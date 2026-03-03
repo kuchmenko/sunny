@@ -1,0 +1,15 @@
+[package]
+name = "sunny-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["full"] } # dep: async runtime, core foundation
+tokio-util = { version = "0.7", features = ["full"] } # dep: CancellationToken for graceful shutdown
+async-trait = "0.1" # dep: async methods in traits per AGENTS.md
+thiserror = "1" # dep: typed error enums per AGENTS.md
+tracing = "0.1" # dep: structured logging, no println per AGENTS.md
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros"] } # dep: test utilities for async tests
+tracing-subscriber = "0.3" # dep: logging subscriber for test output
