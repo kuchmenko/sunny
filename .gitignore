@@ -1,4 +1,4 @@
 /target
 .sisyphus/
 .obsidian/
-.env/
+.env
