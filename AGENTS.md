@@ -227,6 +227,31 @@ Allowed abbreviations: `msg`, `ctx`, `cfg`, `err`, `req`, `res`.
 
 Example: `feat(agent): add capability-based permission system`
 
+### 14.1 Lean Git History (Mandatory)
+
+Keep the commit graph minimal and readable. One commit = one logical change.
+
+**Group related changes into a single commit**:
+- A feature and its tests → one commit
+- A refactor and its fmt/clippy fixes → one commit
+- Multiple small related additions (e.g. two new methods on the same struct) → one commit
+
+**Do not create separate commits for**:
+- Fixing a lint warning introduced in the same session
+- Adding a test that was obviously required by the change
+- Adjusting formatting of code you just wrote
+
+**Each commit must**:
+- Pass all quality gates on its own (no broken intermediate states)
+- Be understandable from its subject line alone
+- Contain only changes relevant to its stated purpose
+
+**Anti-patterns (never do)**:
+- `fix: address review comments` (squash into the original commit instead)
+- `wip: partial implementation` on any persistent branch
+- A chain of `fix fix fix` commits for the same bug
+- Separate `test:` commit for tests that belong to a `feat:` or `fix:` commit
+
 ## 15) Agent Self-Check Before Finish
 
 Before marking task complete, confirm:

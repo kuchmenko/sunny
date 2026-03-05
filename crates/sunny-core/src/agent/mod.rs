@@ -1,9 +1,9 @@
-pub mod error;
 pub mod echo;
+pub mod error;
 pub mod handle;
 
-pub use error::AgentError;
 pub use echo::EchoAgent;
+pub use error::AgentError;
 pub use handle::AgentHandle;
 
 use std::collections::HashMap;

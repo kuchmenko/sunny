@@ -26,10 +26,7 @@ impl Agent for EchoAgent {
                 id: _,
                 content,
                 metadata,
-            } => Ok(AgentResponse::Success {
-                content,
-                metadata,
-            }),
+            } => Ok(AgentResponse::Success { content, metadata }),
         }
     }
 
