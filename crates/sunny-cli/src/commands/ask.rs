@@ -6,14 +6,31 @@ use std::sync::Arc;
 use clap::Args;
 use tokio_util::sync::CancellationToken;
 
-use sunny_core::agent::{AgentHandle, Capability, EchoAgent};
-use sunny_core::orchestrator::{
-    AgentRegistry, ExecutionPlan, IntentClassifier, IntentKind, OrchestratorHandle, PlanExecutor,
-    PlanId, PlanOutcome, PlanPolicy, PlanStep, RequestId,
-};
+use sunny_boys::build_ask_registry;
+use sunny_core::agent::{AgentMessage, AgentResponse, Capability};
+use sunny_core::orchestrator::{IntentClassifier, IntentKind, RequestId};
 use sunny_mind::{KimiProvider, LlmProvider};
 
 use crate::output::{format_prompt_json, format_prompt_pretty, format_prompt_text, PromptOutput};
+
+/// Errors specific to the ask command execution.
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum AskError {
+    #[error("no agent registered for capability: {capability}")]
+    NoAgentForCapability { capability: String },
+
+    #[error("agent not found in registry: {agent_id}")]
+    AgentNotFound { agent_id: String },
+
+    #[error("agent returned error: {code}: {message}")]
+    AgentResponseError { code: String, message: String },
+
+    #[error(transparent)]
+    Registry(#[from] sunny_core::orchestrator::RegistryError),
+
+    #[error(transparent)]
+    Agent(#[from] sunny_core::agent::AgentError),
+}
 
 #[derive(Args, Debug)]
 pub struct AskArgs {
@@ -60,7 +77,7 @@ Guidance: set KIMI_API_KEY and optionally KIMI_AUTH_MODE=api|coding_plan"
 
 pub(crate) async fn execute_ask(
     args: AskArgs,
-    _provider: Option<Arc<dyn LlmProvider>>,
+    provider: Option<Arc<dyn LlmProvider>>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use sunny_core::orchestrator::{
         EVENT_CLI_COMMAND_END, EVENT_CLI_COMMAND_START, OUTCOME_SUCCESS,
@@ -71,144 +88,139 @@ pub(crate) async fn execute_ask(
 
     let request_id = RequestId::new();
     let request_id_text = request_id.to_string();
-    let plan_id = PlanId(request_id.0).to_string();
 
-    tracing::info!(
-        name: EVENT_CLI_COMMAND_START,
-        request_id = %request_id_text,
-        "cli.command.start"
-    );
-
-    let mut plan = ExecutionPlan::new(
-        plan_id.clone(),
-        request_id_text.clone(),
-        intent.clone(),
-        PlanPolicy::default(),
-    );
-    plan.add_step(PlanStep::new(
-        "step-1".to_string(),
-        args.input.clone(),
-        intent.required_capability.clone(),
-        5_000,
-    ))?;
-
-    let mut output = build_ask_output(&request_id_text, &plan, args.dry_run, None, None);
-
-    if args.dry_run {
-        tracing::info!(
-            name: EVENT_CLI_COMMAND_END,
-            request_id = %request_id_text,
-            outcome = "dry_run",
-            "cli.command.end"
-        );
-    } else {
-        let token = CancellationToken::new();
-        let agent_handle = AgentHandle::spawn(Arc::new(EchoAgent), token.child_token());
-
-        let mut registry = AgentRegistry::new();
-        registry.register(
-            "ask-agent".into(),
-            agent_handle,
-            vec![
-                Capability("analyze".into()),
-                Capability("query".into()),
-                Capability("action".into()),
-            ],
-        )?;
-
-        let orchestrator = OrchestratorHandle::spawn(registry, token.child_token());
-        let executor = PlanExecutor::new(&orchestrator);
-        let result = executor.execute(&mut plan, token.child_token()).await?;
-
-        let response = match plan.steps.first().and_then(|step| step.outcome.as_ref()) {
-            Some(sunny_core::orchestrator::StepOutcome::Success { content }) => {
-                Some(content.clone())
-            }
-            _ => None,
-        };
-
-        output = build_ask_output(
-            &request_id_text,
-            &plan,
-            args.dry_run,
-            Some(result),
-            response,
-        );
-
-        token.cancel();
-        orchestrator
-            .shutdown()
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-
-        tracing::info!(
-            name: EVENT_CLI_COMMAND_END,
-            request_id = %request_id_text,
-            outcome = OUTCOME_SUCCESS,
-            "cli.command.end"
-        );
-    }
-
-    let formatted = match args.format.as_str() {
-        "json" => format_prompt_json(&output),
-        "text" => format_prompt_text(&output),
-        _ => format_prompt_pretty(&output),
-    };
-
-    Ok(formatted)
-}
-
-fn build_ask_output(
-    request_id: &str,
-    plan: &ExecutionPlan,
-    dry_run: bool,
-    result: Option<sunny_core::orchestrator::PlanResult>,
-    response: Option<String>,
-) -> PromptOutput {
-    let intent_kind = match plan.intent.kind {
+    let intent_kind = match intent.kind {
         IntentKind::Analyze => "analyze",
         IntentKind::Query => "query",
         IntentKind::Action => "action",
     }
     .to_string();
 
-    let required_capability = plan
-        .intent
+    let required_capability = intent
         .required_capability
-        .as_ref()
-        .map(|cap| cap.0.clone());
+        .clone()
+        .unwrap_or_else(|| Capability("query".into()));
 
-    let (outcome, steps_completed, steps_failed, steps_skipped) = match result {
-        Some(result) => {
-            let outcome = match result.overall_outcome {
-                PlanOutcome::Success => "success",
-                PlanOutcome::Failed => "failed",
-                PlanOutcome::Cancelled => "cancelled",
-            }
-            .to_string();
-            (
-                outcome,
-                result.steps_completed,
-                result.steps_failed,
-                result.steps_skipped,
-            )
+    tracing::info!(
+        name: EVENT_CLI_COMMAND_START,
+        request_id = %request_id_text,
+        intent_kind = %intent_kind,
+        capability = %required_capability.0,
+        "cli.command.start"
+    );
+
+    if args.dry_run {
+        let output = build_ask_output(
+            &request_id_text,
+            &intent_kind,
+            &required_capability.0,
+            args.dry_run,
+            "planned",
+            None,
+        );
+
+        tracing::info!(
+            name: EVENT_CLI_COMMAND_END,
+            request_id = %request_id_text,
+            outcome = "dry_run",
+            "cli.command.end"
+        );
+
+        let formatted = format_output(&args.format, &output);
+        return Ok(formatted);
+    }
+
+    let cancel = CancellationToken::new();
+    let registry = build_ask_registry(provider, &cancel)?;
+
+    let agents = registry.find_by_capability(&required_capability);
+    let agent_id = agents.first().ok_or_else(|| AskError::NoAgentForCapability {
+        capability: required_capability.0.clone(),
+    })?;
+
+    let handle = registry
+        .find(agent_id)
+        .ok_or_else(|| AskError::AgentNotFound {
+            agent_id: agent_id.to_string(),
+        })?;
+
+    let task_msg = AgentMessage::Task {
+        id: request_id_text.clone(),
+        content: args.input.clone(),
+        metadata: HashMap::new(),
+    };
+
+    let response = handle.send(task_msg).await?;
+    cancel.cancel();
+
+    let (outcome, response_content) = match response {
+        AgentResponse::Success { content, .. } => ("success".to_string(), Some(content)),
+        AgentResponse::Error { code, message } => {
+            tracing::warn!(
+                request_id = %request_id_text,
+                error_code = %code,
+                error_message = %message,
+                "agent returned error response"
+            );
+            return Err(Box::new(AskError::AgentResponseError { code, message }));
         }
-        None => ("planned".to_string(), 0, 0, 0),
+    };
+
+    let output = build_ask_output(
+        &request_id_text,
+        &intent_kind,
+        &required_capability.0,
+        args.dry_run,
+        &outcome,
+        response_content,
+    );
+
+    tracing::info!(
+        name: EVENT_CLI_COMMAND_END,
+        request_id = %request_id_text,
+        outcome = OUTCOME_SUCCESS,
+        "cli.command.end"
+    );
+
+    let formatted = format_output(&args.format, &output);
+    Ok(formatted)
+}
+
+fn build_ask_output(
+    request_id: &str,
+    intent_kind: &str,
+    required_capability: &str,
+    dry_run: bool,
+    outcome: &str,
+    response: Option<String>,
+) -> PromptOutput {
+    let (steps_completed, steps_failed) = match outcome {
+        "success" => (1, 0),
+        "planned" => (0, 0),
+        _ => (0, 1),
     };
 
     PromptOutput {
         request_id: request_id.to_string(),
-        plan_id: plan.plan_id.clone(),
-        intent_kind,
-        required_capability,
+        plan_id: request_id.to_string(),
+        intent_kind: intent_kind.to_string(),
+        required_capability: Some(required_capability.to_string()),
         dry_run,
-        step_count: plan.step_count(),
+        step_count: 1,
         steps_completed,
         steps_failed,
-        steps_skipped,
-        outcome,
+        steps_skipped: 0,
+        outcome: outcome.to_string(),
         response,
         metadata: HashMap::new(),
+    }
+}
+
+fn format_output(format: &str, output: &PromptOutput) -> String {
+    match format {
+        "json" => format_prompt_json(output),
+        "text" => format_prompt_text(output),
+        _ => format_prompt_pretty(output),
     }
 }
 
@@ -307,7 +319,7 @@ mod tests {
         let args = AskArgs {
             input: "test".to_string(),
             format: "pretty".to_string(),
-            dry_run: false,
+            dry_run: true, // Use dry_run to avoid actual agent execution
             no_llm: false,
         };
         let result = run_ask(args).await;
@@ -380,10 +392,11 @@ mod tests {
     #[tokio::test]
     async fn test_ask_provider_path_no_llm() {
         // Verifies that when no_llm=true, provider is None and execution still succeeds
+        // Uses dry_run to avoid actual agent execution
         let args = AskArgs {
             input: "test without llm".to_string(),
             format: "json".to_string(),
-            dry_run: false,
+            dry_run: true,
             no_llm: true,
         };
 
@@ -413,7 +426,7 @@ mod tests {
         let args = AskArgs {
             input: "test with missing env".to_string(),
             format: "json".to_string(),
-            dry_run: false,
+            dry_run: true, // Use dry_run to avoid actual agent execution
             no_llm: false, // no_llm is false, but env is missing
         };
 

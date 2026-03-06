@@ -94,3 +94,97 @@ fn test_prompt_still_works() {
 
     assert!(output.status.success(), "prompt command should still work");
 }
+
+#[test]
+fn test_ask_routes_to_codebase_for_query() {
+    use std::fs;
+    let dir = std::env::temp_dir().join(format!("sunny_ask_int_codebase_{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
+
+    let output = sunny_cli()
+        .args([
+            "ask",
+            dir.to_str().expect("valid path"),
+            "--no-llm",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("should run ask command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "command should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("\"intent_kind\": \"query\""),
+        "should classify as query, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("file_count"),
+        "should contain CodebaseAgent response marker, got: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_ask_routes_to_review_for_analyze() {
+    let output = sunny_cli()
+        .args([
+            "ask",
+            "review this code snippet",
+            "--no-llm",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("should run ask command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "command should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("\"intent_kind\": \"analyze\""),
+        "should classify as analyze, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("REVIEW FEEDBACK"),
+        "should contain ReviewAgent response marker, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_ask_routes_to_critique_for_action() {
+    let output = sunny_cli()
+        .args([
+            "ask",
+            "create a fix for this bug",
+            "--no-llm",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("should run ask command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "command should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("\"intent_kind\": \"action\""),
+        "should classify as action, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("CRITIQUE REPORT"),
+        "should contain CritiqueAgent response marker, got: {stdout}"
+    );
+}

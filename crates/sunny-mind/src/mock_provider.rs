@@ -98,6 +98,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "search_web".to_string(),
             arguments: r#"{"query":"test"}"#.to_string(),
+            execution_depth: 0,
         }];
         let mut response = make_response("", "tool_calls");
         response.tool_calls = Some(tool_calls.clone());

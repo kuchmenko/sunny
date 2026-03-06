@@ -7,6 +7,7 @@
 pub const EVENT_TOOL_EXEC_START: &str = "tool.exec.start";
 pub const EVENT_TOOL_EXEC_END: &str = "tool.exec.end";
 pub const EVENT_TOOL_EXEC_ERROR: &str = "tool.exec.error";
+pub const EVENT_TOOL_EXEC_DEPTH: &str = "tool.exec.depth";
 
 pub const EVENT_DISPATCH_START: &str = "orchestrator.dispatch.start";
 pub const EVENT_DISPATCH_SUCCESS: &str = "orchestrator.dispatch.success";
@@ -43,6 +44,7 @@ mod tests {
         assert!(!EVENT_TOOL_EXEC_START.is_empty());
         assert!(!EVENT_TOOL_EXEC_END.is_empty());
         assert!(!EVENT_TOOL_EXEC_ERROR.is_empty());
+        assert!(!EVENT_TOOL_EXEC_DEPTH.is_empty());
         assert!(!EVENT_DISPATCH_START.is_empty());
         assert!(!EVENT_DISPATCH_SUCCESS.is_empty());
         assert!(!EVENT_DISPATCH_ERROR.is_empty());
@@ -75,6 +77,7 @@ mod tests {
             EVENT_TOOL_EXEC_START,
             EVENT_TOOL_EXEC_END,
             EVENT_TOOL_EXEC_ERROR,
+            EVENT_TOOL_EXEC_DEPTH,
             EVENT_DISPATCH_START,
             EVENT_DISPATCH_SUCCESS,
             EVENT_DISPATCH_ERROR,

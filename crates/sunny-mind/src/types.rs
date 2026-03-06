@@ -47,6 +47,9 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// Recursive execution depth for nested tool calls. Defaults to 0.
+    #[serde(default)]
+    pub execution_depth: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

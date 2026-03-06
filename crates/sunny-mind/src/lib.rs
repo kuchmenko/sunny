@@ -296,6 +296,7 @@ mod tests {
                 id: "call_123".to_string(),
                 name: "search_web".to_string(),
                 arguments: "{\"query\":\"sunny\"}".to_string(),
+                execution_depth: 0,
             }]),
         };
 
@@ -313,7 +314,8 @@ mod tests {
             "tool_calls": [{
                 "id": "call_123",
                 "name": "search_web",
-                "arguments": "{\"query\":\"sunny\"}"
+                "arguments": "{\"query\":\"sunny\"}",
+                "execution_depth": 0
             }]
         });
         assert_eq!(actual, expected);
@@ -345,6 +347,7 @@ mod tests {
             id: "call_123".to_string(),
             name: "search_web".to_string(),
             arguments: "{\"query\":\"sunny rust\"}".to_string(),
+            execution_depth: 0,
         };
 
         let json = serde_json::to_string(&call).expect("serialize ToolCall");

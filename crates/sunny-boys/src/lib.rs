@@ -16,11 +16,17 @@
 
 pub mod analyze;
 pub mod codebase;
+pub mod critique;
+pub mod registry;
 pub mod review;
+pub mod tool_loop;
 
 pub use analyze::{AnalysisMode, AnalysisResult, AnalyzeAgent};
 pub use codebase::CodebaseAgent;
+pub use critique::CritiqueAgent;
+pub use registry::build_ask_registry;
 pub use review::ReviewAgent;
+pub use tool_loop::{ToolCallError, ToolCallLoop};
 
 #[cfg(test)]
 mod tests {
