@@ -89,9 +89,9 @@ fn clone_llm_error(err: &LlmError) -> LlmError {
         LlmError::NotConfigured { message } => LlmError::NotConfigured {
             message: message.clone(),
         },
-        LlmError::UnsupportedAuthMode { mode } => LlmError::UnsupportedAuthMode {
-            mode: mode.clone(),
-        },
+        LlmError::UnsupportedAuthMode { mode } => {
+            LlmError::UnsupportedAuthMode { mode: mode.clone() }
+        }
     }
 }
 

@@ -207,20 +207,17 @@ impl LlmProvider for KimiProvider {
             }
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|err| {
-                if err.is_timeout() {
-                    LlmError::Timeout {
-                        timeout_ms: self.timeout_ms(),
-                    }
-                } else {
-                    LlmError::Transport {
-                        source: Box::new(err),
-                    }
+        let response = request.send().await.map_err(|err| {
+            if err.is_timeout() {
+                LlmError::Timeout {
+                    timeout_ms: self.timeout_ms(),
                 }
-            })?;
+            } else {
+                LlmError::Transport {
+                    source: Box::new(err),
+                }
+            }
+        })?;
 
         let status = response.status();
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
@@ -611,7 +608,10 @@ mod tests {
             Some("kimi-cli/1.0".to_string()),
         );
 
-        let res = provider.chat(test_request()).await.expect("chat should succeed");
+        let res = provider
+            .chat(test_request())
+            .await
+            .expect("chat should succeed");
         assert_eq!(res.provider_id, ProviderId("kimi".to_string()));
     }
 }

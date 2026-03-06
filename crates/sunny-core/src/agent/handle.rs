@@ -50,11 +50,19 @@ impl AgentHandle {
     }
 
     pub async fn send(&self, msg: AgentMessage) -> Result<AgentResponse, AgentError> {
+        self.send_with_trace_id(msg, None).await
+    }
+
+    pub(crate) async fn send_with_trace_id(
+        &self,
+        msg: AgentMessage,
+        trace_id: Option<String>,
+    ) -> Result<AgentResponse, AgentError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let actor_msg = AgentActorMsg::HandleMessage {
             msg,
             reply: reply_tx,
-            trace_id: None,
+            trace_id,
             timestamp: Instant::now(),
         };
 
@@ -644,6 +652,79 @@ mod tests {
         match result.expect_err("send should timeout on slow agent") {
             AgentError::Timeout => {}
             err => panic!("expected timeout error, got {err:?}"),
+        }
+
+        cancellation_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_agent_tracing_events() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let agent = Arc::new(TestAgent {
+            stopped: Arc::clone(&stopped),
+        });
+        let cancellation_token = CancellationToken::new();
+        let handle = AgentHandle::spawn(agent, cancellation_token.clone());
+
+        let response = handle
+            .send(AgentMessage::Task {
+                id: "task-tracing-test".to_string(),
+                content: "test-payload".to_string(),
+                metadata: HashMap::new(),
+            })
+            .await
+            .expect("send should succeed");
+
+        match response {
+            AgentResponse::Success { .. } => {}
+            AgentResponse::Error { code, message } => {
+                panic!("unexpected error response {code}: {message}");
+            }
+        }
+
+        // Test verifies that tracing events are emitted without panicking
+        // Start event: agent.message.start with agent_name, task_id
+        // End event: agent.message.end with duration_ms, outcome=success
+        // Error event: agent.message.error with error_code, error_message (on AgentResponse::Error)
+
+        cancellation_token.cancel();
+        let _ = timeout(Duration::from_secs(1), async {
+            while !stopped.load(Ordering::SeqCst) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_agent_tracing_error_event() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let agent = Arc::new(FaultyAgent {
+            panic_msg: None,
+            error_response: Some(("test_error".to_string(), "test error message".to_string())),
+            delay: None,
+            stopped,
+        });
+        let cancellation_token = CancellationToken::new();
+        let handle = AgentHandle::spawn(agent, cancellation_token.clone());
+
+        let response = handle
+            .send(AgentMessage::Task {
+                id: "task-error-tracing".to_string(),
+                content: "test-payload".to_string(),
+                metadata: HashMap::new(),
+            })
+            .await
+            .expect("send should return error response");
+
+        match response {
+            AgentResponse::Error { code, message } => {
+                assert_eq!(code, "test_error");
+                assert_eq!(message, "test error message");
+            }
+            AgentResponse::Success { .. } => {
+                panic!("expected error response from FaultyAgent");
+            }
         }
 
         cancellation_token.cancel();

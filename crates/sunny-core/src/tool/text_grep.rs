@@ -1,3 +1,7 @@
+use tracing::info;
+
+use crate::orchestrator::events::{EVENT_TOOL_EXEC_END, EVENT_TOOL_EXEC_START, OUTCOME_SUCCESS};
+
 /// In-memory text search with pattern matching.
 ///
 /// Operates on string content (no file I/O). Case-insensitive by default.
@@ -39,11 +43,14 @@ impl TextGrep {
     ///
     /// Returns `GrepResult` directly — this operation cannot fail on valid input.
     pub fn search(&self, content: &str, pattern: &str) -> GrepResult {
+        info!(name: EVENT_TOOL_EXEC_START, tool_name = "text_grep", pattern = %pattern);
+
         let mut matches = Vec::new();
         let mut truncated = false;
         let mut total_lines_searched = 0;
 
         if pattern.is_empty() {
+            info!(name: EVENT_TOOL_EXEC_END, tool_name = "text_grep", outcome = OUTCOME_SUCCESS, match_count = 0, truncated = false);
             return GrepResult {
                 matches,
                 truncated,
@@ -74,6 +81,8 @@ impl TextGrep {
                 });
             }
         }
+
+        info!(name: EVENT_TOOL_EXEC_END, tool_name = "text_grep", outcome = OUTCOME_SUCCESS, match_count = matches.len(), truncated = truncated);
 
         GrepResult {
             matches,
@@ -160,5 +169,23 @@ mod tests {
         assert_eq!(result.matches[0].match_start, 0);
         assert_eq!(result.matches[1].line_number, 5);
         assert_eq!(result.matches[1].match_start, 0);
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_grep_tracing() {
+        let grep = TextGrep::default();
+        let content = "hello world\nfoo bar\nhello again";
+        let result = grep.search(content, "hello");
+
+        assert_eq!(result.matches.len(), 2);
+        assert!(!result.truncated);
+
+        assert!(logs_contain("text_grep"));
+        assert!(logs_contain("tool_name"));
+        assert!(logs_contain("hello"));
+        assert!(logs_contain("match_count"));
+        assert!(logs_contain("truncated"));
+        assert!(logs_contain("success"));
     }
 }

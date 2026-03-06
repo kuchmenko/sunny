@@ -1,5 +1,11 @@
 use std::path::{Path, PathBuf};
 
+use tracing::info;
+
+use crate::orchestrator::events::{
+    EVENT_TOOL_EXEC_END, EVENT_TOOL_EXEC_ERROR, EVENT_TOOL_EXEC_START, OUTCOME_ERROR,
+    OUTCOME_SUCCESS,
+};
 use crate::tool::ToolError;
 
 /// 1 MiB — default ceiling before `FileTooLarge` is returned.
@@ -35,23 +41,31 @@ impl Default for FileReader {
 
 impl FileReader {
     pub fn read(&self, path: &Path) -> Result<FileContent, ToolError> {
+        info!(name: EVENT_TOOL_EXEC_START, tool_name = "fs_read", path = %path.display());
+
         let path_str = path.display().to_string();
 
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
             if self.denylist_names.iter().any(|n| n == file_name) {
-                return Err(ToolError::SensitiveFileDenied { path: path_str });
+                let err = ToolError::SensitiveFileDenied { path: path_str };
+                info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "fs_read", outcome = OUTCOME_ERROR, error_kind = "SensitiveFileDenied", error_message = %err);
+                return Err(err);
             }
             if self
                 .denylist_prefixes
                 .iter()
                 .any(|p| file_name.starts_with(p.as_str()))
             {
-                return Err(ToolError::SensitiveFileDenied { path: path_str });
+                let err = ToolError::SensitiveFileDenied { path: path_str };
+                info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "fs_read", outcome = OUTCOME_ERROR, error_kind = "SensitiveFileDenied", error_message = %err);
+                return Err(err);
             }
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 let dotted = format!(".{ext}");
                 if self.denylist_extensions.contains(&dotted) {
-                    return Err(ToolError::SensitiveFileDenied { path: path_str });
+                    let err = ToolError::SensitiveFileDenied { path: path_str };
+                    info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "fs_read", outcome = OUTCOME_ERROR, error_kind = "SensitiveFileDenied", error_message = %err);
+                    return Err(err);
                 }
             }
         }
@@ -66,15 +80,26 @@ impl FileReader {
             _ => ToolError::ExecutionFailed {
                 source: Box::new(e),
             },
+        }).map_err(|err| {
+            let error_kind = match &err {
+                ToolError::PathNotFound { .. } => "PathNotFound",
+                ToolError::PermissionDenied { .. } => "PermissionDenied",
+                ToolError::ExecutionFailed { .. } => "ExecutionFailed",
+                _ => "Unknown",
+            };
+            info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "fs_read", outcome = OUTCOME_ERROR, error_kind = error_kind, error_message = %err);
+            err
         })?;
 
         let size = metadata.len();
         if size > self.max_bytes {
-            return Err(ToolError::FileTooLarge {
+            let err = ToolError::FileTooLarge {
                 path: path_str,
                 size,
                 limit: self.max_bytes,
-            });
+            };
+            info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "fs_read", outcome = OUTCOME_ERROR, error_kind = "FileTooLarge", error_message = %err);
+            return Err(err);
         }
 
         let bytes = std::fs::read(path).map_err(|e| match e.kind() {
@@ -84,22 +109,39 @@ impl FileReader {
             _ => ToolError::ExecutionFailed {
                 source: Box::new(e),
             },
+        }).map_err(|err| {
+            let error_kind = match &err {
+                ToolError::PermissionDenied { .. } => "PermissionDenied",
+                ToolError::ExecutionFailed { .. } => "ExecutionFailed",
+                _ => "Unknown",
+            };
+            info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "fs_read", outcome = OUTCOME_ERROR, error_kind = error_kind, error_message = %err);
+            err
         })?;
 
         let check_end = bytes.len().min(BINARY_CHECK_LEN);
         if bytes[..check_end].contains(&0u8) {
-            return Err(ToolError::BinaryFileSkipped { path: path_str });
+            let err = ToolError::BinaryFileSkipped { path: path_str };
+            info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "fs_read", outcome = OUTCOME_ERROR, error_kind = "BinaryFileSkipped", error_message = %err);
+            return Err(err);
         }
 
         let content = String::from_utf8(bytes).map_err(|e| ToolError::ExecutionFailed {
             source: Box::new(e),
+        }).map_err(|err| {
+            info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "fs_read", outcome = OUTCOME_ERROR, error_kind = "ExecutionFailed", error_message = %err);
+            err
         })?;
 
-        Ok(FileContent {
+        let result = FileContent {
             path: path.to_path_buf(),
             content,
             size_bytes: size,
-        })
+        };
+
+        info!(name: EVENT_TOOL_EXEC_END, tool_name = "fs_read", outcome = OUTCOME_SUCCESS, size_bytes = size);
+
+        Ok(result)
     }
 }
 
@@ -108,6 +150,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+    use tracing_test::traced_test;
 
     fn temp_file_with(content: &[u8], suffix: &str) -> NamedTempFile {
         let mut f = tempfile::Builder::new()
@@ -242,5 +285,49 @@ mod tests {
         let result = reader.read(f.path()).expect("should read empty file");
         assert_eq!(result.content, "");
         assert_eq!(result.size_bytes, 0);
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_fs_read_tracing_events() {
+        let f = temp_file_with(b"test content", ".txt");
+        let reader = FileReader::default();
+        let result = reader.read(f.path()).expect("should read file");
+
+        // Verify success event was logged with correct fields
+        assert!(
+            logs_contain("tool_name=\"fs_read\""),
+            "should log tool_name field"
+        );
+        assert!(
+            logs_contain("outcome=\"success\""),
+            "should log success outcome"
+        );
+        assert!(logs_contain("size_bytes=12"), "should log size_bytes");
+        assert_eq!(result.size_bytes, 12);
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_fs_read_tracing_error() {
+        let reader = FileReader::default();
+        let err = reader
+            .read(std::path::Path::new("/nonexistent.txt"))
+            .unwrap_err();
+
+        // Verify error event was logged with correct fields
+        assert!(
+            logs_contain("tool_name=\"fs_read\""),
+            "should log tool_name field"
+        );
+        assert!(
+            logs_contain("outcome=\"error\""),
+            "should log error outcome"
+        );
+        assert!(
+            logs_contain("error_kind=\"PathNotFound\""),
+            "should include error_kind"
+        );
+        assert!(matches!(err, ToolError::PathNotFound { .. }));
     }
 }

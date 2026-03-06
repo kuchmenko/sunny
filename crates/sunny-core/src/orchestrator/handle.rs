@@ -4,16 +4,31 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Instant};
 use tokio_util::sync::CancellationToken;
+use tracing::{info, info_span};
 
-use crate::agent::{AgentError, AgentMessage, AgentResponse};
+use crate::agent::{AgentError, AgentMessage, AgentResponse, Capability};
 
 use super::telemetry::{DispatchTelemetry, NoopTelemetry};
-use super::{AgentRegistry, NameRouting, OrchestratorError, RoutingStrategy};
+use super::{
+    events::{
+        EVENT_DISPATCH_ERROR, EVENT_DISPATCH_START, EVENT_DISPATCH_SUCCESS, OUTCOME_ERROR,
+        OUTCOME_SUCCESS,
+    },
+    AgentRegistry, CapabilityRouter, IntentRouter, NameRouting, OrchestratorError, RequestId,
+    RoutingStrategy, TieBreakPolicy,
+};
 
 pub(crate) enum OrchestratorMsg {
     Dispatch {
         agent_name: String,
         msg: AgentMessage,
+        request_id: Option<RequestId>,
+        reply: oneshot::Sender<Result<AgentResponse, OrchestratorError>>,
+    },
+    DispatchByCapability {
+        capability: Capability,
+        msg: AgentMessage,
+        request_id: Option<RequestId>,
         reply: oneshot::Sender<Result<AgentResponse, OrchestratorError>>,
     },
 }
@@ -65,10 +80,79 @@ impl OrchestratorHandle {
         agent_name: &str,
         msg: AgentMessage,
     ) -> Result<AgentResponse, OrchestratorError> {
+        self.dispatch_internal(agent_name, msg, None).await
+    }
+
+    pub async fn dispatch_with_context(
+        &self,
+        agent_name: &str,
+        msg: AgentMessage,
+        request_id: RequestId,
+    ) -> Result<AgentResponse, OrchestratorError> {
+        self.dispatch_internal(agent_name, msg, Some(request_id))
+            .await
+    }
+
+    pub async fn dispatch_by_capability(
+        &self,
+        capability: Capability,
+        msg: AgentMessage,
+    ) -> Result<AgentResponse, OrchestratorError> {
+        self.dispatch_by_capability_internal(capability, msg, None)
+            .await
+    }
+
+    pub async fn dispatch_by_capability_with_context(
+        &self,
+        capability: Capability,
+        msg: AgentMessage,
+        request_id: RequestId,
+    ) -> Result<AgentResponse, OrchestratorError> {
+        self.dispatch_by_capability_internal(capability, msg, Some(request_id))
+            .await
+    }
+
+    async fn dispatch_internal(
+        &self,
+        agent_name: &str,
+        msg: AgentMessage,
+        request_id: Option<RequestId>,
+    ) -> Result<AgentResponse, OrchestratorError> {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let request_id = request_id.unwrap_or_default();
         let orchestrator_msg = OrchestratorMsg::Dispatch {
             agent_name: agent_name.to_string(),
             msg,
+            request_id: Some(request_id),
+            reply: reply_tx,
+        };
+
+        timeout(
+            std::time::Duration::from_secs(30),
+            self.tx.send(orchestrator_msg),
+        )
+        .await
+        .map_err(|_| OrchestratorError::AgentUnresponsive)?
+        .map_err(channel_closed_error)?;
+
+        timeout(std::time::Duration::from_secs(30), reply_rx)
+            .await
+            .map_err(|_| OrchestratorError::AgentUnresponsive)?
+            .map_err(channel_closed_error)?
+    }
+
+    async fn dispatch_by_capability_internal(
+        &self,
+        capability: Capability,
+        msg: AgentMessage,
+        request_id: Option<RequestId>,
+    ) -> Result<AgentResponse, OrchestratorError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let request_id = request_id.unwrap_or_default();
+        let orchestrator_msg = OrchestratorMsg::DispatchByCapability {
+            capability,
+            msg,
+            request_id: Some(request_id),
             reply: reply_tx,
         };
 
@@ -107,19 +191,128 @@ pub(crate) async fn run_orchestrator(
             }
             maybe_msg = rx.recv() => {
                 match maybe_msg {
-                    Some(OrchestratorMsg::Dispatch { agent_name, msg, reply }) => {
+                    Some(OrchestratorMsg::Dispatch { agent_name, msg, request_id, reply }) => {
+                        let request_id = request_id.unwrap_or_default();
+                        let request_id_str = request_id.to_string();
+                        let dispatch_span = info_span!("orchestrator.dispatch", request_id = %request_id);
+                        let _guard = dispatch_span.enter();
+
+                        info!(
+                            event = EVENT_DISPATCH_START,
+                            request_id = %request_id,
+                            agent_name = %agent_name
+                        );
                         telemetry.on_dispatch_start(&agent_name);
                         let start = Instant::now();
 
+                        let msg = inject_request_id_metadata(msg, &request_id_str);
                         let result = match routing.resolve(&agent_name, &registry) {
-                            Some(agent_handle) => agent_handle.send(msg).await.map_err(map_agent_error),
+                            Some(agent_handle) => agent_handle
+                                .send_with_trace_id(msg, Some(request_id_str))
+                                .await
+                                .map_err(map_agent_error),
                             None => Err(OrchestratorError::AgentNotFound { name: agent_name.clone() }),
                         };
+                        let result = strip_internal_metadata(result);
+
+                        let duration_ms = start.elapsed().as_millis() as u64;
 
                         match &result {
-                            Ok(_) => telemetry.on_dispatch_success(&agent_name, start.elapsed()),
-                            Err(e) => telemetry.on_dispatch_error(&agent_name, &e.to_string(), start.elapsed()),
+                            Ok(_) => {
+                                info!(
+                                    event = EVENT_DISPATCH_SUCCESS,
+                                    request_id = %request_id,
+                                    agent_name = %agent_name,
+                                    outcome = OUTCOME_SUCCESS,
+                                    duration_ms
+                                );
+                                telemetry.on_dispatch_success(&agent_name, start.elapsed())
+                            }
+                            Err(e) => {
+                                info!(
+                                    event = EVENT_DISPATCH_ERROR,
+                                    request_id = %request_id,
+                                    agent_name = %agent_name,
+                                    outcome = OUTCOME_ERROR,
+                                    error = %e,
+                                    duration_ms
+                                );
+                                telemetry.on_dispatch_error(&agent_name, &e.to_string(), start.elapsed())
+                            }
                         }
+
+                        let _ = reply.send(result);
+                    }
+                    Some(OrchestratorMsg::DispatchByCapability {
+                        capability,
+                        msg,
+                        request_id,
+                        reply,
+                    }) => {
+                        let request_id = request_id.unwrap_or_default();
+                        let request_id_str = request_id.to_string();
+                        let dispatch_span = info_span!("orchestrator.dispatch", request_id = %request_id);
+                        let _guard = dispatch_span.enter();
+
+                        let router = CapabilityRouter::new(TieBreakPolicy::Lexicographic);
+                        let result = match router.route(&capability, &registry) {
+                            Ok(agent_handle) => {
+                                let agent_name = agent_handle.name();
+                                info!(
+                                    event = EVENT_DISPATCH_START,
+                                    request_id = %request_id,
+                                    agent_name = %agent_name
+                                );
+                                telemetry.on_dispatch_start(agent_name);
+
+                                let start = Instant::now();
+                                let msg = inject_request_id_metadata(msg, &request_id_str);
+                                let result = agent_handle
+                                    .send_with_trace_id(msg, Some(request_id_str))
+                                    .await
+                                    .map_err(map_agent_error);
+                                let result = strip_internal_metadata(result);
+                                let duration_ms = start.elapsed().as_millis() as u64;
+
+                                match &result {
+                                    Ok(_) => {
+                                        info!(
+                                            event = EVENT_DISPATCH_SUCCESS,
+                                            request_id = %request_id,
+                                            agent_name = %agent_name,
+                                            outcome = OUTCOME_SUCCESS,
+                                            duration_ms
+                                        );
+                                        telemetry.on_dispatch_success(agent_name, start.elapsed())
+                                    }
+                                    Err(e) => {
+                                        info!(
+                                            event = EVENT_DISPATCH_ERROR,
+                                            request_id = %request_id,
+                                            agent_name = %agent_name,
+                                            outcome = OUTCOME_ERROR,
+                                            error = %e,
+                                            duration_ms
+                                        );
+                                        telemetry.on_dispatch_error(agent_name, &e.to_string(), start.elapsed())
+                                    }
+                                }
+
+                                result
+                            }
+                            Err(err) => {
+                                info!(
+                                    event = EVENT_DISPATCH_ERROR,
+                                    request_id = %request_id,
+                                    agent_name = %capability.0,
+                                    outcome = OUTCOME_ERROR,
+                                    error = %err,
+                                    duration_ms = 0u64
+                                );
+                                telemetry.on_dispatch_error(&capability.0, &err.to_string(), std::time::Duration::from_millis(0));
+                                Err(err)
+                            }
+                        };
 
                         let _ = reply.send(result);
                     }
@@ -130,6 +323,38 @@ pub(crate) async fn run_orchestrator(
             }
         }
     }
+}
+
+fn inject_request_id_metadata(msg: AgentMessage, request_id: &str) -> AgentMessage {
+    match msg {
+        AgentMessage::Task {
+            id,
+            content,
+            mut metadata,
+        } => {
+            metadata.insert("_sunny.request_id".to_string(), request_id.to_string());
+            AgentMessage::Task {
+                id,
+                content,
+                metadata,
+            }
+        }
+    }
+}
+
+fn strip_internal_metadata(
+    result: Result<AgentResponse, OrchestratorError>,
+) -> Result<AgentResponse, OrchestratorError> {
+    result.map(|response| match response {
+        AgentResponse::Success {
+            content,
+            mut metadata,
+        } => {
+            metadata.remove("_sunny.request_id");
+            AgentResponse::Success { content, metadata }
+        }
+        other => other,
+    })
 }
 
 fn map_agent_error(err: AgentError) -> OrchestratorError {
@@ -155,8 +380,15 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
-    use crate::agent::{AgentHandle, AgentMessage, AgentResponse, Capability, EchoAgent};
+    use crate::agent::{
+        Agent, AgentContext, AgentError, AgentHandle, AgentMessage, AgentResponse, Capability,
+        EchoAgent,
+    };
     use crate::orchestrator::telemetry::DispatchTelemetry;
+    use crate::orchestrator::{
+        events::{EVENT_DISPATCH_START, EVENT_DISPATCH_SUCCESS},
+        RequestId,
+    };
 
     use super::{OrchestratorError, OrchestratorHandle};
     use crate::orchestrator::AgentRegistry;
@@ -283,6 +515,39 @@ mod tests {
         last_error_msg: Mutex<String>,
     }
 
+    struct RequestIdEchoAgent;
+
+    #[async_trait::async_trait]
+    impl Agent for RequestIdEchoAgent {
+        fn name(&self) -> &str {
+            "request-id-echo"
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability("echo".to_string())]
+        }
+
+        async fn handle_message(
+            &self,
+            msg: AgentMessage,
+            _ctx: &AgentContext,
+        ) -> Result<AgentResponse, AgentError> {
+            match msg {
+                AgentMessage::Task { metadata, .. } => {
+                    let request_id = metadata
+                        .get("_sunny.request_id")
+                        .cloned()
+                        .unwrap_or_else(|| "missing".to_string());
+
+                    Ok(AgentResponse::Success {
+                        content: request_id,
+                        metadata: HashMap::new(),
+                    })
+                }
+            }
+        }
+    }
+
     impl DispatchTelemetry for RecordingTelemetry {
         fn on_dispatch_start(&self, agent_name: &str) {
             self.starts.fetch_add(1, Ordering::SeqCst);
@@ -357,6 +622,56 @@ mod tests {
         assert_eq!(telemetry.starts.load(Ordering::SeqCst), 2);
         assert_eq!(telemetry.successes.load(Ordering::SeqCst), 1);
         assert_eq!(telemetry.errors.load(Ordering::SeqCst), 1);
+
+        cancellation_token.cancel();
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_dispatch_request_id_propagation() {
+        let cancellation_token = CancellationToken::new();
+        let agent_handle = AgentHandle::spawn(
+            Arc::new(RequestIdEchoAgent),
+            cancellation_token.child_token(),
+        );
+        let mut registry = AgentRegistry::new();
+        registry
+            .register(
+                "echo".to_string(),
+                agent_handle,
+                vec![Capability("echo".to_string())],
+            )
+            .expect("register should succeed");
+
+        let orchestrator = OrchestratorHandle::spawn(registry, cancellation_token.child_token());
+        let request_id = RequestId::new();
+        let request_id_str = request_id.to_string();
+
+        let result = orchestrator
+            .dispatch_with_context(
+                "echo",
+                AgentMessage::Task {
+                    id: "t-request-id".to_string(),
+                    content: "hello".to_string(),
+                    metadata: HashMap::new(),
+                },
+                request_id,
+            )
+            .await;
+
+        match result {
+            Ok(AgentResponse::Success { content, metadata }) => {
+                assert_eq!(content, request_id_str);
+                assert!(metadata.is_empty());
+            }
+            other => panic!("expected success response, got: {other:?}"),
+        }
+
+        assert!(logs_contain(EVENT_DISPATCH_START));
+        assert!(logs_contain(EVENT_DISPATCH_SUCCESS));
+        assert!(logs_contain("processing agent message"));
+        assert!(logs_contain(&format!("request_id={request_id_str}")));
+        assert!(logs_contain(&format!("trace_id={request_id_str}")));
 
         cancellation_token.cancel();
     }

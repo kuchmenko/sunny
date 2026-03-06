@@ -1,9 +1,13 @@
 use std::path::{Path, PathBuf};
 
-use tracing::debug;
+use tracing::{debug, info};
 use walkdir::WalkDir;
 
 use super::error::ToolError;
+use crate::orchestrator::events::{
+    EVENT_TOOL_EXEC_END, EVENT_TOOL_EXEC_ERROR, EVENT_TOOL_EXEC_START, OUTCOME_ERROR,
+    OUTCOME_SUCCESS,
+};
 
 const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_DEPTH: usize = 50;
@@ -54,7 +58,15 @@ impl FileScanner {
     /// Returns `ToolError::PathNotFound` if the given path does not exist.
     /// Sets `ScanResult::truncated = true` if `max_files` limit is reached.
     pub fn scan(&self, path: &Path) -> Result<ScanResult, ToolError> {
+        info!(name: EVENT_TOOL_EXEC_START, tool_name = "fs_scan", path = %path.display());
+
         if !path.exists() {
+            info!(
+                name: EVENT_TOOL_EXEC_ERROR,
+                tool_name = "fs_scan",
+                outcome = OUTCOME_ERROR,
+                error_kind = "PathNotFound"
+            );
             return Err(ToolError::PathNotFound {
                 path: path.display().to_string(),
             });
@@ -120,6 +132,16 @@ impl FileScanner {
             total_size = total_size_bytes,
             truncated,
             "filesystem scan complete"
+        );
+
+        let file_count = files.len();
+        info!(
+            name: EVENT_TOOL_EXEC_END,
+            tool_name = "fs_scan",
+            outcome = OUTCOME_SUCCESS,
+            file_count,
+            total_size_bytes,
+            truncated
         );
 
         Ok(ScanResult {
@@ -283,5 +305,24 @@ mod tests {
                 "file at relative depth {depth} exceeds max_depth=3: {rel:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_fs_scan_tracing() {
+        let dir = tempdir().expect("create temp dir");
+        fs::write(dir.path().join("file1.txt"), "hello").expect("write file1");
+        fs::write(dir.path().join("file2.rs"), "fn main() {}").expect("write file2");
+
+        let scanner = FileScanner::default();
+
+        // Test successful scan emits structured events
+        let result = scanner.scan(dir.path()).expect("scan succeeds");
+        assert_eq!(result.files.len(), 2);
+        assert!(!result.truncated);
+        assert!(result.total_size_bytes > 0);
+
+        // Test error path emits error event
+        let result = scanner.scan(Path::new("/nonexistent/path"));
+        assert!(result.is_err());
     }
 }

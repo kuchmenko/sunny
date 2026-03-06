@@ -188,9 +188,7 @@ language mix, and probable architecture boundaries.\n\nDIGEST:\n{digest}"
             Ok(response) => {
                 let content = response.content.trim();
                 if content.is_empty() {
-                    tracing::warn!(
-                        "AnalyzeAgent LLM returned empty content, using fallback"
-                    );
+                    tracing::warn!("AnalyzeAgent LLM returned empty content, using fallback");
                     None
                 } else {
                     Some(content.to_string())
