@@ -4,16 +4,20 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sunny_core::agent::{Agent, AgentContext, AgentError, AgentMessage, AgentResponse, Capability};
-use sunny_core::tool::{FileReader, FileScanner};
-use sunny_mind::LlmProvider;
+use sunny_core::tool::{FileReader, FileScanner, ToolError, ToolPolicy};
+use sunny_mind::{ChatMessage, ChatRole, LlmProvider, LlmRequest, ToolCall, ToolDefinition};
+use tokio_util::sync::CancellationToken;
+
+use crate::tool_loop::{ToolCallError, ToolCallLoop};
 
 const MAX_CONTEXT_FILES: usize = 20;
 const MAX_FILE_BYTES: usize = 2048;
+const MAX_TOOL_ITERATIONS: usize = 10;
 
 pub struct CodebaseAgent {
     provider: Option<Arc<dyn LlmProvider>>,
-    scanner: FileScanner,
-    reader: FileReader,
+    scanner: Arc<FileScanner>,
+    reader: Arc<FileReader>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,8 +38,8 @@ impl CodebaseAgent {
     pub fn new(provider: Option<Arc<dyn LlmProvider>>) -> Self {
         Self {
             provider,
-            scanner: FileScanner::default(),
-            reader: FileReader::default(),
+            scanner: Arc::new(FileScanner::default()),
+            reader: Arc::new(FileReader::default()),
         }
     }
 
@@ -46,8 +50,8 @@ impl CodebaseAgent {
     ) -> Self {
         Self {
             provider,
-            scanner,
-            reader,
+            scanner: Arc::new(scanner),
+            reader: Arc::new(reader),
         }
     }
 
@@ -57,8 +61,7 @@ impl CodebaseAgent {
                 let trimmed = content.trim();
                 if trimmed.is_empty() {
                     return Err(AgentError::ExecutionFailed {
-                        source: Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
+                        source: Box::new(std::io::Error::other(
                             "codebase query path cannot be empty",
                         )),
                     });
@@ -67,30 +70,102 @@ impl CodebaseAgent {
             }
         }
     }
-}
 
-#[async_trait::async_trait]
-impl Agent for CodebaseAgent {
-    fn name(&self) -> &str {
-        "codebase"
+    fn build_tool_definitions() -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition {
+                name: "fs_scan".to_string(),
+                description: "Scan a directory and list all files with their metadata".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory path to scan"
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ToolDefinition {
+                name: "fs_read".to_string(),
+                description: "Read the contents of a file".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path to read"
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        ]
     }
 
-    fn capabilities(&self) -> Vec<Capability> {
-        vec![Capability("query".to_string())]
+    fn execute_tool_static(
+        scanner: &FileScanner,
+        reader: &FileReader,
+        tool_call: &ToolCall,
+    ) -> Result<String, ToolError> {
+        match tool_call.name.as_str() {
+            "fs_scan" => {
+                let args: serde_json::Value =
+                    serde_json::from_str(&tool_call.arguments).map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                let path_str = args["path"]
+                    .as_str()
+                    .ok_or_else(|| ToolError::ExecutionFailed {
+                        source: Box::new(std::io::Error::other("missing 'path' argument")),
+                    })?;
+                let path = PathBuf::from(path_str);
+                let scan = scanner.scan(&path)?;
+                let files: Vec<String> = scan
+                    .files
+                    .iter()
+                    .map(|f| f.path.to_string_lossy().to_string())
+                    .collect();
+                Ok(serde_json::to_string(&files).unwrap_or_default())
+            }
+            "fs_read" => {
+                let args: serde_json::Value =
+                    serde_json::from_str(&tool_call.arguments).map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                let path_str = args["path"]
+                    .as_str()
+                    .ok_or_else(|| ToolError::ExecutionFailed {
+                        source: Box::new(std::io::Error::other("missing 'path' argument")),
+                    })?;
+                let path = PathBuf::from(path_str);
+                let content = reader.read(&path)?;
+                Ok(content.content)
+            }
+            _ => Err(ToolError::ExecutionFailed {
+                source: Box::new(std::io::Error::other(format!(
+                    "unknown tool: {}",
+                    tool_call.name
+                ))),
+            }),
+        }
     }
 
-    async fn handle_message(
+    async fn run_fallback(
         &self,
-        msg: AgentMessage,
+        root_path: &PathBuf,
         ctx: &AgentContext,
     ) -> Result<AgentResponse, AgentError> {
-        let root_path = Self::parse_task_path(msg)?;
-        let _has_llm = self.provider.is_some();
-        tracing::info!(agent = %ctx.agent_name, path = %root_path.display(), "CodebaseAgent started");
+        tracing::info!(agent = %ctx.agent_name, path = %root_path.display(), "CodebaseAgent using fallback scanner+reader");
 
         let scan = self
             .scanner
-            .scan(&root_path)
+            .scan(root_path)
             .map_err(|e| AgentError::ExecutionFailed {
                 source: Box::new(e),
             })?;
@@ -109,7 +184,7 @@ impl Agent for CodebaseAgent {
                     }
                     let rel_path = file
                         .path
-                        .strip_prefix(&root_path)
+                        .strip_prefix(root_path)
                         .unwrap_or(&file.path)
                         .to_string_lossy()
                         .to_string();
@@ -138,8 +213,134 @@ impl Agent for CodebaseAgent {
         let mut metadata = HashMap::new();
         metadata.insert("file_count".to_string(), result.file_count.to_string());
 
-        tracing::info!(agent = %ctx.agent_name, file_count = result.file_count, "CodebaseAgent completed");
+        tracing::info!(agent = %ctx.agent_name, file_count = result.file_count, "CodebaseAgent completed (fallback)");
         Ok(AgentResponse::Success { content, metadata })
+    }
+}
+
+#[async_trait::async_trait]
+impl Agent for CodebaseAgent {
+    fn name(&self) -> &str {
+        "codebase"
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        vec![Capability("query".to_string())]
+    }
+
+    async fn handle_message(
+        &self,
+        msg: AgentMessage,
+        ctx: &AgentContext,
+    ) -> Result<AgentResponse, AgentError> {
+        let root_path = Self::parse_task_path(msg)?;
+
+        let Some(provider) = &self.provider else {
+            return self.run_fallback(&root_path, ctx).await;
+        };
+
+        tracing::info!(agent = %ctx.agent_name, path = %root_path.display(), "CodebaseAgent using ToolCallLoop");
+
+        let request = LlmRequest {
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: format!(
+                        "You are a codebase analysis assistant. Use the fs_scan and fs_read tools to explore the codebase at: {}. \
+                         Provide a summary of the codebase structure and key files.",
+                        root_path.display()
+                    ),
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: format!("Please analyze the codebase at: {}", root_path.display()),
+                },
+            ],
+            max_tokens: Some(2048),
+            temperature: Some(0.2),
+            tools: Some(Self::build_tool_definitions()),
+            tool_choice: None,
+        };
+
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            MAX_TOOL_ITERATIONS,
+            CancellationToken::new(),
+        );
+
+        let scanner = self.scanner.clone();
+        let reader = self.reader.clone();
+        let executor = move |_id: &str, name: &str, arguments: &str| {
+            let tool_call = ToolCall {
+                id: "exec".to_string(),
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+                execution_depth: 0,
+            };
+            Self::execute_tool_static(&scanner, &reader, &tool_call)
+        };
+
+        let result = loop_runner
+            .run(request, &executor)
+            .await
+            .map_err(|e| match e {
+                ToolCallError::PolicyViolation { tool_name } => AgentError::ExecutionFailed {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Tool {} not allowed by policy",
+                        tool_name
+                    ))),
+                },
+                ToolCallError::MaxIterationsReached { count } => AgentError::ExecutionFailed {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Max tool iterations reached: {}",
+                        count
+                    ))),
+                },
+                ToolCallError::Llm { source } => AgentError::ExecutionFailed {
+                    source: Box::new(std::io::Error::other(format!("LLM error: {}", source))),
+                },
+                ToolCallError::ToolExecution { source } => AgentError::ExecutionFailed {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Tool execution error: {}",
+                        source
+                    ))),
+                },
+                ToolCallError::ToolTimeout {
+                    tool_name,
+                    timeout_secs,
+                } => AgentError::ExecutionFailed {
+                    source: Box::new(std::io::Error::other(format!(
+                        "Tool {} timed out after {}s",
+                        tool_name, timeout_secs
+                    ))),
+                },
+                ToolCallError::Cancelled => AgentError::ExecutionFailed {
+                    source: Box::new(std::io::Error::other("Tool call loop cancelled")),
+                },
+            })?;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "file_count".to_string(),
+            result.metrics.total_tool_calls.to_string(),
+        );
+        metadata.insert(
+            "iterations".to_string(),
+            result.metrics.iterations.to_string(),
+        );
+
+        tracing::info!(
+            agent = %ctx.agent_name,
+            iterations = result.metrics.iterations,
+            total_tool_calls = result.metrics.total_tool_calls,
+            "CodebaseAgent completed (ToolCallLoop)"
+        );
+
+        Ok(AgentResponse::Success {
+            content: result.response.content,
+            metadata,
+        })
     }
 }
 
@@ -147,9 +348,13 @@ impl Agent for CodebaseAgent {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use sunny_core::agent::{Agent, AgentContext, AgentMessage, AgentResponse, Capability};
+    use sunny_mind::{
+        LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage,
+    };
 
     use super::{CodebaseAgent, CodebaseResult};
 
@@ -191,6 +396,34 @@ mod tests {
             AgentResponse::Error { code, message } => {
                 panic!("expected success, got error code={code}, message={message}")
             }
+        }
+    }
+
+    struct MockProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MockProvider {
+        fn provider_id(&self) -> &str {
+            "mock"
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-model"
+        }
+
+        async fn chat(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            Ok(LlmResponse {
+                content: "Mock analysis complete".to_string(),
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                },
+                finish_reason: "stop".to_string(),
+                provider_id: ProviderId("mock".to_string()),
+                model_id: ModelId("mock-model".to_string()),
+                tool_calls: None,
+            })
         }
     }
 
@@ -236,5 +469,51 @@ mod tests {
 
         let result = agent.handle_message(msg, &mk_ctx()).await;
         assert!(result.is_err(), "empty content should produce an error");
+    }
+
+    #[tokio::test]
+    async fn test_codebase_agent_with_provider() {
+        let dir = mk_temp_dir("with_provider");
+        fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
+
+        let provider = Arc::new(MockProvider);
+        let agent = CodebaseAgent::new(Some(provider));
+
+        let response = agent
+            .handle_message(mk_msg(dir.to_str().expect("path str")), &mk_ctx())
+            .await
+            .expect("agent response with provider");
+
+        match response {
+            AgentResponse::Success { content, metadata } => {
+                assert_eq!(content, "Mock analysis complete");
+                assert!(metadata.contains_key("iterations"));
+            }
+            AgentResponse::Error { code, message } => {
+                panic!("expected success, got error code={code}, message={message}");
+            }
+        }
+
+        fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn test_codebase_agent_fallback_without_provider() {
+        let dir = mk_temp_dir("fallback");
+        fs::write(dir.join("test.txt"), "test content\n").expect("write file");
+
+        let agent = CodebaseAgent::new(None);
+
+        let response = agent
+            .handle_message(mk_msg(dir.to_str().expect("path str")), &mk_ctx())
+            .await
+            .expect("agent response without provider");
+
+        let (result, metadata) = parse_success(response);
+        assert_eq!(result.file_count, 1);
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(metadata.get("file_count").map(String::as_str), Some("1"));
+
+        fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
 }

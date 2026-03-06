@@ -1,12 +1,19 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sunny_core::tool::{ToolError, ToolPolicy};
 use sunny_mind::{ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse};
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
-pub struct ToolCallLoop<P: LlmProvider> {
+const TOOL_TIMEOUT_SECS: u64 = 30;
+
+pub struct ToolCallLoop<P: LlmProvider + ?Sized> {
     provider: Arc<P>,
     policy: ToolPolicy,
     max_iterations: usize,
+    cancel: CancellationToken,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -22,26 +29,67 @@ pub enum ToolCallError {
 
     #[error("tool execution failed: {source}")]
     ToolExecution { source: ToolError },
+
+    #[error("tool execution timed out after {timeout_secs}s: {tool_name}")]
+    ToolTimeout {
+        tool_name: String,
+        timeout_secs: u64,
+    },
+
+    #[error("tool call loop cancelled")]
+    Cancelled,
 }
 
-impl<P: LlmProvider> ToolCallLoop<P> {
-    pub fn new(provider: Arc<P>, policy: ToolPolicy, max_iterations: usize) -> Self {
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallMetrics {
+    pub iterations: usize,
+    pub total_tool_calls: usize,
+    pub tools_by_name: HashMap<String, usize>,
+}
+
+pub struct ToolCallResult {
+    pub response: LlmResponse,
+    pub metrics: ToolCallMetrics,
+}
+
+impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
+    pub fn new(
+        provider: Arc<P>,
+        policy: ToolPolicy,
+        max_iterations: usize,
+        cancel: CancellationToken,
+    ) -> Self {
         Self {
             provider,
             policy,
             max_iterations,
+            cancel,
         }
     }
 
     pub async fn run(
         &self,
         request: LlmRequest,
-        tool_executor: &dyn Fn(&str, &str, &str) -> Result<String, ToolError>,
-    ) -> Result<LlmResponse, ToolCallError> {
+        tool_executor: &(dyn Fn(&str, &str, &str) -> Result<String, ToolError> + Send + Sync),
+    ) -> Result<ToolCallResult, ToolCallError> {
         let mut current_request = request;
-        let mut iteration_count = 0;
+        let mut metrics = ToolCallMetrics::default();
 
         loop {
+            // Check for cancellation
+            if self.cancel.is_cancelled() {
+                return Err(ToolCallError::Cancelled);
+            }
+
+            // Check max iterations before processing
+            if metrics.iterations >= self.max_iterations {
+                return Err(ToolCallError::MaxIterationsReached {
+                    count: metrics.iterations,
+                });
+            }
+
+            metrics.iterations += 1;
+
             let response = self
                 .provider
                 .chat(current_request.clone())
@@ -53,15 +101,16 @@ impl<P: LlmProvider> ToolCallLoop<P> {
                 .clone()
                 .filter(|calls| !calls.is_empty())
             else {
-                return Ok(response);
+                return Ok(ToolCallResult { response, metrics });
             };
 
-            if iteration_count >= self.max_iterations {
-                return Err(ToolCallError::MaxIterationsReached {
-                    count: iteration_count,
-                });
+            metrics.total_tool_calls += tool_calls.len();
+            for tool_call in &tool_calls {
+                *metrics
+                    .tools_by_name
+                    .entry(tool_call.name.clone())
+                    .or_insert(0) += 1;
             }
-            iteration_count += 1;
 
             let mut tool_results = Vec::with_capacity(tool_calls.len());
             for tool_call in tool_calls {
@@ -71,9 +120,26 @@ impl<P: LlmProvider> ToolCallLoop<P> {
                     });
                 }
 
-                let content = tool_executor(&tool_call.id, &tool_call.name, &tool_call.arguments)
-                    .map_err(|source| ToolCallError::ToolExecution { source })?;
-                tool_results.push((tool_call, content));
+                // Execute tool with timeout
+                let tool_result = timeout(Duration::from_secs(TOOL_TIMEOUT_SECS), async {
+                    tool_executor(&tool_call.id, &tool_call.name, &tool_call.arguments)
+                })
+                .await;
+
+                match tool_result {
+                    Ok(Ok(content)) => {
+                        tool_results.push((tool_call, content));
+                    }
+                    Ok(Err(source)) => {
+                        return Err(ToolCallError::ToolExecution { source });
+                    }
+                    Err(_) => {
+                        return Err(ToolCallError::ToolTimeout {
+                            tool_name: tool_call.name,
+                            timeout_secs: TOOL_TIMEOUT_SECS,
+                        });
+                    }
+                }
             }
 
             current_request.messages.push(ChatMessage {
@@ -105,6 +171,7 @@ mod tests {
     use std::sync::Arc;
 
     use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
 
     use sunny_core::tool::ToolPolicy;
     use sunny_mind::{
@@ -192,10 +259,19 @@ mod tests {
         }
     }
 
+    fn mk_cancel_token() -> CancellationToken {
+        CancellationToken::new()
+    }
+
     #[tokio::test]
     async fn test_tool_call_loop_no_tools() {
         let provider = Arc::new(MockProvider::new(vec![mk_response("done", None)]));
-        let loop_runner = ToolCallLoop::new(provider.clone(), ToolPolicy::default_ask(), 3);
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            3,
+            mk_cancel_token(),
+        );
 
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let tool_calls_seen = call_count.clone();
@@ -207,7 +283,9 @@ mod tests {
             .await
             .expect("loop should return first LLM response");
 
-        assert_eq!(result.content, "done");
+        assert_eq!(result.response.content, "done");
+        assert_eq!(result.metrics.iterations, 1);
+        assert_eq!(result.metrics.total_tool_calls, 0);
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         let requests = provider.requests().await;
@@ -219,12 +297,21 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![
             mk_response(
                 "calling tool",
-                Some(vec![mk_tool_call("call-1", "fs_read", "{\"path\":\"a.rs\"}")]),
+                Some(vec![mk_tool_call(
+                    "call-1",
+                    "fs_read",
+                    "{\"path\":\"a.rs\"}",
+                )]),
             ),
             mk_response("final", None),
         ]));
 
-        let loop_runner = ToolCallLoop::new(provider.clone(), ToolPolicy::default_ask(), 3);
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            3,
+            mk_cancel_token(),
+        );
 
         let executed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let executed_seen = executed.clone();
@@ -239,7 +326,14 @@ mod tests {
             .await
             .expect("loop should execute allowed tool and finish");
 
-        assert_eq!(result.content, "final");
+        assert_eq!(result.response.content, "final");
+        assert_eq!(result.metrics.iterations, 2);
+        assert_eq!(result.metrics.total_tool_calls, 1);
+        assert_eq!(
+            result.metrics.tools_by_name.get("fs_read"),
+            Some(&1usize),
+            "should track fs_read usage"
+        );
         assert_eq!(executed.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let requests = provider.requests().await;
@@ -257,7 +351,12 @@ mod tests {
             "calling forbidden tool",
             Some(vec![mk_tool_call("call-1", "exec", "{}")]),
         )]));
-        let loop_runner = ToolCallLoop::new(provider.clone(), ToolPolicy::default_ask(), 3);
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            3,
+            mk_cancel_token(),
+        );
 
         let result = loop_runner
             .run(mk_request(), &|_, _, _| Ok("should not run".to_string()))
@@ -280,14 +379,27 @@ mod tests {
         let provider = Arc::new(MockProvider::new(vec![
             mk_response(
                 "first tool",
-                Some(vec![mk_tool_call("call-1", "fs_read", "{\"path\":\"a.rs\"}")]),
+                Some(vec![mk_tool_call(
+                    "call-1",
+                    "fs_read",
+                    "{\"path\":\"a.rs\"}",
+                )]),
             ),
             mk_response(
                 "second tool",
-                Some(vec![mk_tool_call("call-2", "fs_read", "{\"path\":\"b.rs\"}")]),
+                Some(vec![mk_tool_call(
+                    "call-2",
+                    "fs_read",
+                    "{\"path\":\"b.rs\"}",
+                )]),
             ),
         ]));
-        let loop_runner = ToolCallLoop::new(provider.clone(), ToolPolicy::default_ask(), 1);
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            1,
+            mk_cancel_token(),
+        );
 
         let executed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let executed_seen = executed.clone();
@@ -308,6 +420,73 @@ mod tests {
 
         assert_eq!(executed.load(std::sync::atomic::Ordering::SeqCst), 1);
         let requests = provider.requests().await;
-        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests.len(),
+            1,
+            "should only make 1 request before hitting max_iterations"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_loop_respects_cancellation() {
+        let provider = Arc::new(MockProvider::new(vec![mk_response(
+            "calling tool",
+            Some(vec![mk_tool_call("call-1", "fs_read", "{}")]),
+        )]));
+        let cancel_token = CancellationToken::new();
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            3,
+            cancel_token.clone(),
+        );
+
+        // Cancel before running
+        cancel_token.cancel();
+
+        let result = loop_runner
+            .run(mk_request(), &|_, _, _| Ok("ok".to_string()))
+            .await;
+
+        match result {
+            Err(ToolCallError::Cancelled) => {}
+            Ok(_) => panic!("expected cancellation error"),
+            Err(other) => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_loop_tracks_metrics() {
+        let provider = Arc::new(MockProvider::new(vec![
+            mk_response(
+                "first",
+                Some(vec![
+                    mk_tool_call("call-1", "fs_read", "{}"),
+                    mk_tool_call("call-2", "fs_scan", "{}"),
+                ]),
+            ),
+            mk_response(
+                "second",
+                Some(vec![mk_tool_call("call-3", "fs_read", "{}")]),
+            ),
+            mk_response("final", None),
+        ]));
+
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            5,
+            mk_cancel_token(),
+        );
+
+        let result = loop_runner
+            .run(mk_request(), &|_, _, _| Ok("ok".to_string()))
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result.metrics.iterations, 3);
+        assert_eq!(result.metrics.total_tool_calls, 3);
+        assert_eq!(result.metrics.tools_by_name.get("fs_read"), Some(&2usize));
+        assert_eq!(result.metrics.tools_by_name.get("fs_scan"), Some(&1usize));
     }
 }

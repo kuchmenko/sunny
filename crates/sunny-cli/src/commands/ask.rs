@@ -134,9 +134,11 @@ pub(crate) async fn execute_ask(
     let registry = build_ask_registry(provider, &cancel)?;
 
     let agents = registry.find_by_capability(&required_capability);
-    let agent_id = agents.first().ok_or_else(|| AskError::NoAgentForCapability {
-        capability: required_capability.0.clone(),
-    })?;
+    let agent_id = agents
+        .first()
+        .ok_or_else(|| AskError::NoAgentForCapability {
+            capability: required_capability.0.clone(),
+        })?;
 
     let handle = registry
         .find(agent_id)

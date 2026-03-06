@@ -104,10 +104,7 @@ mod tests {
     fn test_critique_agent_name_and_capabilities() {
         let agent = CritiqueAgent::new(None);
         assert_eq!(agent.name(), "critique");
-        assert_eq!(
-            agent.capabilities(),
-            vec![Capability("action".to_string())]
-        );
+        assert_eq!(agent.capabilities(), vec![Capability("action".to_string())]);
     }
 
     #[tokio::test]

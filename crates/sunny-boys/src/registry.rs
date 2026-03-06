@@ -37,16 +37,9 @@ pub fn build_ask_registry(
         Arc::new(ReviewAgent::new(provider.clone())),
         token.child_token(),
     );
-    registry.register(
-        "review".into(),
-        review,
-        vec![Capability("analyze".into())],
-    )?;
+    registry.register("review".into(), review, vec![Capability("analyze".into())])?;
 
-    let critique = AgentHandle::spawn(
-        Arc::new(CritiqueAgent::new(provider)),
-        token.child_token(),
-    );
+    let critique = AgentHandle::spawn(Arc::new(CritiqueAgent::new(provider)), token.child_token());
     registry.register(
         "critique".into(),
         critique,
