@@ -1,7 +1,7 @@
 //! Baseline metrics snapshot tests for regression detection.
 //!
 //! These tests lock critical baseline metrics:
-//! - CLI subcommand availability (prompt, analyze)
+//! - CLI subcommand availability (ask, analyze)
 //! - Event constant values and naming conventions
 //! - Total test count threshold
 
@@ -25,15 +25,15 @@ fn sunny_cli() -> Command {
 }
 
 #[test]
-fn test_baseline_prompt_subcommand_exists() {
+fn test_baseline_ask_subcommand_exists() {
     let output = sunny_cli()
-        .args(["prompt", "--help"])
+        .args(["ask", "--help"])
         .output()
-        .expect("should run prompt --help");
+        .expect("should run ask --help");
 
     assert!(
         output.status.success(),
-        "prompt --help should exit 0, stderr: {}",
+        "ask --help should exit 0, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

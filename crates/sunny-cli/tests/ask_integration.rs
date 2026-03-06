@@ -86,16 +86,6 @@ fn test_ask_with_no_llm() {
 }
 
 #[test]
-fn test_prompt_still_works() {
-    let output = sunny_cli()
-        .args(["prompt", "--help"])
-        .output()
-        .expect("should run prompt --help");
-
-    assert!(output.status.success(), "prompt command should still work");
-}
-
-#[test]
 fn test_ask_routes_to_codebase_for_query() {
     use std::fs;
     let dir = std::env::temp_dir().join(format!("sunny_ask_int_codebase_{}", std::process::id()));

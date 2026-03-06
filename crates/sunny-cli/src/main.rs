@@ -6,8 +6,6 @@ use clap::Parser;
 enum Cli {
     /// Analyze a codebase
     Analyze(crate::commands::AnalyzeArgs),
-    /// Send a prompt to the agent
-    Prompt(crate::commands::PromptArgs),
     /// Ask the agent a question
     Ask(crate::commands::AskArgs),
 }
@@ -29,12 +27,6 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Cli::Prompt(args) => {
-            if let Err(e) = commands::prompt::run_prompt(args).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
         Cli::Ask(args) => {
             if let Err(e) = commands::ask::run_ask(args).await {
                 eprintln!("Error: {e}");
@@ -52,19 +44,6 @@ mod tests {
     fn test_cli_parse_analyze_subcommand() {
         let cli = Cli::try_parse_from(["sunny", "analyze", "."]);
         assert!(cli.is_ok(), "analyze subcommand should parse");
-    }
-
-    #[test]
-    fn test_cli_parse_prompt_subcommand() {
-        let cli = Cli::try_parse_from(["sunny", "prompt", "hello"]);
-        assert!(cli.is_ok(), "prompt subcommand should parse");
-    }
-
-    #[test]
-    fn test_cli_parse_prompt_with_flags() {
-        let cli =
-            Cli::try_parse_from(["sunny", "prompt", "hello", "--format", "json", "--dry-run"]);
-        assert!(cli.is_ok(), "prompt with flags should parse");
     }
 
     #[test]

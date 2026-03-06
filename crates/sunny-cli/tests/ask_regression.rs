@@ -151,26 +151,6 @@ fn test_ask_format_pretty_output() {
     );
 }
 
-/// Verify prompt command still exists and works (removed only in T28)
-#[test]
-fn test_prompt_still_exists() {
-    let output = sunny_cli()
-        .args(["prompt", "--help"])
-        .output()
-        .expect("should run prompt --help");
-
-    assert!(
-        output.status.success(),
-        "prompt command should still exist and work"
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.to_lowercase().contains("usage:"),
-        "prompt help should show usage information"
-    );
-}
-
 /// Verify analyze command is unchanged
 #[test]
 fn test_analyze_unchanged() {
