@@ -38,6 +38,10 @@ pub struct LlmRequest {
     pub tool_choice: Option<ToolChoice>,
 }
 
+/// Tool metadata exposed to the provider wire protocol.
+///
+/// `parameters` should contain a JSON Schema object that the target provider can
+/// forward to model tool/function-calling APIs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
@@ -45,22 +49,34 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
 }
 
+/// A tool invocation requested by a provider.
+///
+/// `arguments` contains the serialized JSON payload returned by the provider for
+/// the requested tool, and `execution_depth` tracks nested tool-loop recursion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
-    /// Recursive execution depth for nested tool calls. Defaults to 0.
     #[serde(default)]
     pub execution_depth: usize,
 }
 
+/// The rendered output associated with a prior tool call.
+///
+/// `tool_call_id` must match the originating [`ToolCall::id`] so providers can
+/// correlate returned content with the requested invocation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallResult {
     pub tool_call_id: String,
     pub content: String,
 }
 
+/// Tool invocation policy requested from the provider.
+///
+/// `Auto` lets the model decide, `None` forbids tool use, `Required` requests a
+/// mandatory tool call for providers that support it, and `Specific(name)` asks
+/// the provider adapter to force the named tool when the wire format allows it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolChoice {
@@ -70,6 +86,7 @@ pub enum ToolChoice {
     Specific(String),
 }
 
+/// Token accounting reported by the provider.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u32,
@@ -78,11 +95,16 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// Return the derived total token count from input and output values.
     pub fn total(&self) -> u32 {
         self.input_tokens + self.output_tokens
     }
 }
 
+/// Provider response payload returned from a chat request.
+///
+/// `tool_calls` is populated when the provider chooses to invoke tools rather
+/// than returning only assistant text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmResponse {
     pub content: String,

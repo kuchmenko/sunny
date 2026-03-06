@@ -14,3 +14,4 @@ tokio = { version = "1", features = ["sync"] } # dep: tokio::sync::Mutex for Moc
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] } # dep: async test runtime
 wiremock = "0.6" # dep: HTTP mocking for provider tests
+proptest = "1" # dep: property-based serialization invariants for public LLM contracts

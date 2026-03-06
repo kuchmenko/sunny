@@ -1,8 +1,125 @@
+use proptest::prelude::*;
 use serde_json::json;
 use sunny_mind::{
     ChatMessage, ChatRole, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage, ToolCall,
     ToolChoice, ToolDefinition,
 };
+
+fn arb_chat_role() -> impl Strategy<Value = ChatRole> {
+    prop_oneof![
+        Just(ChatRole::System),
+        Just(ChatRole::User),
+        Just(ChatRole::Assistant),
+        Just(ChatRole::Tool),
+    ]
+}
+
+fn arb_chat_message() -> impl Strategy<Value = ChatMessage> {
+    (
+        arb_chat_role(),
+        proptest::string::string_regex("(?s).{0,40}").expect("valid regex"),
+    )
+        .prop_map(|(role, content)| ChatMessage { role, content })
+}
+
+fn arb_tool_definition() -> impl Strategy<Value = ToolDefinition> {
+    (
+        proptest::string::string_regex("[a-z_]{1,12}").expect("valid regex"),
+        proptest::string::string_regex("(?s).{0,40}").expect("valid regex"),
+        proptest::string::string_regex("[a-z_]{1,12}").expect("valid regex"),
+    )
+        .prop_map(|(name, description, field_name)| ToolDefinition {
+            name,
+            description,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    field_name: { "type": "string" }
+                }
+            }),
+        })
+}
+
+fn arb_tool_choice() -> impl Strategy<Value = ToolChoice> {
+    prop_oneof![
+        Just(ToolChoice::Auto),
+        Just(ToolChoice::None),
+        Just(ToolChoice::Required),
+        proptest::string::string_regex("[a-z_]{1,12}")
+            .expect("valid regex")
+            .prop_map(ToolChoice::Specific),
+    ]
+}
+
+fn arb_tool_call() -> impl Strategy<Value = ToolCall> {
+    (
+        proptest::string::string_regex("[a-z0-9_]{1,12}").expect("valid regex"),
+        proptest::string::string_regex("[a-z_]{1,12}").expect("valid regex"),
+        proptest::string::string_regex("(?s).{0,40}").expect("valid regex"),
+        0usize..4,
+    )
+        .prop_map(|(id, name, arguments, execution_depth)| ToolCall {
+            id,
+            name,
+            arguments,
+            execution_depth,
+        })
+}
+
+fn arb_llm_request() -> impl Strategy<Value = LlmRequest> {
+    (
+        prop::collection::vec(arb_chat_message(), 1..4),
+        prop::option::of(1u32..4096),
+        prop::option::of((0u16..1000).prop_map(|value| value as f32 / 1000.0)),
+        prop::option::of(prop::collection::vec(arb_tool_definition(), 0..3)),
+        prop::option::of(arb_tool_choice()),
+    )
+        .prop_map(
+            |(messages, max_tokens, temperature, tools, tool_choice)| LlmRequest {
+                messages,
+                max_tokens,
+                temperature,
+                tools,
+                tool_choice,
+            },
+        )
+}
+
+fn arb_llm_response() -> impl Strategy<Value = LlmResponse> {
+    (
+        proptest::string::string_regex("(?s).{0,60}").expect("valid regex"),
+        0u32..5000,
+        0u32..5000,
+        proptest::string::string_regex("[a-z_]{1,16}").expect("valid regex"),
+        proptest::string::string_regex("[a-z0-9._-]{1,16}").expect("valid regex"),
+        proptest::string::string_regex("[a-z0-9._-]{1,20}").expect("valid regex"),
+        prop::option::of(prop::collection::vec(arb_tool_call(), 0..3)),
+    )
+        .prop_map(
+            |(
+                content,
+                input_tokens,
+                output_tokens,
+                finish_reason,
+                provider_id,
+                model_id,
+                tool_calls,
+            )| {
+                LlmResponse {
+                    content,
+                    usage: TokenUsage {
+                        input_tokens,
+                        output_tokens,
+                        total_tokens: input_tokens + output_tokens,
+                    },
+                    finish_reason,
+                    provider_id: ProviderId(provider_id),
+                    model_id: ModelId(model_id),
+                    tool_calls,
+                }
+            },
+        )
+}
 
 /// Test that minimal LlmRequest serializes to JSON with only "messages" key (no null fields)
 #[test]
@@ -331,4 +448,20 @@ fn test_contract_roundtrip() {
     let json = serde_json::to_string(&response).expect("should serialize");
     let back: LlmResponse = serde_json::from_str(&json).expect("should deserialize");
     assert_eq!(response, back);
+}
+
+proptest! {
+    #[test]
+    fn proptest_contract_roundtrip_llm_request(req in arb_llm_request()) {
+        let json = serde_json::to_string(&req).expect("request should serialize");
+        let back: LlmRequest = serde_json::from_str(&json).expect("request should deserialize");
+        prop_assert_eq!(req, back);
+    }
+
+    #[test]
+    fn proptest_contract_roundtrip_llm_response(res in arb_llm_response()) {
+        let json = serde_json::to_string(&res).expect("response should serialize");
+        let back: LlmResponse = serde_json::from_str(&json).expect("response should deserialize");
+        prop_assert_eq!(res, back);
+    }
 }

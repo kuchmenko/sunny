@@ -149,7 +149,7 @@ struct KimiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<KimiToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<ToolChoice>,
+    tool_choice: Option<KimiToolChoice>,
 }
 
 #[derive(Serialize)]
@@ -163,6 +163,36 @@ struct KimiToolFunction {
     name: String,
     description: String,
     parameters: serde_json::Value,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum KimiToolChoice {
+    Mode(&'static str),
+    Specific {
+        r#type: &'static str,
+        function: KimiToolChoiceFunction,
+    },
+}
+
+#[derive(Serialize)]
+struct KimiToolChoiceFunction {
+    name: String,
+}
+
+fn map_tool_choice(tool_choice: Option<ToolChoice>) -> Result<Option<KimiToolChoice>, LlmError> {
+    match tool_choice {
+        None => Ok(None),
+        Some(ToolChoice::Auto) => Ok(Some(KimiToolChoice::Mode("auto"))),
+        Some(ToolChoice::None) => Ok(Some(KimiToolChoice::Mode("none"))),
+        Some(ToolChoice::Specific(name)) => Ok(Some(KimiToolChoice::Specific {
+            r#type: "function",
+            function: KimiToolChoiceFunction { name },
+        })),
+        Some(ToolChoice::Required) => Err(LlmError::InvalidResponse {
+            message: "Kimi does not support tool_choice=required".to_string(),
+        }),
+    }
 }
 
 #[derive(Deserialize)]
@@ -221,6 +251,7 @@ impl LlmProvider for KimiProvider {
     }
 
     async fn chat(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
+        let tool_choice = map_tool_choice(req.tool_choice)?;
         let tools = req.tools.map(|defs| {
             defs.into_iter()
                 .map(|def| KimiToolDefinition {
@@ -240,7 +271,7 @@ impl LlmProvider for KimiProvider {
             max_tokens: req.max_tokens,
             temperature: req.temperature,
             tools,
-            tool_choice: req.tool_choice,
+            tool_choice,
         };
 
         let response = self
@@ -368,7 +399,7 @@ mod tests {
 
     use crate::{
         ChatMessage, ChatRole, KimiProvider, LlmError, LlmProvider, LlmRequest, ModelId,
-        ProviderId, TokenUsage,
+        ProviderId, TokenUsage, ToolChoice,
     };
 
     fn env_lock() -> &'static Mutex<()> {
@@ -815,5 +846,105 @@ mod tests {
 
         assert_eq!(res.content, "I'll check the weather.");
         assert!(res.tool_calls.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_kimi_chat_request_with_specific_tool_choice() {
+        use crate::{ToolChoice, ToolDefinition};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_json(serde_json::json!({
+                "model": "kimi-k2.5",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Get weather for a location",
+                            "parameters": {"type": "object", "properties": {"location": {"type": "string"}}}
+                        }
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "get_weather"}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [
+                    {
+                        "message": { "content": "tool forced" },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 10,
+                    "total_tokens": 30
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = KimiProvider::new(
+            "test-key".to_string(),
+            format!("{}/v1", server.uri()),
+            "kimi-k2.5".to_string(),
+            Duration::from_secs(1),
+        );
+
+        let req = LlmRequest {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: Some(vec![ToolDefinition {
+                name: "get_weather".to_string(),
+                description: "Get weather for a location".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}}
+                }),
+            }]),
+            tool_choice: Some(ToolChoice::Specific("get_weather".to_string())),
+        };
+
+        let res = provider.chat(req).await.expect("chat should succeed");
+        assert_eq!(res.content, "tool forced");
+    }
+
+    #[tokio::test]
+    async fn test_kimi_chat_rejects_required_tool_choice() {
+        let provider = KimiProvider::new(
+            "test-key".to_string(),
+            "https://api.moonshot.ai/v1".to_string(),
+            "kimi-k2.5".to_string(),
+            Duration::from_secs(1),
+        );
+
+        let req = LlmRequest {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            tool_choice: Some(ToolChoice::Required),
+        };
+
+        let err = provider
+            .chat(req)
+            .await
+            .expect_err("required tool_choice should fail");
+        assert!(err
+            .to_string()
+            .contains("does not support tool_choice=required"));
     }
 }

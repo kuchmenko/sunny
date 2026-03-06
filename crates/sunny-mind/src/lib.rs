@@ -14,13 +14,13 @@
 
 pub mod error;
 pub mod kimi;
-pub mod mock_provider;
+#[cfg(test)]
+pub(crate) mod mock_provider;
 pub mod provider;
 pub mod types;
 
 pub use error::LlmError;
 pub use kimi::KimiProvider;
-pub use mock_provider::MockToolCallProvider;
 pub use provider::LlmProvider;
 pub use types::{
     ChatMessage, ChatRole, LlmRequest, LlmResponse, ModelId, ProviderEconomics, ProviderId,
