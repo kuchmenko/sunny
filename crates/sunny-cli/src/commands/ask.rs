@@ -1,6 +1,7 @@
 //! Ask command implementation
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Args;
@@ -14,6 +15,11 @@ use sunny_mind::{KimiProvider, LlmProvider};
 use crate::output::{
     format_prompt_json, format_prompt_pretty, format_prompt_text, PromptIssue, PromptOutput,
 };
+
+struct AskExecution {
+    formatted: String,
+    success: bool,
+}
 
 #[derive(Args, Debug)]
 pub struct AskArgs {
@@ -53,9 +59,51 @@ Guidance: set KIMI_API_KEY and optionally KIMI_AUTH_MODE=api|coding_plan"
         }
     };
 
-    let output = execute_ask(args, provider).await?;
-    println!("{output}");
+    let execution = execute_ask_internal(args, provider).await?;
+    println!("{}", execution.formatted);
+    if !execution.success {
+        return Err(std::io::Error::other("ask command failed").into());
+    }
     Ok(())
+}
+
+fn format_ask_error(
+    format: &str,
+    request_id: &str,
+    intent_kind: &str,
+    required_capability: &str,
+    dry_run: bool,
+    metadata: HashMap<String, String>,
+    error: PromptIssue,
+) -> AskExecution {
+    AskExecution {
+        formatted: render_error_output(
+            format,
+            request_id,
+            intent_kind,
+            required_capability,
+            dry_run,
+            metadata,
+            error,
+        ),
+        success: false,
+    }
+}
+
+fn resolve_query_root(input: &str, cwd: &Path) -> PathBuf {
+    let trimmed = input.trim();
+    let candidate = PathBuf::from(trimmed);
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd.join(candidate)
+    };
+
+    if resolved.exists() {
+        resolved
+    } else {
+        cwd.to_path_buf()
+    }
 }
 
 fn issue(level: &str, code: &str, message: impl Into<String>, hint: Option<&str>) -> PromptIssue {
@@ -198,19 +246,54 @@ fn render_error_output(
     format_output(format, &output)
 }
 
+#[cfg(test)]
 pub(crate) async fn execute_ask(
     args: AskArgs,
     provider: Option<Arc<dyn LlmProvider>>,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(execute_ask_internal(args, provider).await?.formatted)
+}
+
+async fn execute_ask_internal(
+    args: AskArgs,
+    provider: Option<Arc<dyn LlmProvider>>,
+) -> Result<AskExecution, Box<dyn std::error::Error>> {
     use sunny_core::orchestrator::{
         EVENT_CLI_COMMAND_END, EVENT_CLI_COMMAND_START, OUTCOME_ERROR, OUTCOME_SUCCESS,
     };
 
-    let classifier = IntentClassifier::new();
-    let intent = classifier.classify(&args.input);
-
     let request_id = RequestId::new();
     let request_id_text = request_id.to_string();
+
+    if args.input.trim().is_empty() {
+        let mut metadata = HashMap::new();
+        metadata.insert("failure_stage".to_string(), "input_validation".to_string());
+
+        tracing::info!(
+            name: EVENT_CLI_COMMAND_END,
+            request_id = %request_id_text,
+            outcome = OUTCOME_ERROR,
+            "cli.command.end"
+        );
+
+        return Ok(format_ask_error(
+            &args.format,
+            &request_id_text,
+            "invalid",
+            "unknown",
+            args.dry_run,
+            metadata,
+            issue(
+                "error",
+                "blank_input",
+                "Ask input cannot be blank",
+                Some("Provide a question, action, or path to inspect"),
+            ),
+        ));
+    }
+
+    let classifier = IntentClassifier::new();
+    let intent = classifier.classify(&args.input);
 
     let intent_kind = match intent.kind {
         IntentKind::Analyze => "analyze",
@@ -252,8 +335,10 @@ pub(crate) async fn execute_ask(
             "cli.command.end"
         );
 
-        let formatted = format_output(&args.format, &output);
-        return Ok(formatted);
+        return Ok(AskExecution {
+            formatted: format_output(&args.format, &output),
+            success: true,
+        });
     }
 
     let cancel = CancellationToken::new();
@@ -264,7 +349,13 @@ pub(crate) async fn execute_ask(
             metadata.insert("failure_stage".to_string(), "registry_setup".to_string());
             metadata.insert("error".to_string(), err.to_string());
 
-            let formatted = render_error_output(
+            tracing::info!(
+                name: EVENT_CLI_COMMAND_END,
+                request_id = %request_id_text,
+                outcome = OUTCOME_ERROR,
+                "cli.command.end"
+            );
+            return Ok(format_ask_error(
                 &args.format,
                 &request_id_text,
                 &intent_kind,
@@ -277,15 +368,7 @@ pub(crate) async fn execute_ask(
                     "Failed to initialize ask agent registry",
                     Some("Inspect startup logs for provider/agent wiring issues"),
                 ),
-            );
-
-            tracing::info!(
-                name: EVENT_CLI_COMMAND_END,
-                request_id = %request_id_text,
-                outcome = OUTCOME_ERROR,
-                "cli.command.end"
-            );
-            return Ok(formatted);
+            ));
         }
     };
 
@@ -294,7 +377,13 @@ pub(crate) async fn execute_ask(
         let mut metadata = HashMap::new();
         metadata.insert("failure_stage".to_string(), "capability_lookup".to_string());
         metadata.insert("capability".to_string(), required_capability.0.clone());
-        let formatted = render_error_output(
+        tracing::info!(
+            name: EVENT_CLI_COMMAND_END,
+            request_id = %request_id_text,
+            outcome = OUTCOME_ERROR,
+            "cli.command.end"
+        );
+        return Ok(format_ask_error(
             &args.format,
             &request_id_text,
             &intent_kind,
@@ -310,21 +399,20 @@ pub(crate) async fn execute_ask(
                 ),
                 Some("Check ask registry capability mapping"),
             ),
-        );
-        tracing::info!(
-            name: EVENT_CLI_COMMAND_END,
-            request_id = %request_id_text,
-            outcome = OUTCOME_ERROR,
-            "cli.command.end"
-        );
-        return Ok(formatted);
+        ));
     };
 
     let Some(handle) = registry.find(agent_id) else {
         let mut metadata = HashMap::new();
         metadata.insert("failure_stage".to_string(), "agent_lookup".to_string());
         metadata.insert("agent_id".to_string(), agent_id.to_string());
-        let formatted = render_error_output(
+        tracing::info!(
+            name: EVENT_CLI_COMMAND_END,
+            request_id = %request_id_text,
+            outcome = OUTCOME_ERROR,
+            "cli.command.end"
+        );
+        return Ok(format_ask_error(
             &args.format,
             &request_id_text,
             &intent_kind,
@@ -337,14 +425,7 @@ pub(crate) async fn execute_ask(
                 format!("Selected agent '{}' is missing from registry", agent_id),
                 Some("Rebuild registry and verify agent IDs"),
             ),
-        );
-        tracing::info!(
-            name: EVENT_CLI_COMMAND_END,
-            request_id = %request_id_text,
-            outcome = OUTCOME_ERROR,
-            "cli.command.end"
-        );
-        return Ok(formatted);
+        ));
     };
 
     let cwd = match std::env::current_dir() {
@@ -353,7 +434,13 @@ pub(crate) async fn execute_ask(
             let mut metadata = HashMap::new();
             metadata.insert("failure_stage".to_string(), "cwd_resolution".to_string());
             metadata.insert("error".to_string(), err.to_string());
-            let formatted = render_error_output(
+            tracing::info!(
+                name: EVENT_CLI_COMMAND_END,
+                request_id = %request_id_text,
+                outcome = OUTCOME_ERROR,
+                "cli.command.end"
+            );
+            return Ok(format_ask_error(
                 &args.format,
                 &request_id_text,
                 &intent_kind,
@@ -366,25 +453,25 @@ pub(crate) async fn execute_ask(
                     "Unable to resolve current working directory",
                     Some("Run ask from an existing workspace directory"),
                 ),
-            );
-            tracing::info!(
-                name: EVENT_CLI_COMMAND_END,
-                request_id = %request_id_text,
-                outcome = OUTCOME_ERROR,
-                "cli.command.end"
-            );
-            return Ok(formatted);
+            ));
         }
     };
-    let cwd_text = cwd.to_string_lossy().to_string();
+    let query_root = if required_capability.0 == "query" {
+        resolve_query_root(&args.input, &cwd)
+    } else {
+        cwd.clone()
+    };
 
     let mut metadata = HashMap::new();
-    metadata.insert("_sunny.cwd".to_string(), cwd_text.clone());
+    metadata.insert(
+        "_sunny.cwd".to_string(),
+        query_root.to_string_lossy().to_string(),
+    );
     metadata.insert("_sunny.query".to_string(), args.input.clone());
     metadata.insert("_sunny.request_id".to_string(), request_id_text.clone());
 
     let task_content = if required_capability.0 == "query" {
-        cwd_text
+        query_root.to_string_lossy().to_string()
     } else {
         args.input.clone()
     };
@@ -416,7 +503,13 @@ pub(crate) async fn execute_ask(
                 metadata.insert("timeout_source".to_string(), "agent_handle".to_string());
             }
 
-            let formatted = render_error_output(
+            tracing::info!(
+                name: EVENT_CLI_COMMAND_END,
+                request_id = %request_id_text,
+                outcome = OUTCOME_ERROR,
+                "cli.command.end"
+            );
+            return Ok(format_ask_error(
                 &args.format,
                 &request_id_text,
                 &intent_kind,
@@ -424,14 +517,7 @@ pub(crate) async fn execute_ask(
                 args.dry_run,
                 metadata,
                 map_agent_error(&err),
-            );
-            tracing::info!(
-                name: EVENT_CLI_COMMAND_END,
-                request_id = %request_id_text,
-                outcome = OUTCOME_ERROR,
-                "cli.command.end"
-            );
-            return Ok(formatted);
+            ));
         }
     };
     cancel.cancel();
@@ -513,8 +599,10 @@ pub(crate) async fn execute_ask(
         "cli.command.end"
     );
 
-    let formatted = format_output(&args.format, &output);
-    Ok(formatted)
+    Ok(AskExecution {
+        formatted: format_output(&args.format, &output),
+        success: outcome == "success",
+    })
 }
 
 struct AskOutputParams<'a> {

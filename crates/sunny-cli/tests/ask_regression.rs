@@ -4,6 +4,10 @@
 //! They are CHANGE DETECTORS - intentional breaking changes require test updates.
 
 use std::process::Command;
+use std::process::Output;
+use std::process::Stdio;
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn sunny_cli() -> Command {
     let exe = std::env::var("CARGO_BIN_EXE_sunny-cli").unwrap_or_else(|_| {
@@ -22,20 +26,49 @@ fn sunny_cli() -> Command {
     cmd
 }
 
+fn run_with_timeout(cmd: &mut Command) -> Output {
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("should spawn ask command");
+    let deadline = Instant::now() + Duration::from_secs(15);
+
+    loop {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("timed out command should still produce output");
+            panic!(
+                "command timed out after 15s, stdout: {}, stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        match child.try_wait().expect("should poll child process") {
+            Some(_) => {
+                return child
+                    .wait_with_output()
+                    .expect("finished command should produce output");
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    }
+}
+
 /// Verify JSON output schema hasn't changed unexpectedly
 #[test]
 fn test_ask_dry_run_json_schema() {
-    let output = sunny_cli()
-        .args([
-            "ask",
-            "test query",
-            "--dry-run",
-            "--no-llm",
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("should run ask command");
+    let mut cmd = sunny_cli();
+    cmd.args([
+        "ask",
+        "test query",
+        "--dry-run",
+        "--no-llm",
+        "--format",
+        "json",
+    ]);
+    let output = run_with_timeout(&mut cmd);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -78,10 +111,9 @@ fn test_ask_dry_run_json_schema() {
 /// Verify empty input produces graceful error (not panic)
 #[test]
 fn test_ask_empty_input_error() {
-    let output = sunny_cli()
-        .args(["ask", "", "--no-llm", "--format", "json"])
-        .output()
-        .expect("should run ask command");
+    let mut cmd = sunny_cli();
+    cmd.args(["ask", "", "--no-llm", "--format", "json"]);
+    let output = run_with_timeout(&mut cmd);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -96,25 +128,25 @@ fn test_ask_empty_input_error() {
         stderr
     );
     assert!(
-        !output.status.success() || stdout.contains("\"error\"") || stdout.contains("\"outcome\""),
-        "empty input should fail or return a structured error envelope, stdout: {stdout}, stderr: {stderr}"
+        !output.status.success(),
+        "empty input should return non-zero exit, stdout: {stdout}, stderr: {stderr}"
     );
+    assert!(stdout.contains("\"outcome\": \"error\""));
 }
 
 /// Verify text format produces human-readable output
 #[test]
 fn test_ask_format_text_output() {
-    let output = sunny_cli()
-        .args([
-            "ask",
-            "hello world",
-            "--dry-run",
-            "--no-llm",
-            "--format",
-            "text",
-        ])
-        .output()
-        .expect("should run ask command");
+    let mut cmd = sunny_cli();
+    cmd.args([
+        "ask",
+        "hello world",
+        "--dry-run",
+        "--no-llm",
+        "--format",
+        "text",
+    ]);
+    let output = run_with_timeout(&mut cmd);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -134,10 +166,9 @@ fn test_ask_format_text_output() {
 /// Verify pretty format produces structured/colored output
 #[test]
 fn test_ask_format_pretty_output() {
-    let output = sunny_cli()
-        .args(["ask", "test", "--dry-run", "--no-llm", "--format", "pretty"])
-        .output()
-        .expect("should run ask command");
+    let mut cmd = sunny_cli();
+    cmd.args(["ask", "test", "--dry-run", "--no-llm", "--format", "pretty"]);
+    let output = run_with_timeout(&mut cmd);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -157,10 +188,9 @@ fn test_ask_format_pretty_output() {
 /// Verify analyze command is unchanged
 #[test]
 fn test_analyze_unchanged() {
-    let output = sunny_cli()
-        .args(["analyze", "--help"])
-        .output()
-        .expect("should run analyze --help");
+    let mut cmd = sunny_cli();
+    cmd.args(["analyze", "--help"]);
+    let output = run_with_timeout(&mut cmd);
 
     assert!(output.status.success(), "analyze command should still work");
 
@@ -175,17 +205,16 @@ fn test_analyze_unchanged() {
 #[test]
 fn test_all_formats_work() {
     for format in ["json", "text", "pretty"] {
-        let output = sunny_cli()
-            .args([
-                "ask",
-                "test query",
-                "--dry-run",
-                "--no-llm",
-                "--format",
-                format,
-            ])
-            .output()
-            .unwrap_or_else(|_| panic!("should run ask with {} format", format));
+        let mut cmd = sunny_cli();
+        cmd.args([
+            "ask",
+            "test query",
+            "--dry-run",
+            "--no-llm",
+            "--format",
+            format,
+        ]);
+        let output = run_with_timeout(&mut cmd);
 
         assert!(
             output.status.success(),
@@ -198,17 +227,16 @@ fn test_all_formats_work() {
 
 #[test]
 fn test_ask_dry_run_path_input_returns_json_envelope() {
-    let output = sunny_cli()
-        .args([
-            "ask",
-            "analyze /tmp/example-project",
-            "--dry-run",
-            "--no-llm",
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("should run ask command");
+    let mut cmd = sunny_cli();
+    cmd.args([
+        "ask",
+        "analyze /tmp/example-project",
+        "--dry-run",
+        "--no-llm",
+        "--format",
+        "json",
+    ]);
+    let output = run_with_timeout(&mut cmd);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -229,17 +257,16 @@ fn test_ask_dry_run_path_input_returns_json_envelope() {
 #[test]
 fn test_routing_regression() {
     // Query-type input should route correctly
-    let output = sunny_cli()
-        .args([
-            "ask",
-            "what does this codebase do?",
-            "--dry-run",
-            "--no-llm",
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("should run ask command");
+    let mut cmd = sunny_cli();
+    cmd.args([
+        "ask",
+        "what does this codebase do?",
+        "--dry-run",
+        "--no-llm",
+        "--format",
+        "json",
+    ]);
+    let output = run_with_timeout(&mut cmd);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -251,4 +278,95 @@ fn test_routing_regression() {
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(json["intent_kind"].as_str(), Some("query"));
     assert_eq!(json["required_capability"].as_str(), Some("query"));
+}
+
+#[test]
+fn test_path_only_query_uses_requested_directory() {
+    use std::fs;
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sunny_ask_regression_query_path_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    fs::write(temp_dir.join("only-here.txt"), "hello").expect("write sentinel file");
+
+    let mut cmd = sunny_cli();
+    cmd.args([
+        "ask",
+        temp_dir.to_str().expect("valid path"),
+        "--no-llm",
+        "--format",
+        "json",
+    ]);
+    let output = run_with_timeout(&mut cmd);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "path-only query should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(json["intent_kind"].as_str(), Some("query"));
+    let response = json["response"]
+        .as_str()
+        .expect("response should be a string");
+    assert!(
+        response.contains("only-here.txt"),
+        "response should reflect requested directory"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_path_only_file_query_uses_requested_file() {
+    use std::fs;
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sunny_ask_regression_query_file_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    let file_path = temp_dir.join("single-target.rs");
+    fs::write(&file_path, "fn main() {}\n").expect("write target file");
+
+    let mut cmd = sunny_cli();
+    cmd.args([
+        "ask",
+        file_path.to_str().expect("valid path"),
+        "--no-llm",
+        "--format",
+        "json",
+    ]);
+    let output = run_with_timeout(&mut cmd);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "path-only file query should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(json["intent_kind"].as_str(), Some("query"));
+    let response = json["response"]
+        .as_str()
+        .expect("response should be a string");
+    assert!(
+        response.contains("single-target.rs"),
+        "response should reflect requested file"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
 }

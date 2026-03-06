@@ -27,6 +27,8 @@ fn tool_uses_read_budget(name: &str) -> bool {
     matches!(name, "fs_read" | "text_grep")
 }
 
+/// Agent that inspects a workspace by routing query requests through a bounded
+/// LLM tool loop or a scanner/reader fallback when providers are unavailable.
 pub struct CodebaseAgent {
     provider: Option<Arc<dyn LlmProvider>>,
     scanner: Arc<FileScanner>,
@@ -34,6 +36,7 @@ pub struct CodebaseAgent {
     cancel: CancellationToken,
 }
 
+/// Structured payload returned by [`CodebaseAgent`] for query responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodebaseResult {
     pub file_count: usize,
@@ -41,6 +44,7 @@ pub struct CodebaseResult {
     pub files: Vec<CodebaseFile>,
 }
 
+/// A single representative file snippet captured for codebase inspection output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodebaseFile {
     pub path: String,
@@ -64,6 +68,27 @@ impl CodebaseAgent {
         }
     }
 
+    fn tool_root_path(root_path: &Path) -> &Path {
+        if root_path.is_dir() {
+            root_path
+        } else {
+            root_path.parent().unwrap_or(root_path)
+        }
+    }
+
+    fn display_path(root: &Path, path: &Path) -> String {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        let rendered = relative.to_string_lossy();
+        if rendered.is_empty() {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            rendered.to_string()
+        }
+    }
+
     fn contains_git_component(path: &Path) -> bool {
         path.components()
             .any(|component| component.as_os_str() == std::ffi::OsStr::new(".git"))
@@ -83,12 +108,13 @@ impl CodebaseAgent {
     }
 
     fn resolve_tool_path(root_path: &Path, requested_path: &str) -> Result<PathBuf, ToolError> {
-        let canonical_root = std::fs::canonicalize(root_path).map_err(|err| match err.kind() {
+        let tool_root = Self::tool_root_path(root_path);
+        let canonical_root = std::fs::canonicalize(tool_root).map_err(|err| match err.kind() {
             std::io::ErrorKind::NotFound => ToolError::PathNotFound {
-                path: root_path.display().to_string(),
+                path: tool_root.display().to_string(),
             },
             std::io::ErrorKind::PermissionDenied => ToolError::PermissionDenied {
-                path: root_path.display().to_string(),
+                path: tool_root.display().to_string(),
             },
             _ => ToolError::ExecutionFailed {
                 source: Box::new(err),
@@ -136,10 +162,14 @@ impl CodebaseAgent {
         Ok(canonical_candidate)
     }
 
+    /// Create a codebase agent using default filesystem tools and a fresh
+    /// cancellation token.
     pub fn new(provider: Option<Arc<dyn LlmProvider>>) -> Self {
         Self::with_cancel(provider, CancellationToken::new())
     }
 
+    /// Create a codebase agent that shares the supplied cancellation token with
+    /// external orchestration so in-flight tool work stops promptly.
     pub fn with_cancel(provider: Option<Arc<dyn LlmProvider>>, cancel: CancellationToken) -> Self {
         Self {
             provider,
@@ -149,6 +179,7 @@ impl CodebaseAgent {
         }
     }
 
+    /// Create a codebase agent with custom scanner/reader implementations.
     pub fn with_tools(
         provider: Option<Arc<dyn LlmProvider>>,
         scanner: FileScanner,
@@ -283,7 +314,9 @@ impl CodebaseAgent {
                     .take(TOOL_LOOP_SCAN_MAX_FILES)
                     .map(|f| f.path.to_string_lossy().to_string())
                     .collect();
-                Ok(serde_json::to_string(&files).unwrap_or_default())
+                serde_json::to_string(&files).map_err(|e| ToolError::ExecutionFailed {
+                    source: Box::new(e),
+                })
             }
             "fs_read" => {
                 let args: serde_json::Value =
@@ -330,7 +363,9 @@ impl CodebaseAgent {
                     .iter()
                     .map(|m| format!("{}:{}", m.line_number, m.line_content))
                     .collect();
-                Ok(serde_json::to_string(&matches).unwrap_or_default())
+                serde_json::to_string(&matches).map_err(|e| ToolError::ExecutionFailed {
+                    source: Box::new(e),
+                })
             }
             _ => Err(ToolError::ExecutionFailed {
                 source: Box::new(std::io::Error::other(format!(
@@ -462,22 +497,21 @@ impl CodebaseAgent {
                 idx += 1;
             }
 
-            if let Some(result) = join_set.join_next().await {
-                if self.cancel.is_cancelled() {
+            let result = tokio::select! {
+                _ = self.cancel.cancelled() => {
                     join_set.abort_all();
                     return Err(Self::cancelled_error("fallback"));
                 }
+                result = join_set.join_next(), if in_flight > 0 => result,
+            };
 
+            if let Some(result) = result {
                 in_flight = in_flight.saturating_sub(1);
                 match result {
                     Ok((current_idx, root, path, Ok(content))) => {
                         let mut text = content.content;
                         let truncated = Self::safe_truncate(&mut text, MAX_FILE_BYTES);
-                        let rel_path = path
-                            .strip_prefix(&root)
-                            .unwrap_or(&path)
-                            .to_string_lossy()
-                            .to_string();
+                        let rel_path = Self::display_path(&root, &path);
                         files.push((
                             current_idx,
                             CodebaseFile {

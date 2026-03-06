@@ -12,10 +12,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info_span, Instrument};
 
 const TOOL_TIMEOUT_SECS: u64 = 30;
+/// Event name emitted when the tool-call loop exits because cancellation was requested.
 pub const EVENT_TOOL_CANCELLED: &str = "tool.exec.cancelled";
 
+/// Synchronous tool executor used by [`ToolCallLoop`] to run approved tool calls.
 pub type ToolExecutor = dyn Fn(&str, &str, &str, usize) -> Result<String, ToolError> + Send + Sync;
 
+/// Executes bounded provider/tool iterations while enforcing policy, timeout, and cancellation.
 pub struct ToolCallLoop<P: LlmProvider + ?Sized> {
     provider: Arc<P>,
     policy: ToolPolicy,
@@ -24,6 +27,7 @@ pub struct ToolCallLoop<P: LlmProvider + ?Sized> {
     tool_timeout: Duration,
 }
 
+/// Errors that can terminate a [`ToolCallLoop`] run.
 #[derive(thiserror::Error, Debug)]
 pub enum ToolCallError {
     #[error("tool not allowed by policy: {tool_name}")]
@@ -48,6 +52,7 @@ pub enum ToolCallError {
     Cancelled,
 }
 
+/// Aggregate metrics collected across a single [`ToolCallLoop`] execution.
 #[derive(Debug, Clone, Default)]
 pub struct ToolCallMetrics {
     pub iterations: usize,
@@ -55,12 +60,14 @@ pub struct ToolCallMetrics {
     pub tools_by_name: HashMap<String, usize>,
 }
 
+/// Final provider response and metrics returned from a [`ToolCallLoop`] run.
 pub struct ToolCallResult {
     pub response: LlmResponse,
     pub metrics: ToolCallMetrics,
 }
 
 impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
+    /// Create a tool-call loop with explicit provider, policy, iteration limit, and cancellation.
     pub fn new(
         provider: Arc<P>,
         policy: ToolPolicy,
@@ -83,6 +90,7 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
         self
     }
 
+    /// Run the provider/tool loop until the model returns a final response or an error occurs.
     pub async fn run(
         &self,
         request: LlmRequest,
