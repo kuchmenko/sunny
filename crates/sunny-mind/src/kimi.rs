@@ -4,7 +4,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::{LlmError, LlmProvider};
-use crate::{LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage, ToolChoice, ToolDefinition};
+use crate::{LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage, ToolChoice};
 
 const DEFAULT_KIMI_API_BASE_URL: &str = "https://api.moonshot.ai/v1";
 const DEFAULT_KIMI_API_MODEL: &str = "kimi-k2.5";
@@ -147,9 +147,22 @@ struct KimiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<ToolDefinition>>,
+    tools: Option<Vec<KimiToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoice>,
+}
+
+#[derive(Serialize)]
+struct KimiToolDefinition {
+    r#type: &'static str,
+    function: KimiToolFunction,
+}
+
+#[derive(Serialize)]
+struct KimiToolFunction {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -170,7 +183,24 @@ struct KimiMessage {
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
-    tool_calls: Option<Vec<crate::ToolCall>>,
+    tool_calls: Option<Vec<KimiToolCall>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct KimiToolCall {
+    id: String,
+    #[serde(default)]
+    function: Option<KimiToolCallFunction>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct KimiToolCallFunction {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Deserialize)]
@@ -191,12 +221,25 @@ impl LlmProvider for KimiProvider {
     }
 
     async fn chat(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
+        let tools = req.tools.map(|defs| {
+            defs.into_iter()
+                .map(|def| KimiToolDefinition {
+                    r#type: "function",
+                    function: KimiToolFunction {
+                        name: def.name,
+                        description: def.description,
+                        parameters: def.parameters,
+                    },
+                })
+                .collect::<Vec<_>>()
+        });
+
         let payload = KimiChatRequest {
             model: self.model.clone(),
             messages: req.messages,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
-            tools: req.tools,
+            tools,
             tool_choice: req.tool_choice,
         };
 
@@ -276,6 +319,28 @@ impl LlmProvider for KimiProvider {
                 .unwrap_or_default()
         };
 
+        let tool_calls = first_choice.message.tool_calls.clone().map(|calls| {
+            calls
+                .into_iter()
+                .map(|call| {
+                    let (name, arguments) = match call.function {
+                        Some(function) => (function.name, function.arguments),
+                        None => (
+                            call.name.unwrap_or_default(),
+                            call.arguments.unwrap_or_else(|| "{}".to_string()),
+                        ),
+                    };
+
+                    crate::ToolCall {
+                        id: call.id,
+                        name,
+                        arguments,
+                        execution_depth: 0,
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+
         Ok(LlmResponse {
             content,
             usage: TokenUsage {
@@ -286,7 +351,7 @@ impl LlmProvider for KimiProvider {
             finish_reason: first_choice.finish_reason.clone(),
             provider_id: ProviderId(self.provider_id().to_string()),
             model_id: ModelId(self.model.clone()),
-            tool_calls: first_choice.message.tool_calls.clone(),
+            tool_calls,
         })
     }
 }
@@ -640,8 +705,11 @@ mod tests {
                             "tool_calls": [
                                 {
                                     "id": "call_abc123",
-                                    "name": "get_weather",
-                                    "arguments": "{\"location\":\"NYC\"}"
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": "{\"location\":\"NYC\"}"
+                                    }
                                 }
                             ]
                         },
@@ -692,9 +760,12 @@ mod tests {
                 "temperature": 0.2,
                 "tools": [
                     {
-                        "name": "get_weather",
-                        "description": "Get weather for a location",
-                        "parameters": {"type": "object", "properties": {"location": {"type": "string"}}}
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Get weather for a location",
+                            "parameters": {"type": "object", "properties": {"location": {"type": "string"}}}
+                        }
                     }
                 ],
                 "tool_choice": "auto"
