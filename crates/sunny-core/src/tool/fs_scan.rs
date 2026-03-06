@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use ignore::gitignore::GitignoreBuilder;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use super::error::ToolError;
@@ -80,7 +80,23 @@ impl FileScanner {
 
         let gitignore = {
             let mut builder = GitignoreBuilder::new(path);
-            let _ = builder.add(path.join(".gitignore"));
+            for entry in WalkDir::new(path)
+                .max_depth(self.max_depth)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                if !entry.file_type().is_file() || entry.file_name() != ".gitignore" {
+                    continue;
+                }
+
+                if let Some(error) = builder.add(entry.path()) {
+                    warn!(
+                        gitignore_path = %entry.path().display(),
+                        error = %error,
+                        "failed to load .gitignore, continuing scan"
+                    );
+                }
+            }
             builder
                 .build()
                 .map_err(|source| ToolError::ExecutionFailed {
@@ -118,18 +134,11 @@ impl FileScanner {
             });
 
         for entry in walker.filter_map(Result::ok) {
-            let entry_path = entry.path();
-
-            if gitignore
-                .matched_path_or_any_parents(entry_path, false)
-                .is_ignore()
-            {
-                continue;
-            }
-
             if !entry.file_type().is_file() {
                 continue;
             }
+
+            let entry_path = entry.path();
 
             if files.len() >= self.max_files {
                 truncated = true;

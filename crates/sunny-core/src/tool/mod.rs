@@ -1,7 +1,7 @@
 pub mod error;
 pub mod fs_read;
 pub mod fs_scan;
-pub mod policy;
+mod policy;
 pub mod text_grep;
 
 pub use error::ToolError;
