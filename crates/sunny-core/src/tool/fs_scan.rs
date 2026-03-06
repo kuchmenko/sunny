@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use ignore::gitignore::GitignoreBuilder;
 use tracing::{debug, info};
 use walkdir::WalkDir;
 
@@ -77,6 +78,16 @@ impl FileScanner {
         let mut total_size_bytes: u64 = 0;
         let mut truncated = false;
 
+        let gitignore = {
+            let mut builder = GitignoreBuilder::new(path);
+            let _ = builder.add(path.join(".gitignore"));
+            builder
+                .build()
+                .map_err(|source| ToolError::ExecutionFailed {
+                    source: Box::new(source),
+                })?
+        };
+
         debug!(
             path = %path.display(),
             max_files = self.max_files,
@@ -88,16 +99,34 @@ impl FileScanner {
             .max_depth(self.max_depth)
             .into_iter()
             .filter_entry(|entry| {
+                let entry_path = entry.path();
+
+                if gitignore
+                    .matched_path_or_any_parents(entry_path, entry.file_type().is_dir())
+                    .is_ignore()
+                {
+                    return false;
+                }
+
                 if entry.file_type().is_dir() {
                     !ignore_dirs
                         .iter()
-                        .any(|pattern| entry.path().ends_with(Path::new(pattern.as_str())))
+                        .any(|pattern| entry_path.ends_with(Path::new(pattern.as_str())))
                 } else {
                     true
                 }
             });
 
-        for entry in walker.filter_map(|e| e.ok()) {
+        for entry in walker.filter_map(Result::ok) {
+            let entry_path = entry.path();
+
+            if gitignore
+                .matched_path_or_any_parents(entry_path, false)
+                .is_ignore()
+            {
+                continue;
+            }
+
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -114,14 +143,13 @@ impl FileScanner {
 
             total_size_bytes = total_size_bytes.saturating_add(size);
 
-            let extension = entry
-                .path()
+            let extension = entry_path
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .map(|s| s.to_string());
 
             files.push(ScannedFile {
-                path: entry.path().to_path_buf(),
+                path: entry_path.to_path_buf(),
                 size_bytes: size,
                 extension,
             });
@@ -217,6 +245,38 @@ mod tests {
             result.files[0].path.file_name().expect("has filename"),
             "keep.txt"
         );
+    }
+
+    #[test]
+    fn test_scan_respects_gitignore_rules() {
+        let dir = tempdir().expect("create temp dir");
+        fs::write(dir.path().join("keep.txt"), "kept").expect("write keep");
+        fs::write(dir.path().join("ignored.log"), "ignored").expect("write ignored file");
+
+        let ignored_dir = dir.path().join("ignored_dir");
+        fs::create_dir_all(&ignored_dir).expect("create ignored dir");
+        fs::write(ignored_dir.join("nested.txt"), "ignored nested").expect("write ignored nested");
+
+        fs::write(dir.path().join(".gitignore"), "*.log\nignored_dir/\n")
+            .expect("write .gitignore");
+
+        let scanner = FileScanner::default();
+        let result = scanner.scan(dir.path()).expect("scan succeeds");
+
+        let names: Vec<String> = result
+            .files
+            .iter()
+            .filter_map(|f| {
+                f.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+            })
+            .collect();
+
+        assert!(names.contains(&"keep.txt".to_string()));
+        assert!(!names.contains(&"ignored.log".to_string()));
+        assert!(!names.contains(&"nested.txt".to_string()));
     }
 
     #[test]
