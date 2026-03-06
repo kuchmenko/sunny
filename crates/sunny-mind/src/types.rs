@@ -29,6 +29,10 @@ pub struct LlmRequest {
     pub messages: Vec<ChatMessage>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDefinition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,6 +84,8 @@ pub struct LlmResponse {
     pub finish_reason: String,
     pub provider_id: ProviderId,
     pub model_id: ModelId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// Policy for routing requests across LLM providers.

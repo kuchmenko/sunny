@@ -4,7 +4,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::{LlmError, LlmProvider};
-use crate::{LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage};
+use crate::{LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage, ToolChoice, ToolDefinition};
 
 const DEFAULT_KIMI_API_BASE_URL: &str = "https://api.moonshot.ai/v1";
 const DEFAULT_KIMI_API_MODEL: &str = "kimi-k2.5";
@@ -146,6 +146,10 @@ struct KimiChatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
 }
 
 #[derive(Deserialize)]
@@ -165,6 +169,8 @@ struct KimiMessage {
     content: String,
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<crate::ToolCall>>,
 }
 
 #[derive(Deserialize)]
@@ -190,6 +196,8 @@ impl LlmProvider for KimiProvider {
             messages: req.messages,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
+            tools: req.tools,
+            tool_choice: req.tool_choice,
         };
 
         let response = self
@@ -278,6 +286,7 @@ impl LlmProvider for KimiProvider {
             finish_reason: first_choice.finish_reason.clone(),
             provider_id: ProviderId(self.provider_id().to_string()),
             model_id: ModelId(self.model.clone()),
+            tool_calls: first_choice.message.tool_calls.clone(),
         })
     }
 }
@@ -319,6 +328,8 @@ mod tests {
             }],
             max_tokens: Some(128),
             temperature: Some(0.2),
+            tools: None,
+            tool_choice: None,
         }
     }
 
@@ -613,5 +624,125 @@ mod tests {
             .await
             .expect("chat should succeed");
         assert_eq!(res.provider_id, ProviderId("kimi".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_kimi_chat_with_tool_call_response() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_abc123",
+                                    "name": "get_weather",
+                                    "arguments": "{\"location\":\"NYC\"}"
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 15,
+                    "completion_tokens": 25,
+                    "total_tokens": 40
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = KimiProvider::new(
+            "test-key".to_string(),
+            format!("{}/v1", server.uri()),
+            "kimi-k2.5".to_string(),
+            Duration::from_secs(1),
+        );
+
+        let res = provider
+            .chat(test_request())
+            .await
+            .expect("chat should succeed");
+
+        assert_eq!(res.finish_reason, "tool_calls");
+        let tool_calls = res.tool_calls.expect("tool_calls should be present");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_abc123");
+        assert_eq!(tool_calls[0].name, "get_weather");
+        assert_eq!(tool_calls[0].arguments, "{\"location\":\"NYC\"}");
+    }
+
+    #[tokio::test]
+    async fn test_kimi_chat_request_with_tools() {
+        use crate::{ToolChoice, ToolDefinition};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_json(serde_json::json!({
+                "model": "kimi-k2.5",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 128,
+                "temperature": 0.2,
+                "tools": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get weather for a location",
+                        "parameters": {"type": "object", "properties": {"location": {"type": "string"}}}
+                    }
+                ],
+                "tool_choice": "auto"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [
+                    {
+                        "message": { "content": "I'll check the weather." },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 10,
+                    "total_tokens": 30
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = KimiProvider::new(
+            "test-key".to_string(),
+            format!("{}/v1", server.uri()),
+            "kimi-k2.5".to_string(),
+            Duration::from_secs(1),
+        );
+
+        let req = LlmRequest {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+            }],
+            max_tokens: Some(128),
+            temperature: Some(0.2),
+            tools: Some(vec![ToolDefinition {
+                name: "get_weather".to_string(),
+                description: "Get weather for a location".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}}
+                }),
+            }]),
+            tool_choice: Some(ToolChoice::Auto),
+        };
+
+        let res = provider.chat(req).await.expect("chat should succeed");
+
+        assert_eq!(res.content, "I'll check the weather.");
+        assert!(res.tool_calls.is_none());
     }
 }

@@ -14,11 +14,13 @@
 
 pub mod error;
 pub mod kimi;
+pub mod mock_provider;
 pub mod provider;
 pub mod types;
 
 pub use error::LlmError;
 pub use kimi::KimiProvider;
+pub use mock_provider::MockToolCallProvider;
 pub use provider::LlmProvider;
 pub use types::{
     ChatMessage, ChatRole, LlmRequest, LlmResponse, ModelId, ProviderEconomics, ProviderId,
@@ -62,6 +64,8 @@ mod tests {
             }],
             max_tokens: None,
             temperature: None,
+            tools: None,
+            tool_choice: None,
         };
         assert_eq!(req.messages.len(), 1);
         assert!(req.max_tokens.is_none());
@@ -71,6 +75,8 @@ mod tests {
             messages: vec![],
             max_tokens: Some(1024),
             temperature: Some(0.7),
+            tools: None,
+            tool_choice: None,
         };
         assert_eq!(req_with_opts.max_tokens, Some(1024));
         assert_eq!(req_with_opts.temperature, Some(0.7));
@@ -88,6 +94,7 @@ mod tests {
             finish_reason: "stop".to_string(),
             provider_id: ProviderId("test-provider".to_string()),
             model_id: ModelId("test-model".to_string()),
+            tool_calls: None,
         };
         assert_eq!(res.content, "Generated text");
         assert_eq!(res.finish_reason, "stop");
@@ -193,10 +200,123 @@ mod tests {
             messages: vec![msg.clone()],
             max_tokens: Some(512),
             temperature: Some(0.5),
+            tools: None,
+            tool_choice: None,
         };
         let req_json = serde_json::to_string(&req).expect("serialize LlmRequest");
         let req_de: LlmRequest = serde_json::from_str(&req_json).expect("deserialize LlmRequest");
         assert_eq!(req, req_de);
+    }
+
+    #[test]
+    fn test_llm_request_with_tools() {
+        let request = LlmRequest {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "Use a tool".to_string(),
+            }],
+            max_tokens: Some(128),
+            temperature: Some(0.2),
+            tools: Some(vec![ToolDefinition {
+                name: "search_web".to_string(),
+                description: "Searches the web".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    },
+                    "required": ["query"]
+                }),
+            }]),
+            tool_choice: Some(ToolChoice::Required),
+        };
+
+        let actual = serde_json::to_value(&request).expect("serialize request with tools");
+
+        // Compare temperature separately to avoid f32→f64 precision mismatch
+        let temp_val = actual.get("temperature").expect("temperature present");
+        let temp_f = temp_val.as_f64().expect("temperature is number");
+        assert!((temp_f - 0.2).abs() < 1e-6, "temperature should be ~0.2");
+
+        let expected_rest = serde_json::json!({
+            "messages": [{"role": "user", "content": "Use a tool"}],
+            "max_tokens": 128,
+            "tools": [{
+                "name": "search_web",
+                "description": "Searches the web",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"]
+                }
+            }],
+            "tool_choice": "required"
+        });
+        assert_eq!(actual.get("messages"), expected_rest.get("messages"));
+        assert_eq!(actual.get("max_tokens"), expected_rest.get("max_tokens"));
+        assert_eq!(actual.get("tools"), expected_rest.get("tools"));
+        assert_eq!(actual.get("tool_choice"), expected_rest.get("tool_choice"));
+
+        let backward_compatible_request = LlmRequest {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "test".to_string(),
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let backward_actual =
+            serde_json::to_value(&backward_compatible_request).expect("serialize default request");
+        let backward_expected = serde_json::json!({
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": null,
+            "temperature": null
+        });
+        assert_eq!(backward_actual, backward_expected);
+    }
+
+    #[test]
+    fn test_llm_response_with_tool_calls() {
+        let response = LlmResponse {
+            content: "".to_string(),
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 8,
+                total_tokens: 18,
+            },
+            finish_reason: "tool_calls".to_string(),
+            provider_id: ProviderId("test-provider".to_string()),
+            model_id: ModelId("test-model".to_string()),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_123".to_string(),
+                name: "search_web".to_string(),
+                arguments: "{\"query\":\"sunny\"}".to_string(),
+            }]),
+        };
+
+        let actual = serde_json::to_value(&response).expect("serialize response with tool calls");
+        let expected = serde_json::json!({
+            "content": "",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 8,
+                "total_tokens": 18
+            },
+            "finish_reason": "tool_calls",
+            "provider_id": "test-provider",
+            "model_id": "test-model",
+            "tool_calls": [{
+                "id": "call_123",
+                "name": "search_web",
+                "arguments": "{\"query\":\"sunny\"}"
+            }]
+        });
+        assert_eq!(actual, expected);
     }
 
     #[test]

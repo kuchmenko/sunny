@@ -183,6 +183,8 @@ language mix, and probable architecture boundaries.\n\nDIGEST:\n{digest}"
             ],
             max_tokens: Some(600),
             temperature: Some(1.0),
+            tools: None,
+            tool_choice: None,
         };
         match provider.chat(request).await {
             Ok(response) => {
@@ -354,6 +356,7 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 provider_id: ProviderId("mock".to_string()),
                 model_id: ModelId("mock-model".to_string()),
+                tool_calls: None,
             })
         }
     }
