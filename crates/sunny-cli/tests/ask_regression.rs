@@ -202,7 +202,7 @@ fn test_all_formats_work() {
                 format,
             ])
             .output()
-            .expect(&format!("should run ask with {} format", format));
+            .unwrap_or_else(|_| panic!("should run ask with {} format", format));
 
         assert!(
             output.status.success(),
@@ -254,9 +254,9 @@ fn test_ask_with_real_files() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Should produce valid JSON
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).expect("output should be valid JSON");
+    // Should produce valid JSON (verified by successful deserialization)
+    let _json: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("output should be valid JSON"));
 
     // Cleanup
     let _ = fs::remove_dir_all(&temp_dir);

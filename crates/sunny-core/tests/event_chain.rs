@@ -208,8 +208,8 @@ fn test_event_pairs_balanced() {
 
     for (start, end) in &pairs {
         // Start and end should share the same prefix
-        let start_prefix = start.rsplitn(2, '.').nth(1).unwrap_or(start);
-        let end_prefix = end.rsplitn(2, '.').nth(1).unwrap_or(end);
+        let start_prefix = start.rsplit_once('.').map(|x| x.0).unwrap_or(start);
+        let end_prefix = end.rsplit_once('.').map(|x| x.0).unwrap_or(end);
         assert_eq!(
             start_prefix, end_prefix,
             "Start event '{}' and end event '{}' should share prefix",
