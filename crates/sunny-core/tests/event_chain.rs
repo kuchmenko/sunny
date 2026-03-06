@@ -17,6 +17,8 @@ fn test_event_chain_completeness() {
     assert!(!EVENT_TOOL_EXEC_END.is_empty());
     assert!(!EVENT_TOOL_EXEC_ERROR.is_empty());
     assert!(!EVENT_TOOL_EXEC_DEPTH.is_empty());
+    assert!(!EVENT_TOOL_EXEC_TIMEOUT.is_empty());
+    assert!(!EVENT_TOOL_CANCELLED.is_empty());
 }
 
 #[test]
@@ -121,6 +123,8 @@ fn test_event_pairs_balanced() {
     ];
 
     for (start, end) in &pairs {
+        assert!(start.ends_with(".start"));
+        assert!(end.ends_with(".end"));
         let start_prefix = start.rsplit_once('.').map(|x| x.0).unwrap_or(start);
         let end_prefix = end.rsplit_once('.').map(|x| x.0).unwrap_or(end);
         assert_eq!(
@@ -134,10 +138,12 @@ fn test_event_pairs_balanced() {
 #[test]
 fn test_error_event_coverage() {
     assert!(!EVENT_TOOL_EXEC_ERROR.is_empty());
+    assert!(!EVENT_TOOL_EXEC_TIMEOUT.is_empty());
     assert!(!EVENT_DISPATCH_ERROR.is_empty());
     assert!(!EVENT_PLAN_ERROR.is_empty());
     assert!(!EVENT_AGENT_MESSAGE_ERROR.is_empty());
     assert!(!EVENT_ROUTE_FAILED.is_empty());
+    assert!(!EVENT_TOOL_CANCELLED.is_empty());
 }
 
 #[test]
@@ -147,6 +153,8 @@ fn test_event_organization() {
         EVENT_TOOL_EXEC_END,
         EVENT_TOOL_EXEC_ERROR,
         EVENT_TOOL_EXEC_DEPTH,
+        EVENT_TOOL_EXEC_TIMEOUT,
+        EVENT_TOOL_CANCELLED,
     ];
 
     for event in &tool_events {

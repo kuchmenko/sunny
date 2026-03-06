@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sunny_core::agent::{Agent, AgentContext, AgentError, AgentMessage, AgentResponse, Capability};
 use sunny_mind::{ChatMessage, ChatRole, LlmProvider, LlmRequest};
@@ -7,6 +8,8 @@ use sunny_mind::{ChatMessage, ChatRole, LlmProvider, LlmRequest};
 pub struct CritiqueAgent {
     provider: Option<Arc<dyn LlmProvider>>,
 }
+
+const PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl CritiqueAgent {
     pub fn new(provider: Option<Arc<dyn LlmProvider>>) -> Self {
@@ -83,12 +86,13 @@ impl Agent for CritiqueAgent {
 
         let mut metadata = HashMap::new();
         let feedback = if let Some(provider) = &self.provider {
-            let response = provider
-                .chat(Self::build_prompt(trimmed))
-                .await
-                .map_err(|err| AgentError::ExecutionFailed {
-                    source: Box::new(err),
-                })?;
+            let response =
+                tokio::time::timeout(PROVIDER_TIMEOUT, provider.chat(Self::build_prompt(trimmed)))
+                    .await
+                    .map_err(|_| AgentError::Timeout)?
+                    .map_err(|err| AgentError::ExecutionFailed {
+                        source: Box::new(err),
+                    })?;
             metadata.insert("mode".to_string(), "LLM_ENRICHED".to_string());
             response.content.trim().to_string()
         } else {
@@ -108,8 +112,11 @@ impl Agent for CritiqueAgent {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use sunny_core::agent::{Agent, AgentContext, AgentMessage, AgentResponse, Capability};
+    use sunny_core::agent::{
+        Agent, AgentContext, AgentError, AgentMessage, AgentResponse, Capability,
+    };
     use sunny_mind::{
         LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage,
     };
@@ -117,6 +124,8 @@ mod tests {
     use super::CritiqueAgent;
 
     struct MockProvider;
+
+    struct HangingProvider;
 
     #[async_trait::async_trait]
     impl LlmProvider for MockProvider {
@@ -140,6 +149,24 @@ mod tests {
                 provider_id: ProviderId("mock".to_string()),
                 model_id: ModelId("mock-critique".to_string()),
                 tool_calls: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for HangingProvider {
+        fn provider_id(&self) -> &str {
+            "mock"
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-hanging-critique"
+        }
+
+        async fn chat(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            tokio::time::sleep(Duration::from_secs(31)).await;
+            Err(LlmError::InvalidResponse {
+                message: "provider call should have timed out".to_string(),
             })
         }
     }
@@ -212,5 +239,16 @@ mod tests {
                 panic!("expected success, got error code={code}, message={message}");
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_critique_agent_times_out_provider_call() {
+        let agent = CritiqueAgent::new(Some(Arc::new(HangingProvider)));
+        let err = agent
+            .handle_message(mk_msg("Deploy microservices to prod"), &mk_ctx())
+            .await
+            .expect_err("provider call should time out");
+
+        assert!(matches!(err, AgentError::Timeout));
     }
 }

@@ -233,6 +233,41 @@ struct KimiToolCallFunction {
     arguments: String,
 }
 
+fn map_kimi_tool_call(call: KimiToolCall) -> Result<crate::ToolCall, LlmError> {
+    let KimiToolCall {
+        id,
+        function,
+        name,
+        arguments,
+    } = call;
+
+    let (name, arguments) = match function {
+        Some(function) => (function.name, function.arguments),
+        None => match (name, arguments) {
+            (Some(name), Some(arguments)) => (name, arguments),
+            (maybe_name, maybe_arguments) => {
+                let detail = match (maybe_name.is_some(), maybe_arguments.is_some()) {
+                    (false, false) => "missing tool call function, name, and arguments",
+                    (false, true) => "missing tool call function and name",
+                    (true, false) => "missing tool call function and arguments",
+                    (true, true) => "missing tool call function",
+                };
+
+                return Err(LlmError::InvalidResponse {
+                    message: format!("malformed Kimi tool call '{id}': {detail}"),
+                });
+            }
+        },
+    };
+
+    Ok(crate::ToolCall {
+        id,
+        name,
+        arguments,
+        execution_depth: 0,
+    })
+}
+
 #[derive(Deserialize)]
 struct KimiUsage {
     prompt_tokens: u32,
@@ -350,27 +385,17 @@ impl LlmProvider for KimiProvider {
                 .unwrap_or_default()
         };
 
-        let tool_calls = first_choice.message.tool_calls.clone().map(|calls| {
-            calls
-                .into_iter()
-                .map(|call| {
-                    let (name, arguments) = match call.function {
-                        Some(function) => (function.name, function.arguments),
-                        None => (
-                            call.name.unwrap_or_default(),
-                            call.arguments.unwrap_or_else(|| "{}".to_string()),
-                        ),
-                    };
-
-                    crate::ToolCall {
-                        id: call.id,
-                        name,
-                        arguments,
-                        execution_depth: 0,
-                    }
-                })
-                .collect::<Vec<_>>()
-        });
+        let tool_calls = first_choice
+            .message
+            .tool_calls
+            .clone()
+            .map(|calls| {
+                calls
+                    .into_iter()
+                    .map(map_kimi_tool_call)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
 
         Ok(LlmResponse {
             content,
@@ -774,6 +799,54 @@ mod tests {
         assert_eq!(tool_calls[0].id, "call_abc123");
         assert_eq!(tool_calls[0].name, "get_weather");
         assert_eq!(tool_calls[0].arguments, "{\"location\":\"NYC\"}");
+    }
+
+    #[tokio::test]
+    async fn test_kimi_chat_rejects_malformed_tool_call_without_arguments() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_bad",
+                                    "name": "get_weather"
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls"
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 15,
+                    "completion_tokens": 25,
+                    "total_tokens": 40
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = KimiProvider::new(
+            "test-key".to_string(),
+            format!("{}/v1", server.uri()),
+            "kimi-k2.5".to_string(),
+            Duration::from_secs(1),
+        );
+
+        let err = provider
+            .chat(test_request())
+            .await
+            .expect_err("malformed tool call should fail");
+
+        assert!(matches!(err, LlmError::InvalidResponse { .. }));
+        assert!(err
+            .to_string()
+            .contains("malformed Kimi tool call 'call_bad'"));
     }
 
     #[tokio::test]

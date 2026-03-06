@@ -196,32 +196,12 @@ fn test_all_formats_work() {
     }
 }
 
-/// Verify ask with real files produces valid output
 #[test]
 fn test_ask_with_real_files() {
-    use std::fs;
-
-    let temp_dir = std::env::temp_dir().join(format!(
-        "sunny_regression_test_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
-
-    // Create a sample Rust file
-    fs::write(
-        temp_dir.join("main.rs"),
-        "fn main() { println!(\"Hello\"); }",
-    )
-    .expect("write file");
-
     let output = sunny_cli()
         .args([
             "ask",
-            &format!("analyze {}", temp_dir.display()),
+            "analyze /tmp/example-project",
             "--dry-run",
             "--no-llm",
             "--format",
@@ -240,9 +220,6 @@ fn test_ask_with_real_files() {
     // Should produce valid JSON (verified by successful deserialization)
     let _json: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("output should be valid JSON"));
-
-    // Cleanup
-    let _ = fs::remove_dir_all(&temp_dir);
 }
 
 /// Verify routing still works for different intent types

@@ -213,18 +213,8 @@ fn test_e2e_query_routing() {
     let json: serde_json::Value =
         serde_json::from_str(&stdout).expect("output should be valid JSON");
 
-    // Verify: intent_kind is present (may vary by input)
-    assert!(
-        json["intent_kind"].is_string(),
-        "intent_kind should be present, got: {:?}",
-        json["intent_kind"]
-    );
-
-    // Verify: routes correctly (should have capability field)
-    assert!(
-        json.get("required_capability").is_some(),
-        "should have required_capability field"
-    );
+    assert_eq!(json["intent_kind"].as_str(), Some("query"));
+    assert_eq!(json["required_capability"].as_str(), Some("query"));
 
     // Cleanup
     let _ = fs::remove_dir_all(&temp_dir);

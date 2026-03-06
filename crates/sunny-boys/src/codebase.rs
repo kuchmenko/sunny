@@ -23,6 +23,10 @@ const TOOL_LOOP_SCAN_MAX_FILES: usize = 400;
 const TOOL_LOOP_MAX_READ_CALLS: usize = 6;
 const FALLBACK_READ_CONCURRENCY: usize = 6;
 
+fn tool_uses_read_budget(name: &str) -> bool {
+    matches!(name, "fs_read" | "text_grep")
+}
+
 pub struct CodebaseAgent {
     provider: Option<Arc<dyn LlmProvider>>,
     scanner: Arc<FileScanner>,
@@ -384,9 +388,15 @@ impl CodebaseAgent {
             "CodebaseAgent using fallback scanner+reader"
         );
 
-        let scan = self
-            .scanner
-            .scan(root_path)
+        let scanner = self.scanner.clone();
+        let root_path_buf = root_path.to_path_buf();
+        let scan = tokio::task::spawn_blocking(move || scanner.scan(&root_path_buf))
+            .await
+            .map_err(|join_err| AgentError::ExecutionFailed {
+                source: Box::new(std::io::Error::other(format!(
+                    "fallback scan task failed: {join_err}"
+                ))),
+            })?
             .map_err(|e| AgentError::ExecutionFailed {
                 source: Box::new(e),
             })?;
@@ -562,9 +572,10 @@ impl Agent for CodebaseAgent {
                     content: format!(
                         "You are a codebase analysis assistant. Use the fs_scan, fs_read, and text_grep tools to explore the codebase at: {}. \
                          Focus on key architecture files and avoid exhaustive reads. \
-                         Read at most 8 files and stop when enough context is gathered. \
+                         Read at most {} files and stop when enough context is gathered. \
                          Provide a concise summary of structure and key modules.",
-                        root_path.display()
+                        root_path.display(),
+                        TOOL_LOOP_MAX_READ_CALLS
                     ),
                 },
                 ChatMessage {
@@ -598,13 +609,12 @@ impl Agent for CodebaseAgent {
         let read_calls_for_tool = read_calls.clone();
         let executor = Arc::new(
             move |_id: &str, name: &str, arguments: &str, _depth: usize| {
-                if name == "fs_read" {
+                if tool_uses_read_budget(name) {
                     let count = read_calls_for_tool.fetch_add(1, Ordering::Relaxed) + 1;
                     if count > TOOL_LOOP_MAX_READ_CALLS {
                         return Err(ToolError::ExecutionFailed {
                             source: Box::new(std::io::Error::other(format!(
-                                "fs_read call budget exceeded: {} > {}",
-                                count, TOOL_LOOP_MAX_READ_CALLS
+                                "read-like tool call budget exceeded for {name}: {count} > {TOOL_LOOP_MAX_READ_CALLS}"
                             ))),
                         });
                     }
@@ -666,7 +676,7 @@ impl Agent for CodebaseAgent {
         let mut metadata = HashMap::new();
         metadata.insert("mode".to_string(), "LLM_TOOL_LOOP".to_string());
         metadata.insert(
-            "file_count".to_string(),
+            "tool_call_count".to_string(),
             result.metrics.total_tool_calls.to_string(),
         );
         metadata.insert(
@@ -695,6 +705,7 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -706,7 +717,7 @@ mod tests {
         LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage, ToolCall,
     };
 
-    use super::{CodebaseAgent, CodebaseResult};
+    use super::{tool_uses_read_budget, CodebaseAgent, CodebaseResult, TOOL_LOOP_MAX_READ_CALLS};
 
     fn mk_ctx() -> AgentContext {
         AgentContext {
@@ -949,7 +960,10 @@ mod tests {
             AgentResponse::Success { content, metadata } => {
                 assert_eq!(content, "Found 2 Rust source files in the codebase.");
                 assert_eq!(metadata.get("iterations").map(String::as_str), Some("2"));
-                assert_eq!(metadata.get("file_count").map(String::as_str), Some("1"));
+                assert_eq!(
+                    metadata.get("tool_call_count").map(String::as_str),
+                    Some("1")
+                );
             }
             AgentResponse::Error { code, message } => {
                 panic!("expected success, got error code={code}, message={message}");
@@ -1042,5 +1056,154 @@ mod tests {
         assert!(matches!(err, ToolError::SensitiveFileDenied { .. }));
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    struct RequestCapturingProvider {
+        request_seen: Arc<Mutex<Vec<LlmRequest>>>,
+        response: LlmResponse,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RequestCapturingProvider {
+        fn provider_id(&self) -> &str {
+            "capture"
+        }
+
+        fn model_id(&self) -> &str {
+            "capture-model"
+        }
+
+        async fn chat(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            self.request_seen.lock().await.push(req);
+            Ok(self.response.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_codebase_agent_prompt_matches_read_budget() {
+        let dir = mk_temp_dir("prompt_budget");
+        fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(RequestCapturingProvider {
+            request_seen: seen.clone(),
+            response: LlmResponse {
+                content: "done".to_string(),
+                usage: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    total_tokens: 2,
+                },
+                finish_reason: "stop".to_string(),
+                provider_id: ProviderId("capture".to_string()),
+                model_id: ModelId("capture-model".to_string()),
+                tool_calls: None,
+            },
+        });
+        let agent = CodebaseAgent::new(Some(provider));
+
+        agent
+            .handle_message(mk_msg(dir.to_str().expect("path str")), &mk_ctx())
+            .await
+            .expect("agent response");
+
+        let requests = seen.lock().await;
+        let system_prompt = &requests[0].messages[0].content;
+        assert!(system_prompt.contains(&format!("Read at most {} files", TOOL_LOOP_MAX_READ_CALLS)));
+
+        fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    struct FailingReadBudgetProvider {
+        response_sent: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailingReadBudgetProvider {
+        fn provider_id(&self) -> &str {
+            "budget"
+        }
+
+        fn model_id(&self) -> &str {
+            "budget-model"
+        }
+
+        async fn chat(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            if self.response_sent.swap(true, AtomicOrdering::SeqCst) {
+                return Ok(LlmResponse {
+                    content: "unused".to_string(),
+                    usage: TokenUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_tokens: 0,
+                    },
+                    finish_reason: "stop".to_string(),
+                    provider_id: ProviderId("budget".to_string()),
+                    model_id: ModelId("budget-model".to_string()),
+                    tool_calls: None,
+                });
+            }
+
+            let tool_calls = (0..=TOOL_LOOP_MAX_READ_CALLS)
+                .map(|idx| ToolCall {
+                    id: format!("call-{idx}"),
+                    name: "text_grep".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "main.rs",
+                        "pattern": "fn"
+                    })
+                    .to_string(),
+                    execution_depth: 0,
+                })
+                .collect();
+
+            Ok(LlmResponse {
+                content: "searching".to_string(),
+                usage: TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                },
+                finish_reason: "tool_calls".to_string(),
+                provider_id: ProviderId("budget".to_string()),
+                model_id: ModelId("budget-model".to_string()),
+                tool_calls: Some(tool_calls),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_codebase_agent_counts_text_grep_against_read_budget() {
+        let dir = mk_temp_dir("grep_budget");
+        fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
+
+        let agent = CodebaseAgent::new(Some(Arc::new(FailingReadBudgetProvider {
+            response_sent: AtomicBool::new(false),
+        })));
+
+        let response = agent
+            .handle_message(mk_msg(dir.to_str().expect("path str")), &mk_ctx())
+            .await
+            .expect("agent response");
+
+        let (result, metadata) = parse_success(response);
+        assert_eq!(
+            metadata.get("mode").map(String::as_str),
+            Some("TOOL_ONLY_FALLBACK")
+        );
+        assert_eq!(
+            metadata.get("fallback_reason").map(String::as_str),
+            Some("tool_loop_error")
+        );
+        assert_eq!(result.files.len(), 1);
+
+        fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn test_tool_uses_read_budget_matches_supported_read_tools() {
+        assert!(tool_uses_read_budget("fs_read"));
+        assert!(tool_uses_read_budget("text_grep"));
+        assert!(!tool_uses_read_budget("fs_scan"));
     }
 }
