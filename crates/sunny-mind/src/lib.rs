@@ -272,10 +272,9 @@ mod tests {
 
         let backward_actual =
             serde_json::to_value(&backward_compatible_request).expect("serialize default request");
+        // With skip_serializing_if, None fields are omitted for compactness
         let backward_expected = serde_json::json!({
-            "messages": [{"role": "user", "content": "test"}],
-            "max_tokens": null,
-            "temperature": null
+            "messages": [{"role": "user", "content": "test"}]
         });
         assert_eq!(backward_actual, backward_expected);
     }
