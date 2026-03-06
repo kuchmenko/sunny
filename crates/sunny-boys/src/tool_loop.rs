@@ -6,7 +6,7 @@ use sunny_core::tool::{ToolError, ToolPolicy};
 use sunny_mind::{ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::info_span;
+use tracing::{info_span, Instrument};
 
 const TOOL_TIMEOUT_SECS: u64 = 30;
 pub const EVENT_TOOL_CANCELLED: &str = "tool.exec.cancelled";
@@ -100,84 +100,91 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
                 });
             }
 
-            {
-                let _span = info_span!(
-                    "tool_call_iteration",
-                    iteration = metrics.iterations,
-                    depth,
-                    event = sunny_core::orchestrator::events::EVENT_TOOL_EXEC_DEPTH,
-                )
-                .entered();
-            }
+            let iteration = metrics.iterations;
+            let iteration_result = async {
+                metrics.iterations += 1;
 
-            metrics.iterations += 1;
+                let response = self
+                    .provider
+                    .chat(current_request.clone())
+                    .await
+                    .map_err(|source| ToolCallError::Llm { source })?;
 
-            let response = self
-                .provider
-                .chat(current_request.clone())
-                .await
-                .map_err(|source| ToolCallError::Llm { source })?;
+                let Some(tool_calls) = response
+                    .tool_calls
+                    .clone()
+                    .filter(|calls| !calls.is_empty())
+                else {
+                    return Ok::<_, ToolCallError>((response, None));
+                };
 
-            let Some(tool_calls) = response
-                .tool_calls
-                .clone()
-                .filter(|calls| !calls.is_empty())
-            else {
-                return Ok(ToolCallResult { response, metrics });
-            };
-
-            metrics.total_tool_calls += tool_calls.len();
-            for tool_call in &tool_calls {
-                *metrics
-                    .tools_by_name
-                    .entry(tool_call.name.clone())
-                    .or_insert(0) += 1;
-            }
-
-            let mut tool_results = Vec::with_capacity(tool_calls.len());
-            for mut tool_call in tool_calls {
-                if !self.policy.is_allowed(&tool_call.name) {
-                    return Err(ToolCallError::PolicyViolation {
-                        tool_name: tool_call.name,
-                    });
+                metrics.total_tool_calls += tool_calls.len();
+                for tool_call in &tool_calls {
+                    *metrics
+                        .tools_by_name
+                        .entry(tool_call.name.clone())
+                        .or_insert(0) += 1;
                 }
 
-                tool_call.execution_depth = depth;
-
-                // Cooperative yield before tool execution allows the runtime to
-                // check timeout/cancellation timers between poll cycles.
-                let executor = tool_executor.clone();
-                let call_id = tool_call.id.clone();
-                let call_name = tool_call.name.clone();
-                let call_arguments = tool_call.arguments.clone();
-                let tool_result = timeout(self.tool_timeout, async move {
-                    tokio::task::spawn_blocking(move || {
-                        executor(&call_id, &call_name, &call_arguments, depth)
-                    })
-                    .await
-                    .map_err(|join_err| ToolError::ExecutionFailed {
-                        source: Box::new(std::io::Error::other(format!(
-                            "tool execution task failed: {join_err}"
-                        ))),
-                    })?
-                })
-                .await;
-
-                match tool_result {
-                    Ok(Ok(content)) => {
-                        tool_results.push((tool_call, content));
-                    }
-                    Ok(Err(source)) => {
-                        return Err(ToolCallError::ToolExecution { source });
-                    }
-                    Err(_) => {
-                        return Err(ToolCallError::ToolTimeout {
+                let mut tool_results = Vec::with_capacity(tool_calls.len());
+                for mut tool_call in tool_calls {
+                    if !self.policy.is_allowed(&tool_call.name) {
+                        return Err(ToolCallError::PolicyViolation {
                             tool_name: tool_call.name,
-                            timeout_secs: self.tool_timeout.as_secs(),
                         });
                     }
+
+                    tool_call.execution_depth = depth;
+
+                    let executor = tool_executor.clone();
+                    let call_id = tool_call.id.clone();
+                    let call_name = tool_call.name.clone();
+                    let call_arguments = tool_call.arguments.clone();
+                    let tool_result = timeout(self.tool_timeout, async move {
+                        tokio::task::spawn_blocking(move || {
+                            executor(&call_id, &call_name, &call_arguments, depth)
+                        })
+                        .await
+                        .map_err(|join_err| {
+                            ToolError::ExecutionFailed {
+                                source: Box::new(std::io::Error::other(format!(
+                                    "tool execution task failed: {join_err}"
+                                ))),
+                            }
+                        })?
+                    })
+                    .await;
+
+                    match tool_result {
+                        Ok(Ok(content)) => {
+                            tool_results.push((tool_call, content));
+                        }
+                        Ok(Err(source)) => {
+                            return Err(ToolCallError::ToolExecution { source });
+                        }
+                        Err(_) => {
+                            return Err(ToolCallError::ToolTimeout {
+                                tool_name: tool_call.name,
+                                timeout_secs: self.tool_timeout.as_secs(),
+                            });
+                        }
+                    }
                 }
+
+                Ok((response, Some(tool_results)))
             }
+            .instrument(info_span!(
+                "tool_call_iteration",
+                iteration,
+                depth,
+                event = sunny_core::orchestrator::events::EVENT_TOOL_EXEC_DEPTH,
+            ))
+            .await?;
+
+            let (response, tool_results) = iteration_result;
+            let Some(tool_results) = tool_results else {
+                return Ok(ToolCallResult { response, metrics });
+            };
 
             current_request.messages.push(ChatMessage {
                 role: ChatRole::Assistant,
