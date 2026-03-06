@@ -130,7 +130,7 @@ Definition of Done (DoD):
 ## 5) Error Handling Policy
 
 - Every public function in `sunny-core` returns typed `Result<T, E>`.
-- No `.unwrap()` in library code (`sunny-core`, `sunny-llm`).
+- No `.unwrap()` in library code (`sunny-core`, `sunny-mind`, `sunny-boys`).
 - `.expect("reason")` allowed only with invariant explanation.
 - Preserve causal chains (`source`) in error variants.
 
@@ -170,7 +170,7 @@ pub enum AgentError {
 Current workspace paths:
 - Agent traits: `crates/sunny-core/src/agent/`
 - Tool traits: `crates/sunny-core/src/tool/`
-- LLM abstractions: `crates/sunny-llm/src/`
+- LLM abstractions: `crates/sunny-mind/src/`
 - CLI commands: `crates/sunny-cli/src/commands/`
 
 ## 9) Testing Strategy
