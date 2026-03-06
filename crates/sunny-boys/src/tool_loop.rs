@@ -82,7 +82,7 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
     pub async fn run(
         &self,
         request: LlmRequest,
-        tool_executor: &ToolExecutor,
+        tool_executor: Arc<ToolExecutor>,
         initial_depth: usize,
     ) -> Result<ToolCallResult, ToolCallError> {
         let mut current_request = request;
@@ -146,9 +146,20 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
 
                 // Cooperative yield before tool execution allows the runtime to
                 // check timeout/cancellation timers between poll cycles.
-                let tool_result = timeout(self.tool_timeout, async {
-                    tokio::time::sleep(Duration::from_nanos(1)).await;
-                    tool_executor(&tool_call.id, &tool_call.name, &tool_call.arguments, depth)
+                let executor = tool_executor.clone();
+                let call_id = tool_call.id.clone();
+                let call_name = tool_call.name.clone();
+                let call_arguments = tool_call.arguments.clone();
+                let tool_result = timeout(self.tool_timeout, async move {
+                    tokio::task::spawn_blocking(move || {
+                        executor(&call_id, &call_name, &call_arguments, depth)
+                    })
+                    .await
+                    .map_err(|join_err| ToolError::ExecutionFailed {
+                        source: Box::new(std::io::Error::other(format!(
+                            "tool execution task failed: {join_err}"
+                        ))),
+                    })?
                 })
                 .await;
 
@@ -306,10 +317,10 @@ mod tests {
         let result = loop_runner
             .run(
                 mk_request(),
-                &move |_, _, _, _depth| {
+                Arc::new(move |_, _, _, _depth| {
                     tool_calls_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Ok("unused".to_string())
-                },
+                }),
                 0,
             )
             .await
@@ -350,13 +361,13 @@ mod tests {
         let result = loop_runner
             .run(
                 mk_request(),
-                &move |id, name, args, _depth| {
+                Arc::new(move |id, name, args, _depth| {
                     executed_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     assert_eq!(id, "call-1");
                     assert_eq!(name, "fs_read");
                     assert_eq!(args, "{\"path\":\"a.rs\"}");
                     Ok("file content".to_string())
-                },
+                }),
                 0,
             )
             .await
@@ -397,7 +408,7 @@ mod tests {
         let result = loop_runner
             .run(
                 mk_request(),
-                &|_, _, _, _| Ok("should not run".to_string()),
+                Arc::new(|_, _, _, _| Ok("should not run".to_string())),
                 0,
             )
             .await;
@@ -446,10 +457,10 @@ mod tests {
         let result = loop_runner
             .run(
                 mk_request(),
-                &move |_, _, _, _| {
+                Arc::new(move |_, _, _, _| {
                     executed_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Ok("ok".to_string())
-                },
+                }),
                 0,
             )
             .await;
@@ -489,7 +500,7 @@ mod tests {
         cancel_token.cancel();
 
         let result = loop_runner
-            .run(mk_request(), &|_, _, _, _| Ok("ok".to_string()), 0)
+            .run(mk_request(), Arc::new(|_, _, _, _| Ok("ok".to_string())), 0)
             .await;
 
         match result {
@@ -524,7 +535,7 @@ mod tests {
         );
 
         let result = loop_runner
-            .run(mk_request(), &|_, _, _, _| Ok("ok".to_string()), 0)
+            .run(mk_request(), Arc::new(|_, _, _, _| Ok("ok".to_string())), 0)
             .await
             .expect("should succeed");
 
@@ -558,13 +569,13 @@ mod tests {
         let result = loop_runner
             .run(
                 mk_request(),
-                &move |_, _, _, depth| {
+                Arc::new(move |_, _, _, depth| {
                     depths_clone
                         .lock()
                         .expect("lock observed_depths")
                         .push(depth);
                     Ok("ok".to_string())
-                },
+                }),
                 0,
             )
             .await
@@ -591,7 +602,7 @@ mod tests {
         .with_tool_timeout(std::time::Duration::ZERO);
 
         let result = loop_runner
-            .run(mk_request(), &|_, _, _, _| Ok("ok".to_string()), 0)
+            .run(mk_request(), Arc::new(|_, _, _, _| Ok("ok".to_string())), 0)
             .await;
 
         match result {
@@ -632,10 +643,10 @@ mod tests {
         let result = loop_runner
             .run(
                 mk_request(),
-                &move |_, _, _, depth| {
+                Arc::new(move |_, _, _, depth| {
                     max_depth_clone.fetch_max(depth, std::sync::atomic::Ordering::SeqCst);
                     Ok("result".to_string())
-                },
+                }),
                 0,
             )
             .await

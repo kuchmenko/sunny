@@ -51,6 +51,54 @@ struct TaskInput {
 }
 
 impl CodebaseAgent {
+    fn resolve_tool_path(root_path: &Path, requested_path: &str) -> Result<PathBuf, ToolError> {
+        let canonical_root = std::fs::canonicalize(root_path).map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => ToolError::PathNotFound {
+                path: root_path.display().to_string(),
+            },
+            std::io::ErrorKind::PermissionDenied => ToolError::PermissionDenied {
+                path: root_path.display().to_string(),
+            },
+            _ => ToolError::ExecutionFailed {
+                source: Box::new(err),
+            },
+        })?;
+
+        let requested = PathBuf::from(requested_path);
+        let candidate = if requested.is_absolute() {
+            requested
+        } else {
+            canonical_root.join(requested)
+        };
+
+        if !candidate.exists() {
+            return Err(ToolError::PathNotFound {
+                path: candidate.display().to_string(),
+            });
+        }
+
+        let canonical_candidate =
+            std::fs::canonicalize(&candidate).map_err(|err| match err.kind() {
+                std::io::ErrorKind::NotFound => ToolError::PathNotFound {
+                    path: candidate.display().to_string(),
+                },
+                std::io::ErrorKind::PermissionDenied => ToolError::PermissionDenied {
+                    path: candidate.display().to_string(),
+                },
+                _ => ToolError::ExecutionFailed {
+                    source: Box::new(err),
+                },
+            })?;
+
+        if !canonical_candidate.starts_with(&canonical_root) {
+            return Err(ToolError::SensitiveFileDenied {
+                path: canonical_candidate.display().to_string(),
+            });
+        }
+
+        Ok(canonical_candidate)
+    }
+
     pub fn new(provider: Option<Arc<dyn LlmProvider>>) -> Self {
         Self {
             provider,
@@ -166,6 +214,7 @@ impl CodebaseAgent {
     }
 
     fn execute_tool_static(
+        root_path: &Path,
         scanner: &FileScanner,
         reader: &FileReader,
         tool_call: &ToolCall,
@@ -183,7 +232,7 @@ impl CodebaseAgent {
                     .ok_or_else(|| ToolError::ExecutionFailed {
                         source: Box::new(std::io::Error::other("missing 'path' argument")),
                     })?;
-                let path = PathBuf::from(path_str);
+                let path = Self::resolve_tool_path(root_path, path_str)?;
                 let scan = scanner.scan(&path)?;
                 let files: Vec<String> = scan
                     .files
@@ -205,7 +254,7 @@ impl CodebaseAgent {
                     .ok_or_else(|| ToolError::ExecutionFailed {
                         source: Box::new(std::io::Error::other("missing 'path' argument")),
                     })?;
-                let path = PathBuf::from(path_str);
+                let path = Self::resolve_tool_path(root_path, path_str)?;
                 if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
                     return Err(ToolError::SensitiveFileDenied {
                         path: path.display().to_string(),
@@ -236,7 +285,7 @@ impl CodebaseAgent {
                         .ok_or_else(|| ToolError::ExecutionFailed {
                             source: Box::new(std::io::Error::other("missing 'pattern' argument")),
                         })?;
-                let path = PathBuf::from(path_str);
+                let path = Self::resolve_tool_path(root_path, path_str)?;
                 let file_content = reader.read(&path)?;
                 let grep = TextGrep::default();
                 let result = grep.search(&file_content.content, pattern);
@@ -520,42 +569,45 @@ impl Agent for CodebaseAgent {
 
         let scanner = self.scanner.clone();
         let reader = self.reader.clone();
+        let tool_root = root_path.clone();
         let read_calls = Arc::new(AtomicUsize::new(0));
         let request_id_for_tool = request_id.clone();
         let task_id_for_tool = task_id.clone();
         let read_calls_for_tool = read_calls.clone();
-        let executor = move |_id: &str, name: &str, arguments: &str, _depth: usize| {
-            if name == "fs_read" {
-                let count = read_calls_for_tool.fetch_add(1, Ordering::Relaxed) + 1;
-                if count > TOOL_LOOP_MAX_READ_CALLS {
-                    return Err(ToolError::ExecutionFailed {
-                        source: Box::new(std::io::Error::other(format!(
-                            "fs_read call budget exceeded: {} > {}",
-                            count, TOOL_LOOP_MAX_READ_CALLS
-                        ))),
-                    });
+        let executor = Arc::new(
+            move |_id: &str, name: &str, arguments: &str, _depth: usize| {
+                if name == "fs_read" {
+                    let count = read_calls_for_tool.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count > TOOL_LOOP_MAX_READ_CALLS {
+                        return Err(ToolError::ExecutionFailed {
+                            source: Box::new(std::io::Error::other(format!(
+                                "fs_read call budget exceeded: {} > {}",
+                                count, TOOL_LOOP_MAX_READ_CALLS
+                            ))),
+                        });
+                    }
                 }
-            }
 
-            tracing::info!(
-                agent = "codebase",
-                request_id = %request_id_for_tool,
-                task_id = %task_id_for_tool,
-                tool_name = %name,
-                "CodebaseAgent dispatching tool call"
-            );
-            let tool_call = ToolCall {
-                id: "exec".to_string(),
-                name: name.to_string(),
-                arguments: arguments.to_string(),
-                execution_depth: 0,
-            };
-            Self::execute_tool_static(&scanner, &reader, &tool_call)
-        };
+                tracing::info!(
+                    agent = "codebase",
+                    request_id = %request_id_for_tool,
+                    task_id = %task_id_for_tool,
+                    tool_name = %name,
+                    "CodebaseAgent dispatching tool call"
+                );
+                let tool_call = ToolCall {
+                    id: "exec".to_string(),
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                    execution_depth: 0,
+                };
+                Self::execute_tool_static(&tool_root, &scanner, &reader, &tool_call)
+            },
+        );
 
         let result = match tokio::time::timeout(
             Duration::from_secs(TOOL_LOOP_BUDGET_SECS),
-            loop_runner.run(request, &executor, 0),
+            loop_runner.run(request, executor, 0),
         )
         .await
         {
@@ -915,10 +967,34 @@ mod tests {
             execution_depth: 0,
         };
 
-        let err = CodebaseAgent::execute_tool_static(&scanner, &reader, &tool_call)
+        let err = CodebaseAgent::execute_tool_static(&dir, &scanner, &reader, &tool_call)
             .expect_err(".git file should be blocked");
         assert!(matches!(err, ToolError::SensitiveFileDenied { .. }));
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn test_execute_tool_static_rejects_paths_outside_workspace_root() {
+        let dir = mk_temp_dir("outside_root");
+        let outside_dir = mk_temp_dir("outside_root_target");
+        let outside_file = outside_dir.join("secret.txt");
+        fs::write(&outside_file, "secret").expect("write secret file");
+
+        let scanner = FileScanner::default();
+        let reader = FileReader::default();
+        let tool_call = ToolCall {
+            id: "t2".to_string(),
+            name: "fs_read".to_string(),
+            arguments: serde_json::json!({ "path": outside_file }).to_string(),
+            execution_depth: 0,
+        };
+
+        let err = CodebaseAgent::execute_tool_static(&dir, &scanner, &reader, &tool_call)
+            .expect_err("outside file should be blocked");
+        assert!(matches!(err, ToolError::SensitiveFileDenied { .. }));
+
+        fs::remove_dir_all(&dir).expect("cleanup temp dir");
+        fs::remove_dir_all(&outside_dir).expect("cleanup outside temp dir");
     }
 }
