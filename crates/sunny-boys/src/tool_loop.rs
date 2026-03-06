@@ -6,14 +6,19 @@ use sunny_core::tool::{ToolError, ToolPolicy};
 use sunny_mind::{ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use tracing::info_span;
 
 const TOOL_TIMEOUT_SECS: u64 = 30;
+pub const EVENT_TOOL_CANCELLED: &str = "tool.exec.cancelled";
+
+pub type ToolExecutor = dyn Fn(&str, &str, &str, usize) -> Result<String, ToolError> + Send + Sync;
 
 pub struct ToolCallLoop<P: LlmProvider + ?Sized> {
     provider: Arc<P>,
     policy: ToolPolicy,
     max_iterations: usize,
     cancel: CancellationToken,
+    tool_timeout: Duration,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -64,28 +69,45 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
             policy,
             max_iterations,
             cancel,
+            tool_timeout: Duration::from_secs(TOOL_TIMEOUT_SECS),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_tool_timeout(mut self, timeout: Duration) -> Self {
+        self.tool_timeout = timeout;
+        self
     }
 
     pub async fn run(
         &self,
         request: LlmRequest,
-        tool_executor: &(dyn Fn(&str, &str, &str) -> Result<String, ToolError> + Send + Sync),
+        tool_executor: &ToolExecutor,
+        initial_depth: usize,
     ) -> Result<ToolCallResult, ToolCallError> {
         let mut current_request = request;
         let mut metrics = ToolCallMetrics::default();
+        let mut depth = initial_depth;
 
         loop {
-            // Check for cancellation
             if self.cancel.is_cancelled() {
                 return Err(ToolCallError::Cancelled);
             }
 
-            // Check max iterations before processing
             if metrics.iterations >= self.max_iterations {
                 return Err(ToolCallError::MaxIterationsReached {
                     count: metrics.iterations,
                 });
+            }
+
+            {
+                let _span = info_span!(
+                    "tool_call_iteration",
+                    iteration = metrics.iterations,
+                    depth,
+                    event = sunny_core::orchestrator::events::EVENT_TOOL_EXEC_DEPTH,
+                )
+                .entered();
             }
 
             metrics.iterations += 1;
@@ -113,16 +135,20 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
             }
 
             let mut tool_results = Vec::with_capacity(tool_calls.len());
-            for tool_call in tool_calls {
+            for mut tool_call in tool_calls {
                 if !self.policy.is_allowed(&tool_call.name) {
                     return Err(ToolCallError::PolicyViolation {
                         tool_name: tool_call.name,
                     });
                 }
 
-                // Execute tool with timeout
-                let tool_result = timeout(Duration::from_secs(TOOL_TIMEOUT_SECS), async {
-                    tool_executor(&tool_call.id, &tool_call.name, &tool_call.arguments)
+                tool_call.execution_depth = depth;
+
+                // Cooperative yield before tool execution allows the runtime to
+                // check timeout/cancellation timers between poll cycles.
+                let tool_result = timeout(self.tool_timeout, async {
+                    tokio::time::sleep(Duration::from_nanos(1)).await;
+                    tool_executor(&tool_call.id, &tool_call.name, &tool_call.arguments, depth)
                 })
                 .await;
 
@@ -136,7 +162,7 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
                     Err(_) => {
                         return Err(ToolCallError::ToolTimeout {
                             tool_name: tool_call.name,
-                            timeout_secs: TOOL_TIMEOUT_SECS,
+                            timeout_secs: self.tool_timeout.as_secs(),
                         });
                     }
                 }
@@ -150,6 +176,8 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
                 role: ChatRole::User,
                 content: render_tool_results(&tool_results),
             });
+
+            depth += 1;
         }
     }
 }
@@ -276,10 +304,14 @@ mod tests {
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let tool_calls_seen = call_count.clone();
         let result = loop_runner
-            .run(mk_request(), &move |_, _, _| {
-                tool_calls_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok("unused".to_string())
-            })
+            .run(
+                mk_request(),
+                &move |_, _, _, _depth| {
+                    tool_calls_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok("unused".to_string())
+                },
+                0,
+            )
             .await
             .expect("loop should return first LLM response");
 
@@ -316,13 +348,17 @@ mod tests {
         let executed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let executed_seen = executed.clone();
         let result = loop_runner
-            .run(mk_request(), &move |id, name, args| {
-                executed_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                assert_eq!(id, "call-1");
-                assert_eq!(name, "fs_read");
-                assert_eq!(args, "{\"path\":\"a.rs\"}");
-                Ok("file content".to_string())
-            })
+            .run(
+                mk_request(),
+                &move |id, name, args, _depth| {
+                    executed_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(id, "call-1");
+                    assert_eq!(name, "fs_read");
+                    assert_eq!(args, "{\"path\":\"a.rs\"}");
+                    Ok("file content".to_string())
+                },
+                0,
+            )
             .await
             .expect("loop should execute allowed tool and finish");
 
@@ -359,7 +395,11 @@ mod tests {
         );
 
         let result = loop_runner
-            .run(mk_request(), &|_, _, _| Ok("should not run".to_string()))
+            .run(
+                mk_request(),
+                &|_, _, _, _| Ok("should not run".to_string()),
+                0,
+            )
             .await;
 
         match result {
@@ -404,10 +444,14 @@ mod tests {
         let executed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let executed_seen = executed.clone();
         let result = loop_runner
-            .run(mk_request(), &move |_, _, _| {
-                executed_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok("ok".to_string())
-            })
+            .run(
+                mk_request(),
+                &move |_, _, _, _| {
+                    executed_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok("ok".to_string())
+                },
+                0,
+            )
             .await;
 
         match result {
@@ -445,7 +489,7 @@ mod tests {
         cancel_token.cancel();
 
         let result = loop_runner
-            .run(mk_request(), &|_, _, _| Ok("ok".to_string()))
+            .run(mk_request(), &|_, _, _, _| Ok("ok".to_string()), 0)
             .await;
 
         match result {
@@ -480,7 +524,7 @@ mod tests {
         );
 
         let result = loop_runner
-            .run(mk_request(), &|_, _, _| Ok("ok".to_string()))
+            .run(mk_request(), &|_, _, _, _| Ok("ok".to_string()), 0)
             .await
             .expect("should succeed");
 
@@ -488,5 +532,120 @@ mod tests {
         assert_eq!(result.metrics.total_tool_calls, 3);
         assert_eq!(result.metrics.tools_by_name.get("fs_read"), Some(&2usize));
         assert_eq!(result.metrics.tools_by_name.get("fs_scan"), Some(&1usize));
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_loop_tracks_depth() {
+        let provider = Arc::new(MockProvider::new(vec![
+            mk_response("first", Some(vec![mk_tool_call("call-1", "fs_read", "{}")])),
+            mk_response(
+                "second",
+                Some(vec![mk_tool_call("call-2", "fs_read", "{}")]),
+            ),
+            mk_response("done", None),
+        ]));
+
+        let observed_depths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let depths_clone = observed_depths.clone();
+
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            5,
+            mk_cancel_token(),
+        );
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                &move |_, _, _, depth| {
+                    depths_clone
+                        .lock()
+                        .expect("lock observed_depths")
+                        .push(depth);
+                    Ok("ok".to_string())
+                },
+                0,
+            )
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result.response.content, "done");
+        let depths = observed_depths.lock().expect("lock observed_depths");
+        assert_eq!(*depths, vec![0, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_tool_call_loop_respects_timeout() {
+        let provider = Arc::new(MockProvider::new(vec![mk_response(
+            "calling slow tool",
+            Some(vec![mk_tool_call("call-1", "fs_read", "{}")]),
+        )]));
+
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            3,
+            mk_cancel_token(),
+        )
+        .with_tool_timeout(std::time::Duration::ZERO);
+
+        let result = loop_runner
+            .run(mk_request(), &|_, _, _, _| Ok("ok".to_string()), 0)
+            .await;
+
+        match result {
+            Err(ToolCallError::ToolTimeout {
+                tool_name,
+                timeout_secs,
+            }) => {
+                assert_eq!(tool_name, "fs_read");
+                assert_eq!(timeout_secs, 0);
+            }
+            Ok(_) => panic!("expected timeout error"),
+            Err(other) => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_loop_depth_in_events() {
+        let provider = Arc::new(MockProvider::new(vec![
+            mk_response("first", Some(vec![mk_tool_call("call-1", "fs_read", "{}")])),
+            mk_response(
+                "second",
+                Some(vec![mk_tool_call("call-2", "fs_scan", "{}")]),
+            ),
+            mk_response("third", Some(vec![mk_tool_call("call-3", "fs_read", "{}")])),
+            mk_response("final", None),
+        ]));
+
+        let max_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_depth_clone = max_depth.clone();
+
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            10,
+            mk_cancel_token(),
+        );
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                &move |_, _, _, depth| {
+                    max_depth_clone.fetch_max(depth, std::sync::atomic::Ordering::SeqCst);
+                    Ok("result".to_string())
+                },
+                0,
+            )
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result.response.content, "final");
+        assert_eq!(
+            max_depth.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "max depth should be 2 (3 tool iterations: 0, 1, 2)"
+        );
     }
 }
