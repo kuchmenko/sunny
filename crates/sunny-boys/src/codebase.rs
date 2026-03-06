@@ -51,6 +51,24 @@ struct TaskInput {
 }
 
 impl CodebaseAgent {
+    fn contains_git_component(path: &Path) -> bool {
+        path.components()
+            .any(|component| component.as_os_str() == std::ffi::OsStr::new(".git"))
+    }
+
+    fn safe_truncate(text: &mut String, max_bytes: usize) -> bool {
+        if text.len() <= max_bytes {
+            return false;
+        }
+
+        let mut safe_index = max_bytes;
+        while safe_index > 0 && !text.is_char_boundary(safe_index) {
+            safe_index -= 1;
+        }
+        text.truncate(safe_index);
+        true
+    }
+
     fn resolve_tool_path(root_path: &Path, requested_path: &str) -> Result<PathBuf, ToolError> {
         let canonical_root = std::fs::canonicalize(root_path).map_err(|err| match err.kind() {
             std::io::ErrorKind::NotFound => ToolError::PathNotFound {
@@ -91,6 +109,12 @@ impl CodebaseAgent {
             })?;
 
         if !canonical_candidate.starts_with(&canonical_root) {
+            return Err(ToolError::SensitiveFileDenied {
+                path: canonical_candidate.display().to_string(),
+            });
+        }
+
+        if Self::contains_git_component(&canonical_candidate) {
             return Err(ToolError::SensitiveFileDenied {
                 path: canonical_candidate.display().to_string(),
             });
@@ -255,16 +279,9 @@ impl CodebaseAgent {
                         source: Box::new(std::io::Error::other("missing 'path' argument")),
                     })?;
                 let path = Self::resolve_tool_path(root_path, path_str)?;
-                if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
-                    return Err(ToolError::SensitiveFileDenied {
-                        path: path.display().to_string(),
-                    });
-                }
                 let content = reader.read(&path)?;
                 let mut text = content.content;
-                if text.len() > TOOL_LOOP_READ_MAX_BYTES {
-                    text.truncate(TOOL_LOOP_READ_MAX_BYTES);
-                }
+                Self::safe_truncate(&mut text, TOOL_LOOP_READ_MAX_BYTES);
                 Ok(text)
             }
             "text_grep" => {
@@ -306,7 +323,7 @@ impl CodebaseAgent {
     }
 
     fn is_fallback_candidate(path: &Path) -> bool {
-        if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
+        if Self::contains_git_component(path) {
             return false;
         }
 
@@ -401,7 +418,15 @@ impl CodebaseAgent {
                 let path = selected[idx].clone();
                 let current_idx = idx;
                 join_set.spawn(async move {
-                    let content = reader.read(&path);
+                    let path_for_read = path.clone();
+                    let content = tokio::task::spawn_blocking(move || reader.read(&path_for_read))
+                        .await
+                        .map_err(|join_err| ToolError::ExecutionFailed {
+                            source: Box::new(std::io::Error::other(format!(
+                                "fallback read task failed: {join_err}"
+                            ))),
+                        })
+                        .and_then(|content| content);
                     (current_idx, root, path, content)
                 });
                 in_flight += 1;
@@ -413,10 +438,7 @@ impl CodebaseAgent {
                 match result {
                     Ok((current_idx, root, path, Ok(content))) => {
                         let mut text = content.content;
-                        let truncated = text.len() > MAX_FILE_BYTES;
-                        if truncated {
-                            text.truncate(MAX_FILE_BYTES);
-                        }
+                        let truncated = Self::safe_truncate(&mut text, MAX_FILE_BYTES);
                         let rel_path = path
                             .strip_prefix(&root)
                             .unwrap_or(&path)
@@ -996,5 +1018,29 @@ mod tests {
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
         fs::remove_dir_all(&outside_dir).expect("cleanup outside temp dir");
+    }
+
+    #[test]
+    fn test_safe_truncate_respects_utf8_boundary() {
+        let mut text = "cześć-file".to_string();
+        let truncated = CodebaseAgent::safe_truncate(&mut text, 4);
+
+        assert!(truncated);
+        assert_eq!(text, "cze");
+    }
+
+    #[test]
+    fn test_resolve_tool_path_rejects_git_component() {
+        let dir = mk_temp_dir("git_component_guard");
+        let git_dir = dir.join(".git");
+        fs::create_dir_all(&git_dir).expect("create .git dir");
+        let git_config = git_dir.join("config");
+        fs::write(&git_config, "[core]").expect("write git config");
+
+        let err = CodebaseAgent::resolve_tool_path(&dir, ".git/config")
+            .expect_err(".git paths should be rejected");
+        assert!(matches!(err, ToolError::SensitiveFileDenied { .. }));
+
+        fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
 }
