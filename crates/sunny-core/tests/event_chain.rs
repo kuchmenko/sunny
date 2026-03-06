@@ -24,6 +24,13 @@ fn test_event_chain_completeness() {
 #[test]
 fn test_event_chain_order() {
     let expected_chain = [
+        "orchestrator.plan.created",
+        "orchestrator.route.resolved",
+        "agent.message.start",
+        "agent.message.end",
+        "orchestrator.plan.completed",
+    ];
+    let actual_chain = [
         EVENT_PLAN_CREATED,
         EVENT_ROUTE_RESOLVED,
         EVENT_AGENT_MESSAGE_START,
@@ -31,18 +38,7 @@ fn test_event_chain_order() {
         EVENT_PLAN_COMPLETED,
     ];
 
-    for event in &expected_chain {
-        assert!(
-            event.contains('.'),
-            "Event '{}' must use dotted naming convention",
-            event
-        );
-        assert!(
-            !event.contains('_'),
-            "Event '{}' must use dots, not underscores",
-            event
-        );
-    }
+    assert_eq!(actual_chain, expected_chain);
 }
 
 #[test]

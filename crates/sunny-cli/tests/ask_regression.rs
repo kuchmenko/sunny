@@ -197,7 +197,7 @@ fn test_all_formats_work() {
 }
 
 #[test]
-fn test_ask_with_real_files() {
+fn test_ask_dry_run_path_input_returns_json_envelope() {
     let output = sunny_cli()
         .args([
             "ask",
@@ -218,8 +218,11 @@ fn test_ask_with_real_files() {
     );
 
     // Should produce valid JSON (verified by successful deserialization)
-    let _json: serde_json::Value =
+    let json: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("output should be valid JSON"));
+    assert_eq!(json["intent_kind"].as_str(), Some("analyze"));
+    assert_eq!(json["required_capability"].as_str(), Some("analyze"));
+    assert_eq!(json["outcome"].as_str(), Some("planned"));
 }
 
 /// Verify routing still works for different intent types
@@ -246,8 +249,6 @@ fn test_routing_regression() {
     );
 
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
-    assert!(
-        json["intent_kind"].is_string(),
-        "should have intent_kind for routing"
-    );
+    assert_eq!(json["intent_kind"].as_str(), Some("query"));
+    assert_eq!(json["required_capability"].as_str(), Some("query"));
 }

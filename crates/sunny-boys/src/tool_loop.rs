@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sunny_core::tool::{ToolError, ToolPolicy};
-use sunny_mind::{ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse};
+use sunny_mind::{
+    ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse,
+    ToolCallResult as LlmToolCallResult,
+};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{info_span, Instrument};
@@ -105,11 +108,12 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
             let iteration_result = async {
                 metrics.iterations += 1;
 
-                let response = self
-                    .provider
-                    .chat(current_request.clone())
-                    .await
-                    .map_err(|source| ToolCallError::Llm { source })?;
+                let response = tokio::select! {
+                    _ = self.cancel.cancelled() => return Err(ToolCallError::Cancelled),
+                    response = self.provider.chat(current_request.clone()) => {
+                        response.map_err(|source| ToolCallError::Llm { source })?
+                    }
+                };
 
                 let Some(tool_calls) = response
                     .tool_calls
@@ -153,10 +157,12 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
                                 ))),
                             }
                         })?
-                    })
-                    .await;
+                    });
 
-                    match tool_result {
+                    match tokio::select! {
+                        _ = self.cancel.cancelled() => return Err(ToolCallError::Cancelled),
+                        tool_result = tool_result => tool_result,
+                    } {
                         Ok(Ok(content)) => {
                             tool_results.push((tool_call, content));
                         }
@@ -191,31 +197,40 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
                 role: ChatRole::Assistant,
                 content: response.content,
             });
-            current_request.messages.push(ChatMessage {
-                role: ChatRole::User,
-                content: render_tool_results(&tool_results),
-            });
+            current_request
+                .messages
+                .extend(
+                    render_tool_results(&tool_results)
+                        .into_iter()
+                        .map(|content| ChatMessage {
+                            role: ChatRole::Tool,
+                            content,
+                        }),
+                );
 
             depth += 1;
         }
     }
 }
 
-fn render_tool_results(results: &[(sunny_mind::ToolCall, String)]) -> String {
-    let mut rendered = String::from("Tool results:\n");
-    for (tool_call, result) in results {
-        rendered.push_str(&format!(
-            "- id={} name={} arguments={} result={}\n",
-            tool_call.id, tool_call.name, tool_call.arguments, result
-        ));
-    }
-    rendered
+fn render_tool_results(results: &[(sunny_mind::ToolCall, String)]) -> Vec<String> {
+    results
+        .iter()
+        .map(|(tool_call, result)| {
+            serde_json::to_string(&LlmToolCallResult {
+                tool_call_id: tool_call.id.clone(),
+                content: result.clone(),
+            })
+            .expect("ToolCallResult should serialize")
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
@@ -397,6 +412,8 @@ mod tests {
             .messages
             .last()
             .expect("second request should contain appended tool result");
+        assert_eq!(last_message.role, ChatRole::Tool);
+        assert!(last_message.content.contains("call-1"));
         assert!(last_message.content.contains("file content"));
     }
 
@@ -512,6 +529,50 @@ mod tests {
             .await;
 
         match result {
+            Err(ToolCallError::Cancelled) => {}
+            Ok(_) => panic!("expected cancellation error"),
+            Err(other) => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    struct SlowProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SlowProvider {
+        fn provider_id(&self) -> &str {
+            "slow"
+        }
+
+        fn model_id(&self) -> &str {
+            "slow-model"
+        }
+
+        async fn chat(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(mk_response("done", None))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_tool_call_loop_cancels_during_provider_request() {
+        let cancel_token = CancellationToken::new();
+        let loop_runner = ToolCallLoop::new(
+            Arc::new(SlowProvider),
+            ToolPolicy::default_ask(),
+            3,
+            cancel_token.clone(),
+        );
+
+        let run = tokio::spawn(async move {
+            loop_runner
+                .run(mk_request(), Arc::new(|_, _, _, _| Ok("ok".to_string())), 0)
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        cancel_token.cancel();
+
+        match run.await.expect("join run task") {
             Err(ToolCallError::Cancelled) => {}
             Ok(_) => panic!("expected cancellation error"),
             Err(other) => panic!("unexpected error variant: {other}"),

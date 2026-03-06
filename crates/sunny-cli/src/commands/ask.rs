@@ -107,15 +107,23 @@ fn warnings_from_metadata(metadata: &HashMap<String, String>) -> Vec<PromptIssue
     }
 
     if let Some(skipped_raw) = metadata.get("skipped_file_count") {
-        if let Ok(skipped) = skipped_raw.parse::<usize>() {
-            if skipped > 0 {
-                warnings.push(issue(
-                    "warning",
-                    "files_skipped",
-                    format!("Skipped {skipped} file(s) due to read constraints"),
-                    Some("Check logs for file paths and error kinds"),
-                ));
+        match skipped_raw.parse::<usize>() {
+            Ok(skipped) => {
+                if skipped > 0 {
+                    warnings.push(issue(
+                        "warning",
+                        "files_skipped",
+                        format!("Skipped {skipped} file(s) due to read constraints"),
+                        Some("Check logs for file paths and error kinds"),
+                    ));
+                }
             }
+            Err(_) => warnings.push(issue(
+                "warning",
+                "invalid_skipped_file_count",
+                format!("Invalid skipped_file_count metadata: '{skipped_raw}'"),
+                Some("Check fallback metadata serialization in the responding agent"),
+            )),
         }
     }
 
@@ -916,6 +924,16 @@ mod tests {
         assert_eq!(warnings.len(), 2);
         assert_eq!(warnings[0].code, "fallback_mode");
         assert_eq!(warnings[1].code, "files_skipped");
+    }
+
+    #[test]
+    fn test_warnings_from_metadata_reports_invalid_skipped_file_count() {
+        let mut metadata = HashMap::new();
+        metadata.insert("skipped_file_count".to_string(), "many".to_string());
+
+        let warnings = warnings_from_metadata(&metadata);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "invalid_skipped_file_count");
     }
 
     #[test]

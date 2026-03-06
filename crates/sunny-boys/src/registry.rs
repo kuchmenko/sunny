@@ -23,9 +23,13 @@ pub fn build_ask_registry(
 ) -> Result<AgentRegistry, RegistryError> {
     let mut registry = AgentRegistry::new();
 
+    let codebase_token = token.child_token();
     let codebase = AgentHandle::spawn(
-        Arc::new(CodebaseAgent::new(provider.clone())),
-        token.child_token(),
+        Arc::new(CodebaseAgent::with_cancel(
+            provider.clone(),
+            codebase_token.clone(),
+        )),
+        codebase_token,
     );
     registry.register(
         "codebase".into(),

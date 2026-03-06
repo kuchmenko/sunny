@@ -3,6 +3,10 @@
 //! This test covers the full ask pipeline from CLI to agent response.
 
 use std::process::Command;
+use std::process::Output;
+use std::process::Stdio;
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn sunny_cli() -> Command {
     let exe = std::env::var("CARGO_BIN_EXE_sunny-cli").unwrap_or_else(|_| {
@@ -19,6 +23,36 @@ fn sunny_cli() -> Command {
     let mut cmd = Command::new(&exe);
     cmd.env("RUST_LOG", "off");
     cmd
+}
+
+fn run_with_timeout(cmd: &mut Command) -> Output {
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("should spawn ask command");
+    let deadline = Instant::now() + Duration::from_secs(15);
+
+    loop {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("timed out command should still produce output");
+            panic!(
+                "command timed out after 15s, stdout: {}, stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        match child.try_wait().expect("should poll child process") {
+            Some(_) => {
+                return child
+                    .wait_with_output()
+                    .expect("finished command should produce output");
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    }
 }
 
 /// Full end-to-end test covering the entire ask pipeline
@@ -57,16 +91,15 @@ fn test_e2e_ask_pipeline() {
     .expect("write utils.rs");
 
     // Run ask command
-    let output = sunny_cli()
-        .args([
-            "ask",
-            &format!("analyze the structure of {}", temp_dir.display()),
-            "--no-llm",
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("should run ask command");
+    let mut cmd = sunny_cli();
+    cmd.args([
+        "ask",
+        &format!("analyze the structure of {}", temp_dir.display()),
+        "--no-llm",
+        "--format",
+        "json",
+    ]);
+    let output = run_with_timeout(&mut cmd);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -131,10 +164,9 @@ fn test_e2e_ask_pipeline() {
 /// Test error recovery: empty input should produce graceful error (not panic)
 #[test]
 fn test_e2e_empty_input_error_recovery() {
-    let output = sunny_cli()
-        .args(["ask", "", "--no-llm", "--format", "json"])
-        .output()
-        .expect("should run ask command");
+    let mut cmd = sunny_cli();
+    cmd.args(["ask", "", "--no-llm", "--format", "json"]);
+    let output = run_with_timeout(&mut cmd);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -189,16 +221,15 @@ fn test_e2e_query_routing() {
     .expect("write file");
 
     // Use simple path-based query
-    let output = sunny_cli()
-        .args([
-            "ask",
-            &format!("{}", temp_dir.display()),
-            "--no-llm",
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("should run ask command");
+    let mut cmd = sunny_cli();
+    cmd.args([
+        "ask",
+        &format!("{}", temp_dir.display()),
+        "--no-llm",
+        "--format",
+        "json",
+    ]);
+    let output = run_with_timeout(&mut cmd);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -240,16 +271,15 @@ fn test_e2e_mixed_file_types() {
     fs::write(temp_dir.join("README.md"), "# Test Project").expect("write md");
     fs::write(temp_dir.join("Cargo.toml"), "[package]\nname = \"test\"").expect("write toml");
 
-    let output = sunny_cli()
-        .args([
-            "ask",
-            &format!("analyze {}", temp_dir.display()),
-            "--no-llm",
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("should run ask command");
+    let mut cmd = sunny_cli();
+    cmd.args([
+        "ask",
+        &format!("analyze {}", temp_dir.display()),
+        "--no-llm",
+        "--format",
+        "json",
+    ]);
+    let output = run_with_timeout(&mut cmd);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -281,20 +311,28 @@ fn test_e2e_correlation_ids() {
     fs::create_dir_all(&temp_dir).expect("create temp dir");
     fs::write(temp_dir.join("test.txt"), "test").expect("write file");
 
-    let output = sunny_cli()
-        .args([
-            "ask",
-            &format!("analyze {}", temp_dir.display()),
-            "--no-llm",
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("should run ask command");
+    let mut cmd = sunny_cli();
+    cmd.args([
+        "ask",
+        &format!("analyze {}", temp_dir.display()),
+        "--no-llm",
+        "--format",
+        "json",
+    ]);
+    let output = run_with_timeout(&mut cmd);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "ask command should succeed, stderr: {}",
+        stderr
+    );
     let json: serde_json::Value =
         serde_json::from_str(&stdout).expect("output should be valid JSON");
+
+    assert_eq!(json["outcome"].as_str(), Some("success"));
+    assert_eq!(json["steps_completed"].as_u64(), Some(1));
 
     // Verify correlation fields exist
     assert!(json.get("request_id").is_some(), "should have request_id");

@@ -12,7 +12,7 @@ use sunny_mind::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::tool_loop::ToolCallLoop;
+use crate::tool_loop::{ToolCallError, ToolCallLoop};
 
 const MAX_CONTEXT_FILES: usize = 20;
 const MAX_FILE_BYTES: usize = 2048;
@@ -31,6 +31,7 @@ pub struct CodebaseAgent {
     provider: Option<Arc<dyn LlmProvider>>,
     scanner: Arc<FileScanner>,
     reader: Arc<FileReader>,
+    cancel: CancellationToken,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +56,14 @@ struct TaskInput {
 }
 
 impl CodebaseAgent {
+    fn cancelled_error(operation: &str) -> AgentError {
+        AgentError::ExecutionFailed {
+            source: Box::new(std::io::Error::other(format!(
+                "codebase operation cancelled during {operation}"
+            ))),
+        }
+    }
+
     fn contains_git_component(path: &Path) -> bool {
         path.components()
             .any(|component| component.as_os_str() == std::ffi::OsStr::new(".git"))
@@ -128,10 +137,15 @@ impl CodebaseAgent {
     }
 
     pub fn new(provider: Option<Arc<dyn LlmProvider>>) -> Self {
+        Self::with_cancel(provider, CancellationToken::new())
+    }
+
+    pub fn with_cancel(provider: Option<Arc<dyn LlmProvider>>, cancel: CancellationToken) -> Self {
         Self {
             provider,
             scanner: Arc::new(FileScanner::default()),
             reader: Arc::new(FileReader::default()),
+            cancel,
         }
     }
 
@@ -144,6 +158,7 @@ impl CodebaseAgent {
             provider,
             scanner: Arc::new(scanner),
             reader: Arc::new(reader),
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -422,6 +437,10 @@ impl CodebaseAgent {
         let mut idx = 0usize;
 
         while idx < selected.len() || in_flight > 0 {
+            if self.cancel.is_cancelled() {
+                return Err(Self::cancelled_error("fallback"));
+            }
+
             while idx < selected.len() && in_flight < FALLBACK_READ_CONCURRENCY {
                 let reader = self.reader.clone();
                 let root = root_path.to_path_buf();
@@ -444,6 +463,11 @@ impl CodebaseAgent {
             }
 
             if let Some(result) = join_set.join_next().await {
+                if self.cancel.is_cancelled() {
+                    join_set.abort_all();
+                    return Err(Self::cancelled_error("fallback"));
+                }
+
                 in_flight = in_flight.saturating_sub(1);
                 match result {
                     Ok((current_idx, root, path, Ok(content))) => {
@@ -597,7 +621,7 @@ impl Agent for CodebaseAgent {
             provider.clone(),
             ToolPolicy::default_ask(),
             MAX_TOOL_ITERATIONS,
-            CancellationToken::new(),
+            self.cancel.child_token(),
         );
 
         let scanner = self.scanner.clone();
@@ -644,6 +668,9 @@ impl Agent for CodebaseAgent {
         .await
         {
             Ok(Ok(result)) => result,
+            Ok(Err(ToolCallError::Cancelled)) => {
+                return Err(Self::cancelled_error("tool_call_loop"));
+            }
             Ok(Err(err)) => {
                 tracing::warn!(
                     agent = %ctx.agent_name,
@@ -707,12 +734,15 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use sunny_core::tool::{FileReader, FileScanner, ToolError};
     use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
 
-    use sunny_core::agent::{Agent, AgentContext, AgentMessage, AgentResponse, Capability};
+    use sunny_core::agent::{
+        Agent, AgentContext, AgentError, AgentMessage, AgentResponse, Capability,
+    };
     use sunny_mind::{
         LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage, ToolCall,
     };
@@ -1118,6 +1148,8 @@ mod tests {
         response_sent: AtomicBool,
     }
 
+    struct SlowProvider;
+
     #[async_trait::async_trait]
     impl LlmProvider for FailingReadBudgetProvider {
         fn provider_id(&self) -> &str {
@@ -1172,6 +1204,33 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl LlmProvider for SlowProvider {
+        fn provider_id(&self) -> &str {
+            "slow"
+        }
+
+        fn model_id(&self) -> &str {
+            "slow-model"
+        }
+
+        async fn chat(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(LlmResponse {
+                content: "done".to_string(),
+                usage: TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                },
+                finish_reason: "stop".to_string(),
+                provider_id: ProviderId("slow".to_string()),
+                model_id: ModelId("slow-model".to_string()),
+                tool_calls: None,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn test_codebase_agent_counts_text_grep_against_read_budget() {
         let dir = mk_temp_dir("grep_budget");
@@ -1196,6 +1255,32 @@ mod tests {
             Some("tool_loop_error")
         );
         assert_eq!(result.files.len(), 1);
+
+        fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_codebase_agent_stops_when_cancelled() {
+        let dir = mk_temp_dir("cancelled_request");
+        fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
+
+        let cancel = CancellationToken::new();
+        let agent = CodebaseAgent::with_cancel(Some(Arc::new(SlowProvider)), cancel.clone());
+        let request_dir = dir.clone();
+        let run = tokio::spawn(async move {
+            agent
+                .handle_message(mk_msg(request_dir.to_str().expect("path str")), &mk_ctx())
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        let err = run
+            .await
+            .expect("join codebase task")
+            .expect_err("cancellation should stop the request");
+        assert!(matches!(err, AgentError::ExecutionFailed { .. }));
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
