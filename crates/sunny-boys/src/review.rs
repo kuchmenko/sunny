@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use sunny_core::agent::{Agent, AgentContext, AgentError, AgentMessage, AgentResponse, Capability};
-use sunny_mind::LlmProvider;
+use sunny_mind::{ChatMessage, ChatRole, LlmProvider, LlmRequest};
 
 pub struct ReviewAgent {
     provider: Option<Arc<dyn LlmProvider>>,
@@ -27,6 +27,25 @@ impl ReviewAgent {
              {content}",
             content.len()
         )
+    }
+
+    fn build_prompt(content: &str) -> LlmRequest {
+        LlmRequest {
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: "Produce concise review feedback with correctness, style, and concrete suggestions. Do not invent facts beyond the provided input.".to_string(),
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: format!("Review this content and provide structured feedback:\n\n{content}"),
+                },
+            ],
+            max_tokens: Some(600),
+            temperature: Some(0.7),
+            tools: None,
+            tool_choice: None,
+        }
     }
 }
 
@@ -61,13 +80,20 @@ impl Agent for ReviewAgent {
 
         tracing::info!(agent = %ctx.agent_name, content_len = trimmed.len(), "ReviewAgent started");
 
-        // LLM integration placeholder: when provider is available, send review prompt
-        let _has_llm = self.provider.is_some();
-
-        let feedback = Self::build_feedback_template(trimmed);
-
         let mut metadata = HashMap::new();
-        metadata.insert("mode".to_string(), "TEMPLATE".to_string());
+        let feedback = if let Some(provider) = &self.provider {
+            let response = provider
+                .chat(Self::build_prompt(trimmed))
+                .await
+                .map_err(|err| AgentError::ExecutionFailed {
+                    source: Box::new(err),
+                })?;
+            metadata.insert("mode".to_string(), "LLM_ENRICHED".to_string());
+            response.content.trim().to_string()
+        } else {
+            metadata.insert("mode".to_string(), "TEMPLATE".to_string());
+            Self::build_feedback_template(trimmed)
+        };
 
         tracing::info!(agent = %ctx.agent_name, "ReviewAgent completed");
         Ok(AgentResponse::Success {
@@ -80,10 +106,42 @@ impl Agent for ReviewAgent {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use sunny_core::agent::{Agent, AgentContext, AgentMessage, AgentResponse, Capability};
+    use sunny_mind::{
+        LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage,
+    };
 
     use super::ReviewAgent;
+
+    struct MockProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MockProvider {
+        fn provider_id(&self) -> &str {
+            "mock"
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-review"
+        }
+
+        async fn chat(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            Ok(LlmResponse {
+                content: "LLM review feedback".to_string(),
+                usage: TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 7,
+                    total_tokens: 12,
+                },
+                finish_reason: "stop".to_string(),
+                provider_id: ProviderId("mock".to_string()),
+                model_id: ModelId("mock-review".to_string()),
+                tool_calls: None,
+            })
+        }
+    }
 
     fn mk_ctx() -> AgentContext {
         AgentContext {
@@ -134,5 +192,27 @@ mod tests {
         let agent = ReviewAgent::new(None);
         let result = agent.handle_message(mk_msg("   "), &mk_ctx()).await;
         assert!(result.is_err(), "empty content should return error");
+    }
+
+    #[tokio::test]
+    async fn test_review_agent_uses_provider_when_available() {
+        let agent = ReviewAgent::new(Some(Arc::new(MockProvider)));
+        let response = agent
+            .handle_message(mk_msg("fn main() {}"), &mk_ctx())
+            .await
+            .expect("should succeed");
+
+        match response {
+            AgentResponse::Success { content, metadata } => {
+                assert_eq!(content, "LLM review feedback");
+                assert_eq!(
+                    metadata.get("mode").map(String::as_str),
+                    Some("LLM_ENRICHED")
+                );
+            }
+            AgentResponse::Error { code, message } => {
+                panic!("expected success, got error code={code}, message={message}");
+            }
+        }
     }
 }
