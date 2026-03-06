@@ -83,9 +83,8 @@ fn test_ask_empty_input_error() {
         .output()
         .expect("should run ask command");
 
-    // Empty input should produce an error, not panic
-    // The exact exit code may vary, but it should not segfault/panic
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         !stderr.contains("panic"),
         "should not panic on empty input, stderr: {}",
@@ -95,6 +94,10 @@ fn test_ask_empty_input_error() {
         !stderr.contains("thread '"),
         "should not have thread panic, stderr: {}",
         stderr
+    );
+    assert!(
+        !output.status.success() || stdout.contains("\"error\"") || stdout.contains("\"outcome\""),
+        "empty input should fail or return a structured error envelope, stdout: {stdout}, stderr: {stderr}"
     );
 }
 

@@ -150,13 +150,19 @@ fn test_e2e_empty_input_error_recovery() {
         stderr
     );
 
-    // Should produce valid JSON even for error case
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-        // If we got JSON, verify it has expected error structure
-        if json.get("error").is_some() || json.get("outcome").is_some() {
-            // Valid error response
-        }
+    if output.status.success() {
+        let json: serde_json::Value = serde_json::from_str(&stdout)
+            .expect("successful empty-input response should be valid JSON");
+        assert!(
+            json.get("error").is_some() || json.get("outcome").is_some(),
+            "successful empty-input response should contain an error envelope, stdout: {stdout}"
+        );
+    } else {
+        assert!(
+            !stdout.trim().is_empty() || !stderr.trim().is_empty(),
+            "failing empty-input response should emit diagnostics"
+        );
     }
 }
 

@@ -65,14 +65,7 @@ fn test_ask_help_shows_usage() {
 #[test]
 fn test_ask_with_no_llm() {
     let output = sunny_cli()
-        .args([
-            "ask",
-            "what is this",
-            "--no-llm",
-            "--dry-run",
-            "--format",
-            "json",
-        ])
+        .args(["ask", "what is this", "--no-llm", "--format", "json"])
         .output()
         .expect("should run ask command with --no-llm");
 
@@ -82,7 +75,8 @@ fn test_ask_with_no_llm() {
         "command should succeed, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("\"plan_id\""), "should contain plan_id");
+    assert!(stdout.contains("\"outcome\""), "should contain outcome");
+    assert!(stdout.contains("\"response\""), "should contain response");
 }
 
 #[test]

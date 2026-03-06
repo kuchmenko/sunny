@@ -745,22 +745,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ask_provider_path_missing_env() {
-        // Verifies that when KIMI_API_KEY is not set, provider falls back to None
-        // Save original env var
-        let original_key = std::env::var("KIMI_API_KEY").ok();
-
-        // Remove KIMI_API_KEY to simulate missing env
-        std::env::remove_var("KIMI_API_KEY");
-
+    async fn test_execute_ask_without_provider_injection() {
         let args = AskArgs {
-            input: "test with missing env".to_string(),
+            input: "test with direct none injection".to_string(),
             format: "json".to_string(),
-            dry_run: true, // Use dry_run to avoid actual agent execution
-            no_llm: false, // no_llm is false, but env is missing
+            dry_run: true,
+            no_llm: false,
         };
 
-        // Execute - should fall back to None provider and still succeed
         let output = execute_ask(args, None)
             .await
             .expect("ask should succeed even with missing env");
@@ -771,12 +763,6 @@ mod tests {
             "request_id should be present"
         );
         assert!(output.contains("\"plan_id\""), "plan_id should be present");
-
-        // Restore original env var
-        match original_key {
-            Some(key) => std::env::set_var("KIMI_API_KEY", key),
-            None => std::env::remove_var("KIMI_API_KEY"),
-        }
     }
 
     #[tokio::test]
