@@ -3,7 +3,6 @@
 //! These tests lock critical baseline metrics:
 //! - CLI subcommand availability (ask, analyze)
 //! - Event constant values and naming conventions
-//! - Total test count threshold
 
 use std::process::Command;
 
@@ -139,4 +138,27 @@ fn test_baseline_canonical_route_event_value() {
     use sunny_core::orchestrator::events::EVENT_ROUTE_RESOLVED;
 
     assert_eq!(EVENT_ROUTE_RESOLVED, "orchestrator.route.resolved");
+}
+
+#[test]
+fn test_baseline_cli_ask_event_chain() {
+    use sunny_core::orchestrator::events::{
+        EVENT_AGENT_MESSAGE_END, EVENT_AGENT_MESSAGE_START, EVENT_CLI_COMMAND_END,
+        EVENT_CLI_COMMAND_START, EVENT_PLAN_COMPLETED, EVENT_PLAN_CREATED, EVENT_ROUTE_RESOLVED,
+    };
+
+    let expected_chain = [
+        EVENT_CLI_COMMAND_START,
+        EVENT_PLAN_CREATED,
+        EVENT_ROUTE_RESOLVED,
+        EVENT_AGENT_MESSAGE_START,
+        EVENT_AGENT_MESSAGE_END,
+        EVENT_PLAN_COMPLETED,
+        EVENT_CLI_COMMAND_END,
+    ];
+
+    for event in expected_chain {
+        assert!(event.contains('.'));
+        assert!(!event.contains('_'));
+    }
 }
