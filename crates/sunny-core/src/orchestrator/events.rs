@@ -124,4 +124,12 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_canonical_route_event_values() {
+        // These values are part of the public observability contract.
+        // Changing them is a breaking change.
+        assert_eq!(EVENT_ROUTE_RESOLVED, "orchestrator.route.resolved");
+        assert_eq!(EVENT_ROUTE_FAILED, "orchestrator.route.failed");
+    }
 }

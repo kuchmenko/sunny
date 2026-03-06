@@ -15,8 +15,12 @@
 //! sunny-cli stays thin — orchestration wiring only.
 
 pub mod analyze;
+pub mod codebase;
+pub mod review;
 
 pub use analyze::{AnalysisMode, AnalysisResult, AnalyzeAgent};
+pub use codebase::CodebaseAgent;
+pub use review::ReviewAgent;
 
 #[cfg(test)]
 mod tests {

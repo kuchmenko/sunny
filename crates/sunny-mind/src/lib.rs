@@ -22,7 +22,7 @@ pub use kimi::KimiProvider;
 pub use provider::LlmProvider;
 pub use types::{
     ChatMessage, ChatRole, LlmRequest, LlmResponse, ModelId, ProviderEconomics, ProviderId,
-    ProviderRoutingPolicy, TokenUsage,
+    ProviderRoutingPolicy, TokenUsage, ToolCall, ToolCallResult, ToolChoice, ToolDefinition,
 };
 
 #[cfg(test)]
@@ -197,5 +197,59 @@ mod tests {
         let req_json = serde_json::to_string(&req).expect("serialize LlmRequest");
         let req_de: LlmRequest = serde_json::from_str(&req_json).expect("deserialize LlmRequest");
         assert_eq!(req, req_de);
+    }
+
+    #[test]
+    fn test_tool_definition_serde() {
+        let definition = ToolDefinition {
+            name: "search_web".to_string(),
+            description: "Searches the web".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" }
+                },
+                "required": ["query"]
+            }),
+        };
+
+        let json = serde_json::to_string(&definition).expect("serialize ToolDefinition");
+        let decoded: ToolDefinition =
+            serde_json::from_str(&json).expect("deserialize ToolDefinition");
+        assert_eq!(definition, decoded);
+    }
+
+    #[test]
+    fn test_tool_call_serde() {
+        let call = ToolCall {
+            id: "call_123".to_string(),
+            name: "search_web".to_string(),
+            arguments: "{\"query\":\"sunny rust\"}".to_string(),
+        };
+
+        let json = serde_json::to_string(&call).expect("serialize ToolCall");
+        let decoded: ToolCall = serde_json::from_str(&json).expect("deserialize ToolCall");
+        assert_eq!(call, decoded);
+    }
+
+    #[test]
+    fn test_tool_choice_variants() {
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::Auto).expect("serialize auto"),
+            "\"auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::None).expect("serialize none"),
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::Required).expect("serialize required"),
+            "\"required\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::Specific("tool_name".to_string()))
+                .expect("serialize specific"),
+            "{\"specific\":\"tool_name\"}"
+        );
     }
 }
