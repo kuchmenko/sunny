@@ -74,6 +74,7 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn with_tool_timeout(mut self, timeout: Duration) -> Self {
         self.tool_timeout = timeout;
         self
