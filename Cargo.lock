@@ -1622,15 +1622,18 @@ name = "sunny-boys"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "reqwest",
  "serde",
  "serde_json",
  "sunny-core",
  "sunny-mind",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]

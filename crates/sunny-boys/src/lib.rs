@@ -18,15 +18,19 @@ pub mod analyze;
 pub mod codebase;
 pub mod critique;
 pub mod events;
+pub mod git_tools;
 pub mod registry;
 pub mod review;
+pub mod tavily;
 pub mod tool_loop;
 
 pub use analyze::{AnalysisMode, AnalysisResult, AnalyzeAgent};
 pub use codebase::CodebaseAgent;
 pub use critique::CritiqueAgent;
+pub use git_tools::{GitDiff, GitLog, GitStatus};
 pub use registry::build_ask_registry;
 pub use review::ReviewAgent;
+pub use tavily::TavilySearch;
 pub use tool_loop::{ToolCallError, ToolCallLoop, ToolCallMetrics, ToolCallResult};
 
 #[cfg(test)]
