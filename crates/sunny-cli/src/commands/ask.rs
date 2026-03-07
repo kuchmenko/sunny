@@ -7,9 +7,12 @@ use std::sync::Arc;
 use clap::Args;
 use tokio_util::sync::CancellationToken;
 
-use sunny_boys::build_ask_registry;
-use sunny_core::agent::{AgentError, AgentMessage, AgentResponse, Capability};
-use sunny_core::orchestrator::{IntentClassifier, IntentKind, RequestId};
+use sunny_boys::build_boys_registry;
+use sunny_core::agent::{AgentMessage, AgentResponse, Capability};
+use sunny_core::orchestrator::{
+    HeuristicLoopPlanner, IntentClassifier, IntentKind, InteractiveOrchestrator, OrchestratorError,
+    OrchestratorHandle, PlanPolicy, RequestId,
+};
 use sunny_mind::{KimiProvider, LlmProvider};
 
 use crate::output::{
@@ -115,25 +118,49 @@ fn issue(level: &str, code: &str, message: impl Into<String>, hint: Option<&str>
     }
 }
 
-fn map_agent_error(err: &AgentError) -> PromptIssue {
+fn map_orchestrator_error(err: &OrchestratorError) -> PromptIssue {
     match err {
-        AgentError::Timeout => issue(
+        OrchestratorError::AgentUnresponsive => issue(
             "error",
             "agent_timeout",
             "Agent did not respond within timeout window",
             Some("Retry, or use --no-llm to bypass provider/tool loop"),
         ),
-        AgentError::NotFound { id } => issue(
+        OrchestratorError::AgentNotFound { name } => issue(
             "error",
             "agent_not_found",
-            format!("Agent not found: {id}"),
+            format!("Agent not found: {name}"),
             Some("Verify registry/capability wiring for ask route"),
         ),
-        AgentError::ExecutionFailed { source } => issue(
+        OrchestratorError::DispatchFailed { source } => issue(
             "error",
             "agent_execution_failed",
             source.to_string(),
             Some("Inspect logs with request_id for root cause"),
+        ),
+        OrchestratorError::ShuttingDown => issue(
+            "error",
+            "orchestrator_shutting_down",
+            "Orchestrator is shutting down",
+            Some("Retry the command after runtime initialization"),
+        ),
+        OrchestratorError::InvalidStepTransition { from, to } => issue(
+            "error",
+            "invalid_step_transition",
+            format!("Invalid step transition: {from:?} -> {to:?}"),
+            Some("Inspect orchestration state transitions and retry"),
+        ),
+        OrchestratorError::PlanPolicyViolation { reason } => issue(
+            "error",
+            "plan_policy_violation",
+            reason.clone(),
+            Some("Adjust input scope or orchestration policy limits"),
+        ),
+        OrchestratorError::Plan { source } => issue(
+            "error",
+            "plan_error",
+            source.to_string(),
+            Some("Inspect planner constraints and retry"),
         ),
     }
 }
@@ -146,12 +173,26 @@ fn warnings_from_metadata(metadata: &HashMap<String, String>) -> Vec<PromptIssue
             .get("fallback_reason")
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
+        let hint = if reason == "tool_loop_read_budget_exceeded" {
+            "Tool loop hit read budget; narrow the question scope or rerun with --no-llm"
+        } else {
+            "Provider/tool loop was unavailable or timed out; output may be less focused"
+        };
         warnings.push(issue(
             "warning",
             "fallback_mode",
-            format!("Result generated via fallback scanner+reader ({reason})"),
-            Some("LLM tool loop was unavailable or timed out; output may be less focused"),
+            format!("Result generated via fallback execution path ({reason})"),
+            Some(hint),
         ));
+
+        if let Some(detail) = metadata.get("fallback_detail") {
+            warnings.push(issue(
+                "warning",
+                "fallback_detail",
+                format!("Fallback detail: {detail}"),
+                Some("Inspect this detail and request_id logs for exact failing tool call"),
+            ));
+        }
     }
 
     if let Some(skipped_raw) = metadata.get("skipped_file_count") {
@@ -341,8 +382,9 @@ async fn execute_ask_internal(
         });
     }
 
+    let llm_enabled = provider.is_some();
     let cancel = CancellationToken::new();
-    let registry = match build_ask_registry(provider, &cancel) {
+    let registry = match build_boys_registry(provider, &cancel) {
         Ok(registry) => registry,
         Err(err) => {
             let mut metadata = HashMap::new();
@@ -372,61 +414,7 @@ async fn execute_ask_internal(
         }
     };
 
-    let agents = registry.find_by_capability(&required_capability);
-    let Some(agent_id) = agents.first() else {
-        let mut metadata = HashMap::new();
-        metadata.insert("failure_stage".to_string(), "capability_lookup".to_string());
-        metadata.insert("capability".to_string(), required_capability.0.clone());
-        tracing::info!(
-            name: EVENT_CLI_COMMAND_END,
-            request_id = %request_id_text,
-            outcome = OUTCOME_ERROR,
-            "cli.command.end"
-        );
-        return Ok(format_ask_error(
-            &args.format,
-            &request_id_text,
-            &intent_kind,
-            &required_capability.0,
-            args.dry_run,
-            metadata,
-            issue(
-                "error",
-                "no_agent_for_capability",
-                format!(
-                    "No agent registered for capability '{}'",
-                    required_capability.0
-                ),
-                Some("Check ask registry capability mapping"),
-            ),
-        ));
-    };
-
-    let Some(handle) = registry.find(agent_id) else {
-        let mut metadata = HashMap::new();
-        metadata.insert("failure_stage".to_string(), "agent_lookup".to_string());
-        metadata.insert("agent_id".to_string(), agent_id.to_string());
-        tracing::info!(
-            name: EVENT_CLI_COMMAND_END,
-            request_id = %request_id_text,
-            outcome = OUTCOME_ERROR,
-            "cli.command.end"
-        );
-        return Ok(format_ask_error(
-            &args.format,
-            &request_id_text,
-            &intent_kind,
-            &required_capability.0,
-            args.dry_run,
-            metadata,
-            issue(
-                "error",
-                "agent_not_found",
-                format!("Selected agent '{}' is missing from registry", agent_id),
-                Some("Rebuild registry and verify agent IDs"),
-            ),
-        ));
-    };
+    let orchestrator = OrchestratorHandle::spawn(registry, cancel.child_token());
 
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
@@ -486,21 +474,38 @@ async fn execute_ask_internal(
         request_id = %request_id_text,
         intent_kind = %intent_kind,
         capability = %required_capability.0,
-        selected_agent = %agent_id,
         cwd = %cwd.display(),
         query_len = args.input.len(),
         "ask.task.dispatch"
     );
 
-    let response = match handle.send(task_msg).await {
+    let planner = HeuristicLoopPlanner::new(
+        PlanPolicy {
+            max_depth: 3,
+            max_steps: 16,
+            max_retries: 1,
+        },
+        llm_enabled,
+    );
+    let interactive = InteractiveOrchestrator::new(&orchestrator, planner);
+
+    let dispatch_result = interactive
+        .execute(intent, task_msg, cancel.child_token(), request_id)
+        .await;
+
+    if let Err(err) = orchestrator.shutdown().await {
+        tracing::warn!(request_id = %request_id_text, error = %err, "ask orchestrator shutdown failed");
+    }
+
+    let response = match dispatch_result {
         Ok(response) => response,
         Err(err) => {
             cancel.cancel();
             let mut metadata = HashMap::new();
             metadata.insert("failure_stage".to_string(), "agent_dispatch".to_string());
             metadata.insert("error".to_string(), err.to_string());
-            if matches!(err, AgentError::Timeout) {
-                metadata.insert("timeout_source".to_string(), "agent_handle".to_string());
+            if matches!(err, OrchestratorError::AgentUnresponsive) {
+                metadata.insert("timeout_source".to_string(), "orchestrator".to_string());
             }
 
             tracing::info!(
@@ -516,7 +521,7 @@ async fn execute_ask_internal(
                 &required_capability.0,
                 args.dry_run,
                 metadata,
-                map_agent_error(&err),
+                map_orchestrator_error(&err),
             ));
         }
     };

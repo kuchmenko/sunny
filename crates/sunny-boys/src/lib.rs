@@ -36,7 +36,7 @@ pub use delegate::DelegateAgent;
 pub use explore::ExploreAgent;
 pub use git_tools::{GitDiff, GitLog, GitStatus};
 pub use oracle::OracleAgent;
-pub use registry::build_ask_registry;
+pub use registry::build_boys_registry;
 pub use review::ReviewAgent;
 pub use tavily::TavilySearch;
 pub use tool_loop::{ToolCallError, ToolCallLoop, ToolCallMetrics, ToolCallResult};
