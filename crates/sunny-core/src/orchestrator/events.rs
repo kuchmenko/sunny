@@ -7,6 +7,9 @@
 pub const EVENT_TOOL_EXEC_START: &str = "tool.exec.start";
 pub const EVENT_TOOL_EXEC_END: &str = "tool.exec.end";
 pub const EVENT_TOOL_EXEC_ERROR: &str = "tool.exec.error";
+pub const EVENT_TOOL_EXEC_DEPTH: &str = "tool.exec.depth";
+pub const EVENT_TOOL_EXEC_TIMEOUT: &str = "tool.exec.timeout";
+pub const EVENT_TOOL_CANCELLED: &str = "tool.exec.cancelled";
 
 pub const EVENT_DISPATCH_START: &str = "orchestrator.dispatch.start";
 pub const EVENT_DISPATCH_SUCCESS: &str = "orchestrator.dispatch.success";
@@ -43,6 +46,9 @@ mod tests {
         assert!(!EVENT_TOOL_EXEC_START.is_empty());
         assert!(!EVENT_TOOL_EXEC_END.is_empty());
         assert!(!EVENT_TOOL_EXEC_ERROR.is_empty());
+        assert!(!EVENT_TOOL_EXEC_DEPTH.is_empty());
+        assert!(!EVENT_TOOL_EXEC_TIMEOUT.is_empty());
+        assert!(!EVENT_TOOL_CANCELLED.is_empty());
         assert!(!EVENT_DISPATCH_START.is_empty());
         assert!(!EVENT_DISPATCH_SUCCESS.is_empty());
         assert!(!EVENT_DISPATCH_ERROR.is_empty());
@@ -75,6 +81,9 @@ mod tests {
             EVENT_TOOL_EXEC_START,
             EVENT_TOOL_EXEC_END,
             EVENT_TOOL_EXEC_ERROR,
+            EVENT_TOOL_EXEC_DEPTH,
+            EVENT_TOOL_EXEC_TIMEOUT,
+            EVENT_TOOL_CANCELLED,
             EVENT_DISPATCH_START,
             EVENT_DISPATCH_SUCCESS,
             EVENT_DISPATCH_ERROR,
@@ -123,5 +132,13 @@ mod tests {
                 outcome
             );
         }
+    }
+
+    #[test]
+    fn test_canonical_route_event_values() {
+        // These values are part of the public observability contract.
+        // Changing them is a breaking change.
+        assert_eq!(EVENT_ROUTE_RESOLVED, "orchestrator.route.resolved");
+        assert_eq!(EVENT_ROUTE_FAILED, "orchestrator.route.failed");
     }
 }

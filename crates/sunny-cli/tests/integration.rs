@@ -54,6 +54,8 @@ impl LlmProvider for MockProvider {
                 finish_reason: "stop".to_string(),
                 provider_id: ProviderId("mock".to_string()),
                 model_id: ModelId("mock-model".to_string()),
+                tool_calls: None,
+                reasoning_content: None,
             }),
             (_, Some(e)) => Err(clone_llm_error(e)),
             _ => Ok(LlmResponse {
@@ -66,6 +68,8 @@ impl LlmProvider for MockProvider {
                 finish_reason: "stop".to_string(),
                 provider_id: ProviderId("mock".to_string()),
                 model_id: ModelId("mock-model".to_string()),
+                tool_calls: None,
+                reasoning_content: None,
             }),
         }
     }

@@ -15,8 +15,19 @@
 //! sunny-cli stays thin — orchestration wiring only.
 
 pub mod analyze;
+pub mod codebase;
+pub mod critique;
+pub mod events;
+pub mod registry;
+pub mod review;
+pub mod tool_loop;
 
 pub use analyze::{AnalysisMode, AnalysisResult, AnalyzeAgent};
+pub use codebase::CodebaseAgent;
+pub use critique::CritiqueAgent;
+pub use registry::build_ask_registry;
+pub use review::ReviewAgent;
+pub use tool_loop::{ToolCallError, ToolCallLoop, ToolCallMetrics, ToolCallResult};
 
 #[cfg(test)]
 mod tests {

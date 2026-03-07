@@ -1,11 +1,13 @@
 pub mod error;
 pub mod fs_read;
 pub mod fs_scan;
+mod policy;
 pub mod text_grep;
 
 pub use error::ToolError;
 pub use fs_read::{FileContent, FileReader};
 pub use fs_scan::FileScanner;
+pub use policy::ToolPolicy;
 pub use text_grep::{GrepMatch, GrepResult, TextGrep};
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 //! CLI commands module
 
 pub mod analyze;
-pub mod prompt;
+pub mod ask;
 
 pub use analyze::AnalyzeArgs;
-pub use prompt::PromptArgs;
+pub use ask::AskArgs;

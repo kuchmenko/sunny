@@ -15,6 +15,7 @@ serde_json = "1" # dep: JSON output formatting
 tracing = "0.1" # dep: structured logging
 tracing-subscriber = "0.3" # dep: logging output for CLI
 dotenvy = "0.15" # dep: load .env variables for provider configuration
+thiserror = "1" # dep: error handling for CLI commands
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] } # dep: async test runtime

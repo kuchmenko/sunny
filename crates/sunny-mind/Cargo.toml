@@ -8,8 +8,10 @@ serde = { version = "1", features = ["derive"] } # dep: serialization for LLM ty
 async-trait = "0.1" # dep: async methods in LlmProvider trait per AGENTS.md
 thiserror = "1" # dep: typed error enums per AGENTS.md
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] } # dep: HTTP client for Kimi API
+serde_json = "1" # dep: JSON schema/value support for tool definitions and serde tests
+tokio = { version = "1", features = ["sync"] } # dep: tokio::sync::Mutex for MockToolCallProvider (async-safe test mock)
 
 [dev-dependencies]
-serde_json = "1" # dep: JSON roundtrip tests for LLM types
 tokio = { version = "1", features = ["test-util", "macros"] } # dep: async test runtime
 wiremock = "0.6" # dep: HTTP mocking for provider tests
+proptest = "1" # dep: property-based serialization invariants for public LLM contracts
