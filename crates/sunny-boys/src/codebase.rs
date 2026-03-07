@@ -17,7 +17,7 @@ use crate::tool_loop::{ToolCallError, ToolCallLoop};
 const MAX_CONTEXT_FILES: usize = 20;
 const MAX_FILE_BYTES: usize = 2048;
 const MAX_TOOL_ITERATIONS: usize = 10;
-const TOOL_LOOP_BUDGET_SECS: u64 = 24;
+const TOOL_LOOP_BUDGET_SECS: u64 = 120;
 const TOOL_LOOP_READ_MAX_BYTES: usize = 4096;
 const TOOL_LOOP_SCAN_MAX_FILES: usize = 400;
 const TOOL_LOOP_MAX_READ_CALLS: usize = 6;
