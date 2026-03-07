@@ -635,6 +635,9 @@ impl Agent for CodebaseAgent {
                         root_path.display(),
                         TOOL_LOOP_MAX_READ_CALLS
                     ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
                 },
                 ChatMessage {
                     role: ChatRole::User,
@@ -643,6 +646,9 @@ impl Agent for CodebaseAgent {
                         query,
                         root_path.display()
                     ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
                 },
             ],
             max_tokens: Some(2048),
@@ -848,6 +854,7 @@ mod tests {
                 provider_id: ProviderId("mock".to_string()),
                 model_id: ModelId("mock-model".to_string()),
                 tool_calls: None,
+                reasoning_content: None,
             })
         }
     }
@@ -998,6 +1005,7 @@ mod tests {
                     arguments: serde_json::json!({ "path": dir.to_str().unwrap() }).to_string(),
                     execution_depth: 0,
                 }]),
+                reasoning_content: None,
             },
             LlmResponse {
                 content: "Found 2 Rust source files in the codebase.".to_string(),
@@ -1010,6 +1018,7 @@ mod tests {
                 provider_id: ProviderId("mock".to_string()),
                 model_id: ModelId("mock-model".to_string()),
                 tool_calls: None,
+                reasoning_content: None,
             },
         ]));
 
@@ -1162,6 +1171,7 @@ mod tests {
                 provider_id: ProviderId("capture".to_string()),
                 model_id: ModelId("capture-model".to_string()),
                 tool_calls: None,
+                reasoning_content: None,
             },
         });
         let agent = CodebaseAgent::new(Some(provider));
@@ -1207,6 +1217,7 @@ mod tests {
                     provider_id: ProviderId("budget".to_string()),
                     model_id: ModelId("budget-model".to_string()),
                     tool_calls: None,
+                    reasoning_content: None,
                 });
             }
 
@@ -1234,6 +1245,7 @@ mod tests {
                 provider_id: ProviderId("budget".to_string()),
                 model_id: ModelId("budget-model".to_string()),
                 tool_calls: Some(tool_calls),
+                reasoning_content: None,
             })
         }
     }
@@ -1261,6 +1273,7 @@ mod tests {
                 provider_id: ProviderId("slow".to_string()),
                 model_id: ModelId("slow-model".to_string()),
                 tool_calls: None,
+                reasoning_content: None,
             })
         }
     }

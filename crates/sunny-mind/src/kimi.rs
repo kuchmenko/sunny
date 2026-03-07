@@ -138,10 +138,97 @@ impl KimiProvider {
     }
 }
 
+/// Wire format for a single message in an outbound Kimi chat request.
+///
+/// Maps our domain [`crate::ChatMessage`] to the OpenAI-compatible message schema.
+/// Kimi uses the same wire format as OpenAI; other providers will implement their own mapping.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum KimiOutboundMessage {
+    /// user / system / plain assistant (no tool calls) messages.
+    Standard { role: &'static str, content: String },
+    /// Assistant message that invoked one or more tools.
+    AssistantWithTools {
+        role: &'static str,
+        content: String,
+        tool_calls: Vec<KimiRequestToolCall>,
+        /// Kimi thinking models require reasoning_content to be echoed verbatim on follow-up turns.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
+    },
+    /// Tool result correlated with a prior [`AssistantWithTools`] message.
+    ToolResult {
+        role: &'static str,
+        tool_call_id: String,
+        content: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct KimiRequestToolCall {
+    id: String,
+    r#type: &'static str,
+    function: KimiRequestToolCallFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct KimiRequestToolCallFunction {
+    name: String,
+    arguments: String,
+}
+
+fn map_to_kimi_message(msg: crate::ChatMessage) -> Result<KimiOutboundMessage, LlmError> {
+    match msg.role {
+        crate::ChatRole::Tool => {
+            let tool_call_id = msg.tool_call_id.ok_or_else(|| LlmError::InvalidResponse {
+                message: "tool result message is missing tool_call_id".to_string(),
+            })?;
+            Ok(KimiOutboundMessage::ToolResult {
+                role: "tool",
+                tool_call_id,
+                content: msg.content,
+            })
+        }
+        crate::ChatRole::Assistant if msg.tool_calls.is_some() => {
+            let tool_calls = msg
+                .tool_calls
+                .expect("checked above via is_some guard")
+                .into_iter()
+                .map(|tc| KimiRequestToolCall {
+                    id: tc.id,
+                    r#type: "function",
+                    function: KimiRequestToolCallFunction {
+                        name: tc.name,
+                        arguments: tc.arguments,
+                    },
+                })
+                .collect();
+            Ok(KimiOutboundMessage::AssistantWithTools {
+                role: "assistant",
+                content: msg.content,
+                tool_calls,
+                reasoning_content: msg.reasoning_content,
+            })
+        }
+        role => {
+            let role_str = match role {
+                crate::ChatRole::System => "system",
+                crate::ChatRole::User => "user",
+                crate::ChatRole::Assistant => "assistant",
+                crate::ChatRole::Tool => unreachable!("Tool role is handled in the first arm"),
+            };
+            Ok(KimiOutboundMessage::Standard {
+                role: role_str,
+                content: msg.content,
+            })
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct KimiChatRequest {
     model: String,
-    messages: Vec<crate::ChatMessage>,
+    messages: Vec<KimiOutboundMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,7 +389,11 @@ impl LlmProvider for KimiProvider {
 
         let payload = KimiChatRequest {
             model: self.model.clone(),
-            messages: req.messages,
+            messages: req
+                .messages
+                .into_iter()
+                .map(map_to_kimi_message)
+                .collect::<Result<Vec<_>, _>>()?,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
             tools,
@@ -408,6 +499,7 @@ impl LlmProvider for KimiProvider {
             provider_id: ProviderId(self.provider_id().to_string()),
             model_id: ModelId(self.model.clone()),
             tool_calls,
+            reasoning_content: first_choice.message.reasoning_content.clone(),
         })
     }
 }
@@ -446,6 +538,9 @@ mod tests {
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hello".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
             }],
             max_tokens: Some(128),
             temperature: Some(0.2),
@@ -901,6 +996,9 @@ mod tests {
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hello".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
             }],
             max_tokens: Some(128),
             temperature: Some(0.2),
@@ -974,6 +1072,9 @@ mod tests {
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hello".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
             }],
             max_tokens: None,
             temperature: None,
@@ -1005,6 +1106,9 @@ mod tests {
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hello".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
             }],
             max_tokens: None,
             temperature: None,
@@ -1019,5 +1123,103 @@ mod tests {
         assert!(err
             .to_string()
             .contains("does not support tool_choice=required"));
+    }
+}
+
+#[cfg(test)]
+mod map_tests {
+    use crate::{ChatMessage, ChatRole, ToolCall};
+
+    use super::map_to_kimi_message;
+
+    fn mk_msg(role: ChatRole, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn test_map_to_kimi_message_standard_user() {
+        let msg = mk_msg(ChatRole::User, "hello");
+        let wire = map_to_kimi_message(msg).expect("should map user message");
+        let json = serde_json::to_value(&wire).expect("should serialize");
+        assert_eq!(json["role"], "user");
+        assert_eq!(json["content"], "hello");
+        assert!(
+            json.get("tool_calls").is_none(),
+            "no tool_calls field on standard message"
+        );
+        assert!(
+            json.get("tool_call_id").is_none(),
+            "no tool_call_id field on standard message"
+        );
+    }
+
+    #[test]
+    fn test_map_to_kimi_message_assistant_with_tool_calls() {
+        let msg = ChatMessage {
+            role: ChatRole::Assistant,
+            content: "".to_string(),
+            tool_calls: Some(vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "fs_read".to_string(),
+                arguments: "{\"path\":\"a.rs\"}".to_string(),
+                execution_depth: 0,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let wire = map_to_kimi_message(msg).expect("should map assistant-with-tools");
+        let json = serde_json::to_value(&wire).expect("should serialize");
+        assert_eq!(json["role"], "assistant");
+        assert!(
+            json.get("tool_calls").is_some(),
+            "must carry tool_calls array"
+        );
+        let tc = &json["tool_calls"][0];
+        assert_eq!(tc["id"], "call-1");
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["function"]["name"], "fs_read");
+        assert_eq!(tc["function"]["arguments"], "{\"path\":\"a.rs\"}");
+    }
+
+    #[test]
+    fn test_map_to_kimi_message_tool_result() {
+        let msg = ChatMessage {
+            role: ChatRole::Tool,
+            content: "file content".to_string(),
+            tool_calls: None,
+            tool_call_id: Some("call-1".to_string()),
+            reasoning_content: None,
+        };
+        let wire = map_to_kimi_message(msg).expect("should map tool result");
+        let json = serde_json::to_value(&wire).expect("should serialize");
+        assert_eq!(json["role"], "tool");
+        assert_eq!(json["tool_call_id"], "call-1");
+        assert_eq!(json["content"], "file content");
+        assert!(
+            json.get("tool_calls").is_none(),
+            "no tool_calls field on tool result"
+        );
+    }
+
+    #[test]
+    fn test_map_to_kimi_message_tool_result_missing_id_errors() {
+        let msg = ChatMessage {
+            role: ChatRole::Tool,
+            content: "result".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let err = map_to_kimi_message(msg).expect_err("missing tool_call_id must error");
+        assert!(
+            err.to_string().contains("tool_call_id"),
+            "error message should mention tool_call_id, got: {err}"
+        );
     }
 }

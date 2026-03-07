@@ -39,10 +39,16 @@ impl CritiqueAgent {
                 ChatMessage {
                     role: ChatRole::System,
                     content: "Produce a concise critique covering feasibility, risks, gaps, and improvements. Stay grounded in the provided input.".to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
                 },
                 ChatMessage {
                     role: ChatRole::User,
                     content: format!("Critique this proposal and call out the main risks and gaps:\n\n{content}"),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
                 },
             ],
             max_tokens: Some(600),
@@ -149,6 +155,7 @@ mod tests {
                 provider_id: ProviderId("mock".to_string()),
                 model_id: ModelId("mock-critique".to_string()),
                 tool_calls: None,
+                reasoning_content: None,
             })
         }
     }

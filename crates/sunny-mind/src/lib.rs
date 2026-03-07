@@ -38,6 +38,9 @@ mod tests {
         let msg = ChatMessage {
             role: ChatRole::User,
             content: "Hello, world!".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
         };
         assert_eq!(msg.role, ChatRole::User);
         assert_eq!(msg.content, "Hello, world!");
@@ -45,12 +48,18 @@ mod tests {
         let system_msg = ChatMessage {
             role: ChatRole::System,
             content: "You are helpful.".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
         };
         assert_eq!(system_msg.role, ChatRole::System);
 
         let assistant_msg = ChatMessage {
             role: ChatRole::Assistant,
             content: "Sure!".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
         };
         assert_eq!(assistant_msg.role, ChatRole::Assistant);
     }
@@ -61,6 +70,9 @@ mod tests {
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "test".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
             }],
             max_tokens: None,
             temperature: None,
@@ -95,6 +107,7 @@ mod tests {
             provider_id: ProviderId("test-provider".to_string()),
             model_id: ModelId("test-model".to_string()),
             tool_calls: None,
+            reasoning_content: None,
         };
         assert_eq!(res.content, "Generated text");
         assert_eq!(res.finish_reason, "stop");
@@ -180,6 +193,9 @@ mod tests {
         let msg = ChatMessage {
             role: ChatRole::User,
             content: "Hello!".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize ChatMessage");
         let deserialized: ChatMessage =
@@ -190,6 +206,9 @@ mod tests {
             let m = ChatMessage {
                 role: role.clone(),
                 content: "test".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
             };
             let j = serde_json::to_string(&m).expect("serialize");
             let d: ChatMessage = serde_json::from_str(&j).expect("deserialize");
@@ -214,6 +233,9 @@ mod tests {
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "Use a tool".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
             }],
             max_tokens: Some(128),
             temperature: Some(0.2),
@@ -263,6 +285,9 @@ mod tests {
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "test".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
             }],
             max_tokens: None,
             temperature: None,
@@ -297,6 +322,7 @@ mod tests {
                 arguments: "{\"query\":\"sunny\"}".to_string(),
                 execution_depth: 0,
             }]),
+            reasoning_content: None,
         };
 
         let actual = serde_json::to_value(&response).expect("serialize response with tool calls");

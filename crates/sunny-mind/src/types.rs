@@ -23,8 +23,18 @@ pub enum ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Tool invocations requested by the model; populated on `Assistant` messages that call
+    /// tools. Each provider adapter converts these to its own wire format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Correlates a `Tool` role result with its originating call; must match [`ToolCall::id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Internal chain-of-thought produced by thinking models (e.g. kimi-k2.5).
+    /// Must be echoed back verbatim in the assistant message for subsequent turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmRequest {
     pub messages: Vec<ChatMessage>,
@@ -114,8 +124,11 @@ pub struct LlmResponse {
     pub model_id: ModelId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Internal chain-of-thought produced by thinking models (e.g. kimi-k2.5).
+    /// Preserved from the provider response so it can be echoed back in follow-up turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
-
 /// Policy for routing requests across LLM providers.
 ///
 /// TODO: Add `Fallback(Vec<ProviderId>)` variant for failover routing

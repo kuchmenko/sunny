@@ -175,10 +175,16 @@ language mix, and probable architecture boundaries.\n\nDIGEST:\n{digest}"
                 ChatMessage {
                     role: ChatRole::System,
                     content: "Produce a concise structural codebase summary.".to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
                 },
                 ChatMessage {
                     role: ChatRole::User,
                     content: Self::build_prompt(digest),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
                 },
             ],
             max_tokens: Some(600),
@@ -357,6 +363,7 @@ mod tests {
                 provider_id: ProviderId("mock".to_string()),
                 model_id: ModelId("mock-model".to_string()),
                 tool_calls: None,
+                reasoning_content: None,
             })
         }
     }

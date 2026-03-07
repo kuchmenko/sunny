@@ -3,10 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sunny_core::tool::{ToolError, ToolPolicy};
-use sunny_mind::{
-    ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse,
-    ToolCallResult as LlmToolCallResult,
-};
+use sunny_mind::{ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{info_span, Instrument};
@@ -203,35 +200,24 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
 
             current_request.messages.push(ChatMessage {
                 role: ChatRole::Assistant,
-                content: response.content,
+                content: response.content.clone(),
+                tool_calls: response.tool_calls.clone(),
+                tool_call_id: None,
+                reasoning_content: response.reasoning_content.clone(),
             });
             current_request
                 .messages
-                .extend(
-                    render_tool_results(&tool_results)
-                        .into_iter()
-                        .map(|content| ChatMessage {
-                            role: ChatRole::Tool,
-                            content,
-                        }),
-                );
+                .extend(tool_results.iter().map(|(tc, result)| ChatMessage {
+                    role: ChatRole::Tool,
+                    content: result.clone(),
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_calls: None,
+                    reasoning_content: None,
+                }));
 
             depth += 1;
         }
     }
-}
-
-fn render_tool_results(results: &[(sunny_mind::ToolCall, String)]) -> Vec<String> {
-    results
-        .iter()
-        .map(|(tool_call, result)| {
-            serde_json::to_string(&LlmToolCallResult {
-                tool_call_id: tool_call.id.clone(),
-                content: result.clone(),
-            })
-            .expect("ToolCallResult should serialize")
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -297,6 +283,9 @@ mod tests {
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "initial prompt".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
             }],
             max_tokens: Some(256),
             temperature: Some(0.2),
@@ -317,6 +306,7 @@ mod tests {
             provider_id: ProviderId("mock".to_string()),
             model_id: ModelId("mock-model".to_string()),
             tool_calls,
+            reasoning_content: None,
         }
     }
 
@@ -421,8 +411,17 @@ mod tests {
             .last()
             .expect("second request should contain appended tool result");
         assert_eq!(last_message.role, ChatRole::Tool);
-        assert!(last_message.content.contains("call-1"));
-        assert!(last_message.content.contains("file content"));
+        assert_eq!(last_message.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(last_message.content, "file content");
+        // The second-to-last message is the assistant message that carried the tool call.
+        let assistant_msg = &requests[1].messages[requests[1].messages.len() - 2];
+        assert_eq!(assistant_msg.role, ChatRole::Assistant);
+        let tcs = assistant_msg
+            .tool_calls
+            .as_ref()
+            .expect("assistant message must carry tool_calls");
+        assert_eq!(tcs[0].id, "call-1");
+        assert_eq!(tcs[0].name, "fs_read");
     }
 
     #[tokio::test]

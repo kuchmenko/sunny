@@ -19,7 +19,13 @@ fn arb_chat_message() -> impl Strategy<Value = ChatMessage> {
         arb_chat_role(),
         proptest::string::string_regex("(?s).{0,40}").expect("valid regex"),
     )
-        .prop_map(|(role, content)| ChatMessage { role, content })
+        .prop_map(|(role, content)| ChatMessage {
+            role,
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        })
 }
 
 fn arb_tool_definition() -> impl Strategy<Value = ToolDefinition> {
@@ -116,6 +122,7 @@ fn arb_llm_response() -> impl Strategy<Value = LlmResponse> {
                     provider_id: ProviderId(provider_id),
                     model_id: ModelId(model_id),
                     tool_calls,
+                    reasoning_content: None,
                 }
             },
         )
@@ -128,6 +135,9 @@ fn test_request_minimal_contract() {
         messages: vec![ChatMessage {
             role: ChatRole::User,
             content: "Hello".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
         }],
         max_tokens: None,
         temperature: None,
@@ -162,10 +172,16 @@ fn test_request_full_contract() {
             ChatMessage {
                 role: ChatRole::System,
                 content: "You are a helpful assistant".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: ChatRole::User,
                 content: "Hello".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
             },
         ],
         max_tokens: Some(256),
@@ -219,6 +235,7 @@ fn test_response_minimal_contract() {
         provider_id: ProviderId("kimi".to_string()),
         model_id: ModelId("moonshot-v1".to_string()),
         tool_calls: None,
+        reasoning_content: None,
     };
 
     let json = serde_json::to_string(&response).expect("should serialize");
@@ -261,6 +278,7 @@ fn test_response_with_tool_calls_contract() {
             arguments: "{\"path\":\"/tmp/test.txt\"}".to_string(),
             execution_depth: 0,
         }]),
+        reasoning_content: None,
     };
 
     let json = serde_json::to_string(&response).expect("should serialize");
@@ -290,6 +308,9 @@ fn test_chat_role_variants_contract() {
     let msg = ChatMessage {
         role: ChatRole::System,
         content: "System message".to_string(),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
     };
     let json = serde_json::to_string(&msg).expect("should serialize");
     assert!(
@@ -302,6 +323,9 @@ fn test_chat_role_variants_contract() {
     let msg = ChatMessage {
         role: ChatRole::User,
         content: "User message".to_string(),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
     };
     let json = serde_json::to_string(&msg).expect("should serialize");
     assert!(
@@ -314,6 +338,9 @@ fn test_chat_role_variants_contract() {
     let msg = ChatMessage {
         role: ChatRole::Assistant,
         content: "Assistant message".to_string(),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
     };
     let json = serde_json::to_string(&msg).expect("should serialize");
     assert!(
@@ -326,6 +353,9 @@ fn test_chat_role_variants_contract() {
     let msg = ChatMessage {
         role: ChatRole::Tool,
         content: "Tool result".to_string(),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
     };
     let json = serde_json::to_string(&msg).expect("should serialize");
     assert!(
@@ -417,6 +447,9 @@ fn test_contract_roundtrip() {
         messages: vec![ChatMessage {
             role: ChatRole::System,
             content: "Test".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
         }],
         max_tokens: Some(100),
         temperature: Some(0.5),
@@ -444,6 +477,7 @@ fn test_contract_roundtrip() {
             arguments: "{}".to_string(),
             execution_depth: 1,
         }]),
+        reasoning_content: None,
     };
     let json = serde_json::to_string(&response).expect("should serialize");
     let back: LlmResponse = serde_json::from_str(&json).expect("should deserialize");

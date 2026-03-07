@@ -38,10 +38,16 @@ impl ReviewAgent {
                 ChatMessage {
                     role: ChatRole::System,
                     content: "Produce concise review feedback with correctness, style, and concrete suggestions. Do not invent facts beyond the provided input.".to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
                 },
                 ChatMessage {
                     role: ChatRole::User,
                     content: format!("Review this content and provide structured feedback:\n\n{content}"),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
                 },
             ],
             max_tokens: Some(600),
@@ -148,6 +154,7 @@ mod tests {
                 provider_id: ProviderId("mock".to_string()),
                 model_id: ModelId("mock-review".to_string()),
                 tool_calls: None,
+                reasoning_content: None,
             })
         }
     }
