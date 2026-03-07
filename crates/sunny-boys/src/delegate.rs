@@ -11,9 +11,8 @@ use sunny_core::agent::{
     AgentResponse, Capability,
 };
 use sunny_core::orchestrator::AgentRegistry;
-use tokio_util::sync::CancellationToken;
 
-use crate::background::{BackgroundError, BackgroundTaskManager, TaskStatus};
+use crate::background::{BackgroundError, BackgroundTaskManager};
 
 const DEFAULT_MAX_DEPTH: usize = 3;
 const DELEGATE_TIMEOUT_SECS: u64 = 120;
@@ -23,6 +22,7 @@ pub struct DelegateAgent {
     registry: Arc<AgentRegistry>,
     background: Arc<BackgroundTaskManager>,
     max_depth: usize,
+    #[allow(dead_code)]
     metadata: AgentMetadata,
 }
 
@@ -94,14 +94,14 @@ impl DelegateAgent {
 
         background
             .spawn(task_id.clone(), async move {
-                let handle = registry.find(&target).ok_or_else(|| {
-                    AgentError::ExecutionFailed {
+                let handle = registry
+                    .find(&target)
+                    .ok_or_else(|| AgentError::ExecutionFailed {
                         source: Box::new(std::io::Error::other(format!(
                             "delegate target '{}' not found",
                             target
                         ))),
-                    }
-                })?;
+                    })?;
 
                 match handle.send(task).await {
                     Ok(AgentResponse::Success { content, .. }) => Ok(content),
@@ -194,7 +194,10 @@ impl Agent for DelegateAgent {
 
         if is_background {
             let task_id = format!("delegate-{}", uuid::Uuid::new_v4());
-            match self.delegate_async(task_id.clone(), target.clone(), task).await {
+            match self
+                .delegate_async(task_id.clone(), target.clone(), task)
+                .await
+            {
                 Ok(_) => {
                     let mut resp_metadata = HashMap::new();
                     resp_metadata.insert("task_id".into(), task_id.clone());
@@ -232,7 +235,6 @@ impl Agent for DelegateAgent {
 }
 
 #[cfg(test)]
-
 #[cfg(test)]
 mod tests {
     use super::*;
