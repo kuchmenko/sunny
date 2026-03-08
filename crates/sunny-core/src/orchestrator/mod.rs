@@ -6,7 +6,9 @@ pub mod executor;
 pub mod handle;
 pub mod intent;
 pub mod plan;
+pub mod planner;
 pub mod registry;
+
 pub mod routing;
 pub mod supervision;
 pub mod telemetry;
@@ -25,7 +27,9 @@ pub use executor::{PlanExecutor, PlanOutcome, PlanResult};
 pub use handle::OrchestratorHandle;
 pub use intent::{Intent, IntentKind, PlanPolicy};
 pub use plan::{ExecutionPlan, PlanStep, StepOutcome, StepState};
+pub use planner::ExecutionProfile;
 pub use registry::AgentRegistry;
+
 pub use routing::{CapabilityRouter, IntentRouter, NameRouting, RoutingStrategy, TieBreakPolicy};
 pub use supervision::RestartPolicy;
 pub use telemetry::{DispatchTelemetry, NoopTelemetry};
