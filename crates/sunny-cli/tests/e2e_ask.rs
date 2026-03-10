@@ -198,7 +198,7 @@ fn test_e2e_empty_input_error_recovery() {
     }
 }
 
-/// Test with query-type input: should route to codebase agent
+/// Test with query-type input: should route to workspace-read agent
 #[test]
 fn test_e2e_query_routing() {
     use std::fs;

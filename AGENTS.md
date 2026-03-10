@@ -19,6 +19,13 @@ Definitions used in this policy:
 - **Architecture change**: dependency-direction change, runtime semantic change, or protocol/message format change.
 - **DoD** (Definition of Done): required checks and artifacts for the change class.
 
+## Branch and Workspace Policy (Mandatory)
+
+- All plans and code changes must be executed on the **`master`** branch.
+- Do **not** use git worktrees. All edits happen in the main working tree.
+- Before starting work, verify `git branch --show-current` returns `master`.
+
+
 ## 1) Multi-Agent Workflow (Mandatory)
 
 Every non-trivial task follows this lifecycle:

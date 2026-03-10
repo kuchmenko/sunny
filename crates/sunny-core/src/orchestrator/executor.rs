@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -141,7 +139,7 @@ impl<'a> PlanExecutor<'a> {
                             AgentMessage::Task {
                                 id: step.step_id.clone(),
                                 content: step.action.clone(),
-                                metadata: HashMap::new(),
+                                metadata: step.metadata.clone(),
                             },
                             request_id,
                         );

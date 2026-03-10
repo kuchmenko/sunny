@@ -1,6 +1,7 @@
 use crate::agent::Capability;
 use crate::orchestrator::error::OrchestratorError;
 use crate::orchestrator::intent::{Intent, PlanPolicy};
+use std::collections::HashMap;
 
 /// StepState represents the lifecycle state of a plan step.
 ///
@@ -66,6 +67,8 @@ pub struct PlanStep {
     pub outcome: Option<StepOutcome>,
     /// Current attempt number (0-indexed)
     pub attempt: u32,
+    /// Step metadata forwarded to agent task message
+    pub metadata: HashMap<String, String>,
 }
 
 impl PlanStep {
@@ -76,6 +79,23 @@ impl PlanStep {
         required_capability: Option<Capability>,
         timeout_ms: u64,
     ) -> Self {
+        Self::new_with_metadata(
+            step_id,
+            action,
+            required_capability,
+            timeout_ms,
+            HashMap::new(),
+        )
+    }
+
+    /// Creates a new plan step in Planned state with metadata.
+    pub fn new_with_metadata(
+        step_id: String,
+        action: String,
+        required_capability: Option<Capability>,
+        timeout_ms: u64,
+        metadata: HashMap<String, String>,
+    ) -> Self {
         Self {
             step_id,
             action,
@@ -84,6 +104,7 @@ impl PlanStep {
             state: StepState::Planned,
             outcome: None,
             attempt: 0,
+            metadata,
         }
     }
 

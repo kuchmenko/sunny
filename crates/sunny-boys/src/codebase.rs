@@ -29,14 +29,14 @@ fn tool_uses_read_budget(name: &str) -> bool {
 
 /// Agent that inspects a workspace by routing query requests through a bounded
 /// LLM tool loop or a scanner/reader fallback when providers are unavailable.
-pub struct CodebaseAgent {
+pub struct WorkspaceReadAgent {
     provider: Option<Arc<dyn LlmProvider>>,
     scanner: Arc<FileScanner>,
     reader: Arc<FileReader>,
     cancel: CancellationToken,
 }
 
-/// Structured payload returned by [`CodebaseAgent`] for query responses.
+/// Structured payload returned by [`WorkspaceReadAgent`] for query responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodebaseResult {
     pub file_count: usize,
@@ -59,7 +59,7 @@ struct TaskInput {
     task_id: String,
 }
 
-impl CodebaseAgent {
+impl WorkspaceReadAgent {
     fn cancelled_error(operation: &str) -> AgentError {
         AgentError::ExecutionFailed {
             source: Box::new(std::io::Error::other(format!(
@@ -435,7 +435,7 @@ impl CodebaseAgent {
             task_id,
             path = %root_path.display(),
             max_concurrency = FALLBACK_READ_CONCURRENCY,
-            "CodebaseAgent using fallback scanner+reader"
+            "WorkspaceReadAgent using fallback scanner+reader"
         );
 
         let scanner = self.scanner.clone();
@@ -528,7 +528,7 @@ impl CodebaseAgent {
                             task_id,
                             path = %path.display(),
                             error = %err,
-                            "CodebaseAgent skipped file"
+                            "WorkspaceReadAgent skipped file"
                         );
                     }
                     Err(err) => {
@@ -537,7 +537,7 @@ impl CodebaseAgent {
                             request_id,
                             task_id,
                             error = %err,
-                            "CodebaseAgent fallback read task join failed"
+                            "WorkspaceReadAgent fallback read task join failed"
                         );
                     }
                 }
@@ -571,16 +571,16 @@ impl CodebaseAgent {
             request_id,
             task_id,
             file_count = result.file_count,
-            "CodebaseAgent completed (fallback)"
+            "WorkspaceReadAgent completed (fallback)"
         );
         Ok(AgentResponse::Success { content, metadata })
     }
 }
 
 #[async_trait::async_trait]
-impl Agent for CodebaseAgent {
+impl Agent for WorkspaceReadAgent {
     fn name(&self) -> &str {
-        "codebase"
+        "workspace-read"
     }
 
     fn capabilities(&self) -> Vec<Capability> {
@@ -605,7 +605,7 @@ impl Agent for CodebaseAgent {
             path = %root_path.display(),
             query_len = query.len(),
             llm_enabled = self.provider.is_some(),
-            "CodebaseAgent normalized task input"
+            "WorkspaceReadAgent normalized task input"
         );
 
         let Some(provider) = &self.provider else {
@@ -620,42 +620,42 @@ impl Agent for CodebaseAgent {
             task_id,
             path = %root_path.display(),
             tool_loop_budget_secs = TOOL_LOOP_BUDGET_SECS,
-            "CodebaseAgent using ToolCallLoop"
+            "WorkspaceReadAgent using ToolCallLoop"
         );
 
         let request = LlmRequest {
-            messages: vec![
-                ChatMessage {
-                    role: ChatRole::System,
-                    content: format!(
-                        "You are a codebase analysis assistant. Use the fs_scan, fs_read, and text_grep tools to explore the codebase at: {}. \
-                         Focus on key architecture files and avoid exhaustive reads. \
-                         Read at most {} files and stop when enough context is gathered. \
-                         Provide a concise summary of structure and key modules.",
-                        root_path.display(),
-                        TOOL_LOOP_MAX_READ_CALLS
-                    ),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                },
-                ChatMessage {
-                    role: ChatRole::User,
-                    content: format!(
-                        "User request: {}\nAnalyze the codebase at: {}",
-                        query,
-                        root_path.display()
-                    ),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                },
-            ],
-            max_tokens: Some(2048),
-            temperature: Some(1.0),
-            tools: Some(Self::build_tool_definitions()),
-            tool_choice: Some(ToolChoice::Auto),
-        };
+        messages: vec![
+            ChatMessage {
+                role: ChatRole::System,
+                content: format!(
+                    "You are a codebase analysis assistant. Use the fs_scan, fs_read, and text_grep tools to explore the codebase at: {}. \
+                     Focus on key architecture files and avoid exhaustive reads. \
+                     Read at most {} files and stop when enough context is gathered. \
+                     Provide a concise summary of structure and key modules.",
+                    root_path.display(),
+                    TOOL_LOOP_MAX_READ_CALLS
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: format!(
+                    "User request: {}\nAnalyze the codebase at: {}",
+                    query,
+                    root_path.display()
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ],
+        max_tokens: Some(2048),
+        temperature: Some(1.0),
+        tools: Some(Self::build_tool_definitions()),
+        tool_choice: Some(ToolChoice::Auto),
+    };
 
         let loop_runner = ToolCallLoop::new(
             provider.clone(),
@@ -677,19 +677,19 @@ impl Agent for CodebaseAgent {
                     let count = read_calls_for_tool.fetch_add(1, Ordering::Relaxed) + 1;
                     if count > TOOL_LOOP_MAX_READ_CALLS {
                         return Err(ToolError::ExecutionFailed {
-                            source: Box::new(std::io::Error::other(format!(
-                                "read-like tool call budget exceeded for {name}: {count} > {TOOL_LOOP_MAX_READ_CALLS}"
-                            ))),
-                        });
+                        source: Box::new(std::io::Error::other(format!(
+                            "read-like tool call budget exceeded for {name}: {count} > {TOOL_LOOP_MAX_READ_CALLS}"
+                        ))),
+                    });
                     }
                 }
 
                 tracing::info!(
-                    agent = "codebase",
+                    agent = "workspace-read",
                     request_id = %request_id_for_tool,
                     task_id = %task_id_for_tool,
                     tool_name = %name,
-                    "CodebaseAgent dispatching tool call"
+                    "WorkspaceReadAgent dispatching tool call"
                 );
                 let tool_call = ToolCall {
                     id: "exec".to_string(),
@@ -718,7 +718,7 @@ impl Agent for CodebaseAgent {
                     task_id,
                     path = %root_path.display(),
                     error = %err,
-                    "CodebaseAgent ToolCallLoop failed; falling back to scanner+reader"
+                    "WorkspaceReadAgent ToolCallLoop failed; falling back to scanner+reader"
                 );
                 return self
                     .run_fallback(&root_path, &request_id, &task_id, "tool_loop_error", ctx)
@@ -732,7 +732,7 @@ impl Agent for CodebaseAgent {
                     path = %root_path.display(),
                     operation = "tool_call_loop",
                     timeout_secs = TOOL_LOOP_BUDGET_SECS,
-                    "CodebaseAgent ToolCallLoop timed out; falling back to scanner+reader"
+                    "WorkspaceReadAgent ToolCallLoop timed out; falling back to scanner+reader"
                 );
                 return self
                     .run_fallback(&root_path, &request_id, &task_id, "tool_loop_timeout", ctx)
@@ -757,7 +757,7 @@ impl Agent for CodebaseAgent {
             task_id,
             iterations = result.metrics.iterations,
             total_tool_calls = result.metrics.total_tool_calls,
-            "CodebaseAgent completed (ToolCallLoop)"
+            "WorkspaceReadAgent completed (ToolCallLoop)"
         );
 
         Ok(AgentResponse::Success {
@@ -787,7 +787,9 @@ mod tests {
         LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage, ToolCall,
     };
 
-    use super::{tool_uses_read_budget, CodebaseAgent, CodebaseResult, TOOL_LOOP_MAX_READ_CALLS};
+    use super::{
+        tool_uses_read_budget, CodebaseResult, WorkspaceReadAgent, TOOL_LOOP_MAX_READ_CALLS,
+    };
 
     fn mk_ctx() -> AgentContext {
         AgentContext {
@@ -860,19 +862,19 @@ mod tests {
     }
 
     #[test]
-    fn test_codebase_agent_name_and_capabilities() {
-        let agent = CodebaseAgent::new(None);
-        assert_eq!(agent.name(), "codebase");
+    fn test_workspace_read_agent_name_and_capabilities() {
+        let agent = WorkspaceReadAgent::new(None);
+        assert_eq!(agent.name(), "workspace-read");
         assert_eq!(agent.capabilities(), vec![Capability("query".to_string())]);
     }
 
     #[tokio::test]
-    async fn test_codebase_agent_handles_task() {
+    async fn test_workspace_read_agent_handles_task() {
         let dir = mk_temp_dir("handles_task");
         fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
         fs::write(dir.join("lib.rs"), "pub fn hello() {}\n").expect("write file");
 
-        let agent = CodebaseAgent::new(None);
+        let agent = WorkspaceReadAgent::new(None);
         let response = agent
             .handle_message(mk_msg(dir.to_str().expect("path str")), &mk_ctx())
             .await
@@ -891,8 +893,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_codebase_agent_empty_content_error() {
-        let agent = CodebaseAgent::new(None);
+    async fn test_workspace_read_agent_empty_content_error() {
+        let agent = WorkspaceReadAgent::new(None);
         let msg = AgentMessage::Task {
             id: "task-empty".to_string(),
             content: "".to_string(),
@@ -904,12 +906,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_codebase_agent_with_provider() {
+    async fn test_workspace_read_agent_with_provider() {
         let dir = mk_temp_dir("with_provider");
         fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
 
         let provider = Arc::new(MockProvider);
-        let agent = CodebaseAgent::new(Some(provider));
+        let agent = WorkspaceReadAgent::new(Some(provider));
 
         let response = agent
             .handle_message(mk_msg(dir.to_str().expect("path str")), &mk_ctx())
@@ -930,11 +932,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_codebase_agent_fallback_without_provider() {
+    async fn test_workspace_read_agent_fallback_without_provider() {
         let dir = mk_temp_dir("fallback");
         fs::write(dir.join("test.txt"), "test content\n").expect("write file");
 
-        let agent = CodebaseAgent::new(None);
+        let agent = WorkspaceReadAgent::new(None);
 
         let response = agent
             .handle_message(mk_msg(dir.to_str().expect("path str")), &mk_ctx())
@@ -983,7 +985,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_codebase_agent_with_tool_loop() {
+    async fn test_workspace_read_agent_with_tool_loop() {
         let dir = mk_temp_dir("tool_loop");
         fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
         fs::write(dir.join("lib.rs"), "pub fn greet() {}\n").expect("write file");
@@ -1022,7 +1024,7 @@ mod tests {
             },
         ]));
 
-        let agent = CodebaseAgent::new(Some(provider));
+        let agent = WorkspaceReadAgent::new(Some(provider));
 
         let response = agent
             .handle_message(mk_msg(dir.to_str().expect("path str")), &mk_ctx())
@@ -1048,17 +1050,21 @@ mod tests {
 
     #[test]
     fn test_is_fallback_candidate_excludes_git_pointer_and_binary_like_files() {
-        assert!(!CodebaseAgent::is_fallback_candidate(Path::new(".git")));
-        assert!(!CodebaseAgent::is_fallback_candidate(Path::new(
+        assert!(!WorkspaceReadAgent::is_fallback_candidate(Path::new(
+            ".git"
+        )));
+        assert!(!WorkspaceReadAgent::is_fallback_candidate(Path::new(
             "assets/logo.png"
         )));
-        assert!(!CodebaseAgent::is_fallback_candidate(Path::new(
+        assert!(!WorkspaceReadAgent::is_fallback_candidate(Path::new(
             "Cargo.lock"
         )));
-        assert!(CodebaseAgent::is_fallback_candidate(Path::new(
+        assert!(WorkspaceReadAgent::is_fallback_candidate(Path::new(
             "src/lib.rs"
         )));
-        assert!(CodebaseAgent::is_fallback_candidate(Path::new("README.md")));
+        assert!(WorkspaceReadAgent::is_fallback_candidate(Path::new(
+            "README.md"
+        )));
     }
 
     #[test]
@@ -1076,7 +1082,7 @@ mod tests {
             execution_depth: 0,
         };
 
-        let err = CodebaseAgent::execute_tool_static(&dir, &scanner, &reader, &tool_call)
+        let err = WorkspaceReadAgent::execute_tool_static(&dir, &scanner, &reader, &tool_call)
             .expect_err(".git file should be blocked");
         assert!(matches!(err, ToolError::SensitiveFileDenied { .. }));
 
@@ -1099,7 +1105,7 @@ mod tests {
             execution_depth: 0,
         };
 
-        let err = CodebaseAgent::execute_tool_static(&dir, &scanner, &reader, &tool_call)
+        let err = WorkspaceReadAgent::execute_tool_static(&dir, &scanner, &reader, &tool_call)
             .expect_err("outside file should be blocked");
         assert!(matches!(err, ToolError::SensitiveFileDenied { .. }));
 
@@ -1110,7 +1116,7 @@ mod tests {
     #[test]
     fn test_safe_truncate_respects_utf8_boundary() {
         let mut text = "cześć-file".to_string();
-        let truncated = CodebaseAgent::safe_truncate(&mut text, 4);
+        let truncated = WorkspaceReadAgent::safe_truncate(&mut text, 4);
 
         assert!(truncated);
         assert_eq!(text, "cze");
@@ -1124,7 +1130,7 @@ mod tests {
         let git_config = git_dir.join("config");
         fs::write(&git_config, "[core]").expect("write git config");
 
-        let err = CodebaseAgent::resolve_tool_path(&dir, ".git/config")
+        let err = WorkspaceReadAgent::resolve_tool_path(&dir, ".git/config")
             .expect_err(".git paths should be rejected");
         assert!(matches!(err, ToolError::SensitiveFileDenied { .. }));
 
@@ -1153,7 +1159,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_codebase_agent_prompt_matches_read_budget() {
+    async fn test_workspace_read_agent_prompt_matches_read_budget() {
         let dir = mk_temp_dir("prompt_budget");
         fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
 
@@ -1174,7 +1180,7 @@ mod tests {
                 reasoning_content: None,
             },
         });
-        let agent = CodebaseAgent::new(Some(provider));
+        let agent = WorkspaceReadAgent::new(Some(provider));
 
         agent
             .handle_message(mk_msg(dir.to_str().expect("path str")), &mk_ctx())
@@ -1279,11 +1285,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_codebase_agent_counts_text_grep_against_read_budget() {
+    async fn test_workspace_read_agent_counts_text_grep_against_read_budget() {
         let dir = mk_temp_dir("grep_budget");
         fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
 
-        let agent = CodebaseAgent::new(Some(Arc::new(FailingReadBudgetProvider {
+        let agent = WorkspaceReadAgent::new(Some(Arc::new(FailingReadBudgetProvider {
             response_sent: AtomicBool::new(false),
         })));
 
@@ -1307,12 +1313,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_codebase_agent_stops_when_cancelled() {
+    async fn test_workspace_read_agent_stops_when_cancelled() {
         let dir = mk_temp_dir("cancelled_request");
         fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
 
         let cancel = CancellationToken::new();
-        let agent = CodebaseAgent::with_cancel(Some(Arc::new(SlowProvider)), cancel.clone());
+        let agent = WorkspaceReadAgent::with_cancel(Some(Arc::new(SlowProvider)), cancel.clone());
         let request_dir = dir.clone();
         let run = tokio::spawn(async move {
             agent

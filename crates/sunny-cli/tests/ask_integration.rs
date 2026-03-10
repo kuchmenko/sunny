@@ -108,8 +108,9 @@ fn test_ask_routes_to_codebase_for_query() {
         "should classify as query, got: {stdout}"
     );
     assert!(
-        stdout.contains("file_count"),
-        "should contain CodebaseAgent response marker, got: {stdout}"
+        stdout.contains("\"response_format\": \"query_summary_from_structured_payload\"")
+            || stdout.contains("Representative files:"),
+        "should contain query summary marker, got: {stdout}"
     );
 
     let _ = fs::remove_dir_all(&dir);

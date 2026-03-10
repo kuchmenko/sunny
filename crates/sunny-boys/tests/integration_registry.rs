@@ -36,8 +36,8 @@ async fn test_full_registry_construction() {
 
     // Verify all 6 agents are registered
     assert!(
-        registry.find("codebase").is_some(),
-        "codebase agent should exist"
+        registry.find("workspace-read").is_some(),
+        "workspace-read agent should exist"
     );
     assert!(
         registry.find("review").is_some(),

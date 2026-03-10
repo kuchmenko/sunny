@@ -11,7 +11,7 @@ use sunny_boys::build_boys_registry;
 use sunny_core::agent::{AgentMessage, AgentResponse, Capability};
 use sunny_core::orchestrator::{
     HeuristicLoopPlanner, IntentClassifier, IntentKind, InteractiveOrchestrator, OrchestratorError,
-    OrchestratorHandle, PlanPolicy, RequestId,
+    OrchestratorHandle, PlanPolicy, PlanningIntake, RequestId,
 };
 use sunny_mind::{KimiProvider, LlmProvider};
 
@@ -115,6 +115,37 @@ fn issue(level: &str, code: &str, message: impl Into<String>, hint: Option<&str>
         code: code.to_string(),
         message: message.into(),
         hint: hint.map(str::to_string),
+    }
+}
+
+fn insert_provider_metadata(
+    metadata: &mut HashMap<String, String>,
+    provider: Option<&Arc<dyn LlmProvider>>,
+    no_llm: bool,
+) {
+    metadata.insert(
+        "_sunny.provider.id".to_string(),
+        provider
+            .map(|provider| provider.provider_id().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    );
+    metadata.insert(
+        "_sunny.provider.model".to_string(),
+        provider
+            .map(|provider| provider.model_id().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    );
+    metadata.insert(
+        "_sunny.provider.mode".to_string(),
+        if no_llm {
+            "no_llm".to_string()
+        } else {
+            "llm_enabled".to_string()
+        },
+    );
+
+    if provider.is_none() && !no_llm {
+        metadata.insert("_sunny.degradation.active".to_string(), "true".to_string());
     }
 }
 
@@ -384,7 +415,7 @@ async fn execute_ask_internal(
 
     let llm_enabled = provider.is_some();
     let cancel = CancellationToken::new();
-    let registry = match build_boys_registry(provider, &cancel) {
+    let registry = match build_boys_registry(provider.clone(), &cancel) {
         Ok(registry) => registry,
         Err(err) => {
             let mut metadata = HashMap::new();
@@ -487,7 +518,7 @@ async fn execute_ask_internal(
         },
         llm_enabled,
     );
-    let interactive = InteractiveOrchestrator::new(&orchestrator, planner);
+    let interactive = InteractiveOrchestrator::new(&orchestrator, planner, PlanningIntake::new());
 
     let dispatch_result = interactive
         .execute(intent, task_msg, cancel.child_token(), request_id)
@@ -532,11 +563,23 @@ async fn execute_ask_internal(
             content,
             mut metadata,
         } => {
+            let intake_verdict_label = metadata
+                .get("_sunny.intake.verdict")
+                .map(String::as_str)
+                .unwrap_or("unknown");
+            tracing::info!(
+                event = "ask.intake.verdict",
+                verdict = %intake_verdict_label,
+                request_id = %request_id_text
+            );
+
             let summary = if required_capability.0 == "query" {
                 summarize_query_response(&content)
             } else {
                 None
             };
+
+            insert_provider_metadata(&mut metadata, provider.as_ref(), args.no_llm);
 
             if summary.is_some() {
                 metadata.insert(
@@ -661,9 +704,42 @@ mod tests {
 
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::commands::analyze::{execute_analyze, AnalyzeArgs};
+    use sunny_mind::{
+        LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage,
+    };
+
+    struct MockProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MockProvider {
+        fn provider_id(&self) -> &str {
+            "mock"
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-model"
+        }
+
+        async fn chat(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            Ok(LlmResponse {
+                content: "LLM review feedback".to_string(),
+                usage: TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 7,
+                    total_tokens: 12,
+                },
+                finish_reason: "stop".to_string(),
+                provider_id: ProviderId("mock".to_string()),
+                model_id: ModelId("mock-model".to_string()),
+                tool_calls: None,
+                reasoning_content: None,
+            })
+        }
+    }
 
     fn extract_json_plan_id(output: &str) -> Option<String> {
         let parsed: serde_json::Value = serde_json::from_str(output).ok()?;
@@ -775,6 +851,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ask_metadata_includes_provider_info() {
+        let args = AskArgs {
+            input: "review this code snippet".to_string(),
+            format: "json".to_string(),
+            dry_run: false,
+            no_llm: false,
+        };
+
+        let output = execute_ask(args, Some(Arc::new(MockProvider)))
+            .await
+            .expect("ask should succeed with provider metadata");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+
+        assert_eq!(parsed["metadata"]["_sunny.provider.id"], "mock");
+        assert_eq!(parsed["metadata"]["_sunny.provider.model"], "mock-model");
+        assert_eq!(parsed["metadata"]["_sunny.provider.mode"], "llm_enabled");
+        assert!(
+            parsed["metadata"]["_sunny.degradation.active"].is_null(),
+            "degradation marker should be absent when provider is available"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ask_output_includes_intake_verdict() {
+        let args = AskArgs {
+            input: "analyze this request".to_string(),
+            format: "json".to_string(),
+            dry_run: false,
+            no_llm: true,
+        };
+
+        let output = execute_ask(args, None)
+            .await
+            .expect("ask should succeed with intake metadata");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+
+        assert_eq!(parsed["metadata"]["_sunny.intake.verdict"], "proceed");
+        assert_eq!(parsed["metadata"]["_sunny.provider.mode"], "no_llm");
+    }
+
+    #[tokio::test]
+    async fn test_ask_metadata_degradation_marker() {
+        let args = AskArgs {
+            input: "review this code snippet".to_string(),
+            format: "json".to_string(),
+            dry_run: false,
+            no_llm: false,
+        };
+
+        let output = execute_ask(args, None)
+            .await
+            .expect("ask should succeed without configured provider");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+
+        assert_eq!(parsed["metadata"]["_sunny.provider.id"], "none");
+        assert_eq!(parsed["metadata"]["_sunny.provider.model"], "none");
+        assert_eq!(parsed["metadata"]["_sunny.provider.mode"], "llm_enabled");
+        assert_eq!(parsed["metadata"]["_sunny.degradation.active"], "true");
+    }
+
+    #[tokio::test]
     async fn test_sunny_analyze_path_still_works() {
         let temp_dir = mk_temp_dir("ask_regression_analyze");
         fs::write(temp_dir.join("main.rs"), "fn main() {}\n").expect("write sample file");
@@ -817,6 +957,34 @@ mod tests {
         assert!(
             output.contains("\"intent_kind\""),
             "intent_kind should be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ask_dry_run_no_intake_metadata() {
+        let args = AskArgs {
+            input: "test".to_string(),
+            format: "json".to_string(),
+            dry_run: true,
+            no_llm: true,
+        };
+
+        let output = execute_ask(args, None)
+            .await
+            .expect("dry-run should succeed without intake metadata");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+
+        let metadata = parsed["metadata"]
+            .as_object()
+            .expect("metadata should be an object");
+        assert!(
+            !metadata.contains_key("_sunny.intake.verdict"),
+            "dry-run should not include intake verdict metadata"
+        );
+        assert!(
+            !metadata.contains_key("_sunny.intake.skip_reason"),
+            "dry-run should not include intake skip metadata"
         );
     }
 

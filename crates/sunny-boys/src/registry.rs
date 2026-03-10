@@ -6,7 +6,7 @@ use sunny_mind::LlmProvider;
 use tokio_util::sync::CancellationToken;
 
 use crate::background::BackgroundTaskManager;
-use crate::codebase::CodebaseAgent;
+use crate::codebase::WorkspaceReadAgent;
 use crate::critique::CritiqueAgent;
 use crate::delegate::DelegateAgent;
 use crate::explore::ExploreAgent;
@@ -39,17 +39,17 @@ fn register_core_agents(
     provider: Option<Arc<dyn LlmProvider>>,
     token: &CancellationToken,
 ) -> Result<(), RegistryError> {
-    let codebase_token = token.child_token();
-    let codebase = AgentHandle::spawn(
-        Arc::new(CodebaseAgent::with_cancel(
+    let workspace_read_token = token.child_token();
+    let workspace_read = AgentHandle::spawn(
+        Arc::new(WorkspaceReadAgent::with_cancel(
             provider.clone(),
-            codebase_token.clone(),
+            workspace_read_token.clone(),
         )),
-        codebase_token,
+        workspace_read_token,
     );
     registry.register(
-        "codebase".into(),
-        codebase,
+        "workspace-read".into(),
+        workspace_read,
         vec![Capability("query".into())],
     )?;
 
@@ -109,7 +109,7 @@ mod tests {
         let token = CancellationToken::new();
         let registry = build_boys_registry(None, &token).expect("should build registry");
 
-        assert!(registry.find("codebase").is_some());
+        assert!(registry.find("workspace-read").is_some());
         assert!(registry.find("review").is_some());
         assert!(registry.find("critique").is_some());
         assert!(registry.find("explore").is_some());
@@ -125,7 +125,7 @@ mod tests {
         let registry = build_boys_registry(None, &token).expect("should build registry");
 
         let query_agents = registry.find_by_capability(&Capability("query".into()));
-        assert!(query_agents.contains(&"codebase"));
+        assert!(query_agents.contains(&"workspace-read"));
 
         let analyze_agents = registry.find_by_capability(&Capability("analyze".into()));
         assert!(analyze_agents.contains(&"review"));

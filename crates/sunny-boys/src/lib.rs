@@ -30,7 +30,7 @@ pub mod tool_loop;
 
 pub use analyze::{AnalysisMode, AnalysisResult, AnalyzeAgent};
 pub use background::{BackgroundError, BackgroundTaskManager, TaskId, TaskResult, TaskStatus};
-pub use codebase::CodebaseAgent;
+pub use codebase::WorkspaceReadAgent;
 pub use critique::CritiqueAgent;
 pub use delegate::DelegateAgent;
 pub use explore::ExploreAgent;
