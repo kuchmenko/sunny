@@ -1,10 +1,13 @@
 pub mod echo;
 pub mod error;
 pub mod handle;
+pub mod metadata;
 
 pub use echo::EchoAgent;
 pub use error::AgentError;
+pub(crate) use handle::is_transport_failure;
 pub use handle::AgentHandle;
+pub use metadata::{AgentCost, AgentMetadata, AgentMode};
 
 use std::collections::HashMap;
 

@@ -13,7 +13,11 @@ serde = { version = "1", features = ["derive"] } # dep: serialization for Analys
 serde_json = "1" # dep: JSON serialization for agent responses
 tokio = { version = "1", features = ["full"] } # dep: async runtime for agent execution
 tokio-util = { version = "0.7", features = ["full"] } # dep: CancellationToken for graceful shutdown
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] } # dep: HTTP client for Tavily web search API
+uuid = { version = "1", features = ["v4"] } # dep: UUID generation for delegate task IDs
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] } # dep: async test runtime
 tracing-subscriber = "0.3" # dep: logging subscriber for test output
+wiremock = "0.6" # dep: HTTP mocking for Tavily search tests
+tempfile = "3" # dep: temporary directories for git tool tests

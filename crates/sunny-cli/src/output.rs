@@ -41,6 +41,14 @@ pub struct AnalysisOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptIssue {
+    pub level: String,
+    pub code: String,
+    pub message: String,
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptOutput {
     pub request_id: String,
     pub plan_id: String,
@@ -53,6 +61,10 @@ pub struct PromptOutput {
     pub steps_skipped: usize,
     pub outcome: String,
     pub response: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<PromptIssue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<PromptIssue>,
     pub metadata: HashMap<String, String>,
 }
 
@@ -131,7 +143,37 @@ pub fn format_prompt_text(output: &PromptOutput) -> String {
     }
 
     if let Some(response) = &output.response {
-        result.push_str(&format!("Response: {}\n", response));
+        let (preview, truncated) = response_preview(response, 4000);
+        result.push_str(&format!("Response: {}\n", preview));
+        if truncated {
+            result.push_str(
+                "Response truncated. Use --format json for full payload or check debug logs.\n",
+            );
+        }
+    }
+
+    if !output.warnings.is_empty() {
+        result.push_str("Warnings:\n");
+        for warning in &output.warnings {
+            result.push_str(&format!(
+                "  [{}] {}: {}\n",
+                warning.code, warning.level, warning.message
+            ));
+            if let Some(hint) = &warning.hint {
+                result.push_str(&format!("    Hint: {}\n", hint));
+            }
+        }
+    }
+
+    if let Some(error) = &output.error {
+        result.push_str("Error:\n");
+        result.push_str(&format!(
+            "  [{}] {}: {}\n",
+            error.code, error.level, error.message
+        ));
+        if let Some(hint) = &error.hint {
+            result.push_str(&format!("  Hint: {}\n", hint));
+        }
     }
 
     result
@@ -162,10 +204,41 @@ pub fn format_prompt_pretty(output: &PromptOutput) -> String {
     }
 
     if let Some(response) = &output.response {
-        result.push_str(&format!("\n💬 Response:\n{}\n", response));
+        let (preview, truncated) = response_preview(response, 4000);
+        result.push_str(&format!("\n💬 Response:\n{}\n", preview));
+        if truncated {
+            result.push_str("ℹ️ Response truncated. Use --format json for full payload.\n");
+        }
+    }
+
+    if !output.warnings.is_empty() {
+        result.push_str("\n⚠️ Warnings:\n");
+        for warning in &output.warnings {
+            result.push_str(&format!("   • [{}] {}\n", warning.code, warning.message));
+            if let Some(hint) = &warning.hint {
+                result.push_str(&format!("     ↳ Hint: {}\n", hint));
+            }
+        }
+    }
+
+    if let Some(error) = &output.error {
+        result.push_str(&format!("\n❌ Error [{}]: {}\n", error.code, error.message));
+        if let Some(hint) = &error.hint {
+            result.push_str(&format!("💡 Hint: {}\n", hint));
+        }
     }
 
     result
+}
+
+fn response_preview(response: &str, max_chars: usize) -> (String, bool) {
+    let count = response.chars().count();
+    if count <= max_chars {
+        return (response.to_string(), false);
+    }
+
+    let preview = response.chars().take(max_chars).collect::<String>();
+    (preview, true)
 }
 
 #[cfg(test)]
@@ -196,6 +269,8 @@ mod tests {
             steps_skipped: 0,
             outcome: "success".to_string(),
             response: Some("ok".to_string()),
+            warnings: Vec::new(),
+            error: None,
             metadata: HashMap::new(),
         }
     }
@@ -257,5 +332,14 @@ mod tests {
         let formatted = format_prompt_pretty(&output);
         assert!(formatted.contains("Prompt Execution"));
         assert!(formatted.contains("plan-1"));
+    }
+
+    #[test]
+    fn test_format_prompt_text_truncates_large_response() {
+        let mut output = sample_prompt_output();
+        output.response = Some("x".repeat(5000));
+
+        let formatted = format_prompt_text(&output);
+        assert!(formatted.contains("Response truncated."));
     }
 }

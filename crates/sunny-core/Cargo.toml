@@ -10,6 +10,7 @@ async-trait = "0.1" # dep: async methods in traits per AGENTS.md
 thiserror = "1" # dep: typed error enums per AGENTS.md
 tracing = "0.1" # dep: structured logging, no println per AGENTS.md
 walkdir = "2" # dep: recursive directory traversal for filesystem tools
+ignore = "0.4" # dep: .gitignore-aware filesystem scanning
 uuid = { version = "1", features = ["v4"] } # dep: UUID generation for event/span correlation IDs
 
 [dev-dependencies]

@@ -4,9 +4,14 @@ pub mod error;
 pub mod events;
 pub mod executor;
 pub mod handle;
+pub mod intake;
 pub mod intent;
+pub mod interactive;
 pub mod plan;
+pub mod planner;
+pub mod prompt_spec;
 pub mod registry;
+
 pub mod routing;
 pub mod supervision;
 pub mod telemetry;
@@ -23,9 +28,21 @@ pub use events::{
 };
 pub use executor::{PlanExecutor, PlanOutcome, PlanResult};
 pub use handle::OrchestratorHandle;
+pub use intake::{
+    ComplexityHint, IntakeAdvisor, IntakeAdvisorError, PlanHints, PlanningIntake,
+    PlanningIntakeInput, PlanningIntakeVerdict, RawIntakeAdvice, WorkspaceContext,
+};
 pub use intent::{Intent, IntentKind, PlanPolicy};
+pub use interactive::InteractiveOrchestrator;
 pub use plan::{ExecutionPlan, PlanStep, StepOutcome, StepState};
+pub use planner::ExecutionProfile;
+pub use planner::HeuristicLoopPlanner;
+pub use prompt_spec::{
+    OutputFormat, PromptSpec, ToolBoundary, SPEC_EXPLORE, SPEC_LIBRARIAN, SPEC_ORCHESTRATOR,
+    SPEC_PLANNER, SPEC_PLANNING_INTAKE, SPEC_VERIFICATION_CRITIQUE,
+};
 pub use registry::AgentRegistry;
+
 pub use routing::{CapabilityRouter, IntentRouter, NameRouting, RoutingStrategy, TieBreakPolicy};
 pub use supervision::RestartPolicy;
 pub use telemetry::{DispatchTelemetry, NoopTelemetry};

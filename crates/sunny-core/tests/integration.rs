@@ -234,7 +234,7 @@ async fn test_dispatch_to_slow_agent_times_out() {
     let stopped = Arc::new(AtomicBool::new(false));
 
     let agent = Arc::new(SlowAgent {
-        delay: Duration::from_secs(31),
+        delay: Duration::from_secs(300),
         stopped: Arc::clone(&stopped),
     });
 

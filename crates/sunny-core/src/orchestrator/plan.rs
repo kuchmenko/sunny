@@ -1,6 +1,7 @@
 use crate::agent::Capability;
 use crate::orchestrator::error::OrchestratorError;
 use crate::orchestrator::intent::{Intent, PlanPolicy};
+use std::collections::HashMap;
 
 /// StepState represents the lifecycle state of a plan step.
 ///
@@ -66,6 +67,9 @@ pub struct PlanStep {
     pub outcome: Option<StepOutcome>,
     /// Current attempt number (0-indexed)
     pub attempt: u32,
+    /// Step metadata forwarded to agent task message
+    pub metadata: HashMap<String, String>,
+    pub depends_on: Vec<String>,
 }
 
 impl PlanStep {
@@ -76,6 +80,25 @@ impl PlanStep {
         required_capability: Option<Capability>,
         timeout_ms: u64,
     ) -> Self {
+        Self::new_with_metadata(
+            step_id,
+            action,
+            required_capability,
+            timeout_ms,
+            HashMap::new(),
+            Vec::new(),
+        )
+    }
+
+    /// Creates a new plan step in Planned state with metadata.
+    pub fn new_with_metadata(
+        step_id: String,
+        action: String,
+        required_capability: Option<Capability>,
+        timeout_ms: u64,
+        metadata: HashMap<String, String>,
+        depends_on: Vec<String>,
+    ) -> Self {
         Self {
             step_id,
             action,
@@ -84,7 +107,15 @@ impl PlanStep {
             state: StepState::Planned,
             outcome: None,
             attempt: 0,
+            metadata,
+            depends_on,
         }
+    }
+
+    pub fn is_ready_with(&self, completed_steps: &[String]) -> bool {
+        self.depends_on
+            .iter()
+            .all(|dependency| completed_steps.iter().any(|done| done == dependency))
     }
 
     /// Transitions this step to a new state with validation.
@@ -206,6 +237,27 @@ impl ExecutionPlan {
     /// Returns a mutable reference to a step by step_id, if it exists.
     pub fn get_step_mut(&mut self, step_id: &str) -> Option<&mut PlanStep> {
         self.steps.iter_mut().find(|s| s.step_id == step_id)
+    }
+
+    pub fn validate_dependencies(&self) -> Result<(), OrchestratorError> {
+        for step in &self.steps {
+            for dependency in &step.depends_on {
+                if self.get_step(dependency).is_none() {
+                    return Err(OrchestratorError::PlanPolicyViolation {
+                        reason: format!(
+                            "step '{}' depends on missing step '{}'",
+                            step.step_id, dependency
+                        ),
+                    });
+                }
+                if dependency == &step.step_id {
+                    return Err(OrchestratorError::PlanPolicyViolation {
+                        reason: format!("step '{}' cannot depend on itself", step.step_id),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 

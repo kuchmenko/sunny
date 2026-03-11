@@ -84,6 +84,7 @@ impl FileReader {
             let error_kind = match &err {
                 ToolError::PathNotFound { .. } => "PathNotFound",
                 ToolError::PermissionDenied { .. } => "PermissionDenied",
+                ToolError::DirectoryReadUnsupported { .. } => "DirectoryReadUnsupported",
                 ToolError::ExecutionFailed { .. } => "ExecutionFailed",
                 _ => "Unknown",
             };
@@ -92,6 +93,14 @@ impl FileReader {
         })?;
 
         let size = metadata.len();
+        if metadata.is_dir() {
+            let err = ToolError::DirectoryReadUnsupported {
+                path: path_str.clone(),
+            };
+            info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "fs_read", outcome = OUTCOME_ERROR, error_kind = "DirectoryReadUnsupported", error_message = %err);
+            return Err(err);
+        }
+
         if size > self.max_bytes {
             let err = ToolError::FileTooLarge {
                 path: path_str,
@@ -285,6 +294,17 @@ mod tests {
         let result = reader.read(f.path()).expect("should read empty file");
         assert_eq!(result.content, "");
         assert_eq!(result.size_bytes, 0);
+    }
+
+    #[test]
+    fn test_fs_read_directory_returns_typed_error() {
+        let dir = tempfile::tempdir().expect("test: create temp dir");
+        let reader = FileReader::default();
+        let err = reader.read(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ToolError::DirectoryReadUnsupported { .. }),
+            "expected DirectoryReadUnsupported, got {err:?}"
+        );
     }
 
     #[traced_test]

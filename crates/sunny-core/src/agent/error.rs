@@ -5,7 +5,7 @@ pub enum AgentError {
     #[error("agent not found: {id}")]
     NotFound { id: String },
 
-    #[error("execution failed")]
+    #[error("execution failed: {source}")]
     ExecutionFailed {
         source: Box<dyn Error + Send + Sync>,
     },

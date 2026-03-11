@@ -20,7 +20,10 @@ pub enum ToolError {
     #[error("binary file skipped: {path}")]
     BinaryFileSkipped { path: String },
 
-    #[error("tool execution failed")]
+    #[error("directory read unsupported: {path}")]
+    DirectoryReadUnsupported { path: String },
+
+    #[error("tool execution failed: {source}")]
     ExecutionFailed {
         source: Box<dyn Error + Send + Sync>,
     },

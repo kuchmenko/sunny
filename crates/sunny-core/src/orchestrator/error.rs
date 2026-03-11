@@ -15,7 +15,7 @@ pub enum OrchestratorError {
     #[error("agent not found: {name}")]
     AgentNotFound { name: String },
 
-    #[error("dispatch failed")]
+    #[error("dispatch failed: {source}")]
     DispatchFailed { source: AgentError },
 
     #[error("agent unresponsive")]
