@@ -7,7 +7,7 @@ use crate::{LlmError, LlmProvider};
 use crate::{LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage};
 
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
-const DEFAULT_OLLAMA_MODEL: &str = "qwen3.5";
+const DEFAULT_OLLAMA_MODEL: &str = "qwen3.5:9b";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug)]
@@ -228,7 +228,7 @@ mod tests {
         let provider = OllamaProvider::from_env().expect("provider should load from env");
 
         assert_eq!(provider.base_url, "http://localhost:11434");
-        assert_eq!(provider.model_id(), "qwen3.5");
+        assert_eq!(provider.model_id(), "qwen3.5:9b");
         assert_eq!(provider.timeout, Duration::from_millis(30_000));
 
         clear_ollama_env();
