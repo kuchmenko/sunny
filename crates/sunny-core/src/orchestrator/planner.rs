@@ -141,10 +141,31 @@ impl HeuristicLoopPlanner {
             }
         }
 
-        let required_capability = intent
-            .required_capability
-            .clone()
+        // Prefer intake suggested_capability when available, otherwise fall back to classifier intent
+        let required_capability = hints
+            .as_ref()
+            .and_then(|h| h.suggested_capability.clone())
+            .or_else(|| intent.required_capability.clone())
             .unwrap_or_else(|| Capability("query".to_string()));
+
+        // Log capability override when intake suggestion differs from classifier
+        if let Some(ref plan_hints) = hints {
+            if let Some(ref suggested) = plan_hints.suggested_capability {
+                let intent_cap = intent
+                    .required_capability
+                    .as_ref()
+                    .map(|c| c.0.as_str())
+                    .unwrap_or("query");
+                if suggested.0 != intent_cap {
+                    tracing::info!(
+                        event = "planner.capability.override",
+                        from = %intent_cap,
+                        to = %suggested.0,
+                        "intake advisory overriding classifier capability"
+                    );
+                }
+            }
+        }
 
         let mut plan = ExecutionPlan::new(
             PlanId::new().to_string(),

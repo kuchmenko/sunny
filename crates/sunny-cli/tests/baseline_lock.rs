@@ -30,17 +30,14 @@ fn test_ask_subcommand_exists() {
         .args(["ask", "--help"])
         .output()
         .expect("failed to run sunny-cli ask --help");
-    
+
     assert!(
         output.status.success(),
         "sunny-cli ask --help should exit successfully"
     );
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("ask"),
-        "ask --help should mention 'ask'"
-    );
+    assert!(stdout.contains("ask"), "ask --help should mention 'ask'");
 }
 
 /// Test that sunny analyze subcommand exists and parses

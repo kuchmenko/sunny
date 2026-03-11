@@ -35,12 +35,15 @@ impl<'a> InteractiveOrchestrator<'a> {
         cancel: CancellationToken,
         request_id: RequestId,
     ) -> Result<AgentResponse, OrchestratorError> {
-        let intake_verdict = self.intake.evaluate(PlanningIntakeInput {
-            intent: intent.clone(),
-            task: task.clone(),
-            request_id,
-            llm_enabled: self.planner.llm_enabled(),
-        });
+        let intake_verdict = self
+            .intake
+            .evaluate(PlanningIntakeInput {
+                intent: intent.clone(),
+                task: task.clone(),
+                request_id,
+                llm_enabled: self.planner.llm_enabled(),
+            })
+            .await;
         let (hints, intake_verdict_label, intake_skip_reason) = match intake_verdict {
             PlanningIntakeVerdict::Proceed(hints) => (Some(hints), "proceed", None),
             PlanningIntakeVerdict::Skip { reason } => {

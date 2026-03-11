@@ -29,7 +29,8 @@ pub use events::{
 pub use executor::{PlanExecutor, PlanOutcome, PlanResult};
 pub use handle::OrchestratorHandle;
 pub use intake::{
-    ComplexityHint, PlanHints, PlanningIntake, PlanningIntakeInput, PlanningIntakeVerdict,
+    ComplexityHint, IntakeAdvisor, IntakeAdvisorError, PlanHints, PlanningIntake,
+    PlanningIntakeInput, PlanningIntakeVerdict, RawIntakeAdvice,
 };
 pub use intent::{Intent, IntentKind, PlanPolicy};
 pub use interactive::InteractiveOrchestrator;

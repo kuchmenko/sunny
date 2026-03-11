@@ -518,7 +518,8 @@ async fn execute_ask_internal(
         },
         llm_enabled,
     );
-    let interactive = InteractiveOrchestrator::new(&orchestrator, planner, PlanningIntake::new());
+    let interactive =
+        InteractiveOrchestrator::new(&orchestrator, planner, PlanningIntake::new(None));
 
     let dispatch_result = interactive
         .execute(intent, task_msg, cancel.child_token(), request_id)
