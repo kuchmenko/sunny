@@ -65,8 +65,8 @@ impl IntakeAdvisor for LlmIntakeAdvisor {
                     reasoning_content: None,
                 },
             ],
-            max_tokens: None,
-            temperature: None,
+            max_tokens: Some(256),
+            temperature: Some(0.1),
             tools: None,
             tool_choice: None,
         };

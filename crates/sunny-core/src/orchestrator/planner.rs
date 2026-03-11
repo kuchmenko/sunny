@@ -391,3 +391,123 @@ mod tests {
         assert!(!step.metadata.contains_key("_sunny.should_not_be_added"));
     }
 }
+
+#[test]
+fn test_build_plan_uses_suggested_capability_over_intent() {
+    use crate::agent::{AgentMessage, Capability};
+    use crate::orchestrator::intake::PlanHints;
+    use crate::orchestrator::intent::{Intent, IntentKind};
+    use crate::orchestrator::RequestId;
+    use std::collections::HashMap;
+
+    let planner = HeuristicLoopPlanner::new(PlanPolicy::default(), false);
+    let intent = Intent {
+        kind: IntentKind::Query,
+        raw_input: "test".to_string(),
+        required_capability: Some(Capability("query".to_string())),
+    };
+    let task = AgentMessage::Task {
+        id: "task-1".to_string(),
+        content: "test content".to_string(),
+        metadata: HashMap::new(),
+    };
+    let request_id = RequestId::new();
+
+    let hints = PlanHints {
+        suggested_capability: Some(Capability("advise".to_string())),
+        complexity_hint: None,
+        context_tags: vec![],
+        metadata_overrides: HashMap::new(),
+    };
+
+    let plan = planner
+        .build_plan(intent, task, request_id, Some(hints))
+        .unwrap();
+
+    let step = &plan.steps[0];
+    // Should use intake suggestion, not intent capability
+    assert_eq!(
+        step.required_capability,
+        Some(Capability("advise".to_string()))
+    );
+}
+
+#[test]
+fn test_build_plan_falls_back_to_intent_when_no_suggestion() {
+    use crate::agent::{AgentMessage, Capability};
+    use crate::orchestrator::intake::PlanHints;
+    use crate::orchestrator::intent::{Intent, IntentKind};
+    use crate::orchestrator::RequestId;
+    use std::collections::HashMap;
+
+    let planner = HeuristicLoopPlanner::new(PlanPolicy::default(), false);
+    let intent = Intent {
+        kind: IntentKind::Query,
+        raw_input: "test".to_string(),
+        required_capability: Some(Capability("analyze".to_string())),
+    };
+    let task = AgentMessage::Task {
+        id: "task-1".to_string(),
+        content: "test content".to_string(),
+        metadata: HashMap::new(),
+    };
+    let request_id = RequestId::new();
+
+    let hints = PlanHints {
+        suggested_capability: None,
+        complexity_hint: None,
+        context_tags: vec![],
+        metadata_overrides: HashMap::new(),
+    };
+
+    let plan = planner
+        .build_plan(intent, task, request_id, Some(hints))
+        .unwrap();
+
+    let step = &plan.steps[0];
+    // Should fall back to intent's capability
+    assert_eq!(
+        step.required_capability,
+        Some(Capability("analyze".to_string()))
+    );
+}
+
+#[test]
+fn test_build_plan_defaults_to_query_when_no_capability() {
+    use crate::agent::{AgentMessage, Capability};
+    use crate::orchestrator::intake::PlanHints;
+    use crate::orchestrator::intent::{Intent, IntentKind};
+    use crate::orchestrator::RequestId;
+    use std::collections::HashMap;
+
+    let planner = HeuristicLoopPlanner::new(PlanPolicy::default(), false);
+    let intent = Intent {
+        kind: IntentKind::Query,
+        raw_input: "test".to_string(),
+        required_capability: None,
+    };
+    let task = AgentMessage::Task {
+        id: "task-1".to_string(),
+        content: "test content".to_string(),
+        metadata: HashMap::new(),
+    };
+    let request_id = RequestId::new();
+
+    let hints = PlanHints {
+        suggested_capability: None,
+        complexity_hint: None,
+        context_tags: vec![],
+        metadata_overrides: HashMap::new(),
+    };
+
+    let plan = planner
+        .build_plan(intent, task, request_id, Some(hints))
+        .unwrap();
+
+    let step = &plan.steps[0];
+    // Should default to "query" when neither intent nor hints have capability
+    assert_eq!(
+        step.required_capability,
+        Some(Capability("query".to_string()))
+    );
+}
