@@ -8,7 +8,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{info_span, Instrument};
 
-const TOOL_TIMEOUT_SECS: u64 = 30;
+use crate::timeouts::{tool_call_timeout, tool_provider_timeout};
 /// Event name emitted when the tool-call loop exits because cancellation was requested.
 pub const EVENT_TOOL_CANCELLED: &str = "tool.exec.cancelled";
 
@@ -22,6 +22,7 @@ pub struct ToolCallLoop<P: LlmProvider + ?Sized> {
     max_iterations: usize,
     cancel: CancellationToken,
     tool_timeout: Duration,
+    provider_timeout: Duration,
 }
 
 /// Errors that can terminate a [`ToolCallLoop`] run.
@@ -39,11 +40,23 @@ pub enum ToolCallError {
     #[error("tool execution failed: {source}")]
     ToolExecution { source: ToolError },
 
+    #[error(
+        "recoverable tool error repeated {count} times for {tool_name} ({error_kind}); aborting loop"
+    )]
+    RecoverableErrorStreak {
+        tool_name: String,
+        error_kind: String,
+        count: usize,
+    },
+
     #[error("tool execution timed out after {timeout_secs}s: {tool_name}")]
     ToolTimeout {
         tool_name: String,
         timeout_secs: u64,
     },
+
+    #[error("provider response timed out after {timeout_secs}s")]
+    ProviderTimeout { timeout_secs: u64 },
 
     #[error("tool call loop cancelled")]
     Cancelled,
@@ -63,6 +76,38 @@ pub struct ToolCallResult {
     pub metrics: ToolCallMetrics,
 }
 
+const MAX_RECOVERABLE_ERROR_STREAK: usize = 3;
+
+fn is_recoverable_tool_error(err: &ToolError) -> bool {
+    matches!(err, ToolError::DirectoryReadUnsupported { .. })
+}
+
+fn recoverable_tool_error_payload(err: &ToolError) -> String {
+    serde_json::json!({
+        "ok": false,
+        "recoverable": true,
+        "error_kind": "directory_read_unsupported",
+        "message": err.to_string(),
+    })
+    .to_string()
+}
+
+fn recoverable_error_kind(err: &ToolError) -> &'static str {
+    match err {
+        ToolError::DirectoryReadUnsupported { .. } => "directory_read_unsupported",
+        _ => "unknown",
+    }
+}
+
+fn recoverable_error_fingerprint(tool_name: &str, err: &ToolError) -> String {
+    match err {
+        ToolError::DirectoryReadUnsupported { path } => {
+            format!("{tool_name}:directory_read_unsupported:{path}")
+        }
+        _ => format!("{tool_name}:unknown"),
+    }
+}
+
 impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
     /// Create a tool-call loop with explicit provider, policy, iteration limit, and cancellation.
     pub fn new(
@@ -76,7 +121,8 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
             policy,
             max_iterations,
             cancel,
-            tool_timeout: Duration::from_secs(TOOL_TIMEOUT_SECS),
+            tool_timeout: tool_call_timeout(),
+            provider_timeout: tool_provider_timeout(),
         }
     }
 
@@ -84,6 +130,13 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
     #[allow(dead_code)]
     pub(crate) fn with_tool_timeout(mut self, timeout: Duration) -> Self {
         self.tool_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn with_provider_timeout(mut self, timeout: Duration) -> Self {
+        self.provider_timeout = timeout;
         self
     }
 
@@ -97,6 +150,8 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
         let mut current_request = request;
         let mut metrics = ToolCallMetrics::default();
         let mut depth = initial_depth;
+        let mut last_recoverable_error: Option<String> = None;
+        let mut recoverable_error_streak = 0usize;
 
         loop {
             if self.cancel.is_cancelled() {
@@ -115,8 +170,13 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
 
                 let response = tokio::select! {
                     _ = self.cancel.cancelled() => return Err(ToolCallError::Cancelled),
-                    response = self.provider.chat(current_request.clone()) => {
-                        response.map_err(|source| ToolCallError::Llm { source })?
+                    response = timeout(self.provider_timeout, self.provider.chat(current_request.clone())) => {
+                        match response {
+                            Ok(response) => response.map_err(|source| ToolCallError::Llm { source })?,
+                            Err(_) => return Err(ToolCallError::ProviderTimeout {
+                                timeout_secs: self.provider_timeout.as_secs(),
+                            }),
+                        }
                     }
                 };
 
@@ -169,10 +229,33 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
                         tool_result = tool_result => tool_result,
                     } {
                         Ok(Ok(content)) => {
+                            last_recoverable_error = None;
+                            recoverable_error_streak = 0;
                             tool_results.push((tool_call, content));
                         }
                         Ok(Err(source)) => {
-                            return Err(ToolCallError::ToolExecution { source });
+                            if is_recoverable_tool_error(&source) {
+                                let fingerprint =
+                                    recoverable_error_fingerprint(&tool_call.name, &source);
+                                if last_recoverable_error.as_deref() == Some(fingerprint.as_str()) {
+                                    recoverable_error_streak += 1;
+                                } else {
+                                    last_recoverable_error = Some(fingerprint);
+                                    recoverable_error_streak = 1;
+                                }
+
+                                if recoverable_error_streak >= MAX_RECOVERABLE_ERROR_STREAK {
+                                    return Err(ToolCallError::RecoverableErrorStreak {
+                                        tool_name: tool_call.name,
+                                        error_kind: recoverable_error_kind(&source).to_string(),
+                                        count: recoverable_error_streak,
+                                    });
+                                }
+
+                                tool_results.push((tool_call, recoverable_tool_error_payload(&source)));
+                            } else {
+                                return Err(ToolCallError::ToolExecution { source });
+                            }
                         }
                         Err(_) => {
                             return Err(ToolCallError::ToolTimeout {
@@ -229,7 +312,7 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
-    use sunny_core::tool::ToolPolicy;
+    use sunny_core::tool::{ToolError, ToolPolicy};
     use sunny_mind::{
         ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId,
         TokenUsage, ToolCall,
@@ -694,6 +777,29 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_tool_call_loop_respects_provider_timeout() {
+        let loop_runner = ToolCallLoop::new(
+            Arc::new(SlowProvider),
+            ToolPolicy::default_ask(),
+            3,
+            mk_cancel_token(),
+        )
+        .with_provider_timeout(Duration::ZERO);
+
+        let result = loop_runner
+            .run(mk_request(), Arc::new(|_, _, _, _| Ok("ok".to_string())), 0)
+            .await;
+
+        match result {
+            Err(ToolCallError::ProviderTimeout { timeout_secs }) => {
+                assert_eq!(timeout_secs, 0);
+            }
+            Ok(_) => panic!("expected provider timeout error"),
+            Err(other) => panic!("unexpected error variant: {other}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_tool_call_loop_depth_in_events() {
         let provider = Arc::new(MockProvider::new(vec![
@@ -734,5 +840,116 @@ mod tests {
             2,
             "max depth should be 2 (3 tool iterations: 0, 1, 2)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_loop_continues_on_recoverable_tool_error() {
+        let provider = Arc::new(MockProvider::new(vec![
+            mk_response("first", Some(vec![mk_tool_call("call-1", "fs_read", "{}")])),
+            mk_response("done", None),
+        ]));
+
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            3,
+            mk_cancel_token(),
+        );
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                Arc::new(|_, _, _, _| {
+                    Err(ToolError::DirectoryReadUnsupported {
+                        path: "/tmp".to_string(),
+                    })
+                }),
+                0,
+            )
+            .await
+            .expect("recoverable tool error should not abort loop");
+
+        assert_eq!(result.response.content, "done");
+        assert_eq!(result.metrics.iterations, 2);
+        assert_eq!(result.metrics.total_tool_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_loop_fails_on_repeated_recoverable_error_streak() {
+        let provider = Arc::new(MockProvider::new(vec![
+            mk_response("first", Some(vec![mk_tool_call("call-1", "fs_read", "{}")])),
+            mk_response(
+                "second",
+                Some(vec![mk_tool_call("call-2", "fs_read", "{}")]),
+            ),
+            mk_response("third", Some(vec![mk_tool_call("call-3", "fs_read", "{}")])),
+            mk_response("unreachable", None),
+        ]));
+
+        let loop_runner =
+            ToolCallLoop::new(provider, ToolPolicy::default_ask(), 10, mk_cancel_token());
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                Arc::new(|_, _, _, _| {
+                    Err(ToolError::DirectoryReadUnsupported {
+                        path: "/tmp".to_string(),
+                    })
+                }),
+                0,
+            )
+            .await;
+
+        match result {
+            Err(ToolCallError::RecoverableErrorStreak {
+                tool_name,
+                error_kind,
+                count,
+            }) => {
+                assert_eq!(tool_name, "fs_read");
+                assert_eq!(error_kind, "directory_read_unsupported");
+                assert_eq!(count, 3);
+            }
+            Ok(_) => panic!("expected recoverable error streak failure"),
+            Err(other) => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_loop_resets_recoverable_error_streak_after_success() {
+        let provider = Arc::new(MockProvider::new(vec![
+            mk_response("first", Some(vec![mk_tool_call("call-1", "fs_read", "{}")])),
+            mk_response(
+                "second",
+                Some(vec![mk_tool_call("call-2", "fs_read", "{}")]),
+            ),
+            mk_response("third", Some(vec![mk_tool_call("call-3", "fs_read", "{}")])),
+            mk_response("done", None),
+        ]));
+
+        let loop_runner =
+            ToolCallLoop::new(provider, ToolPolicy::default_ask(), 10, mk_cancel_token());
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                Arc::new(|id, _, _, _| {
+                    if id == "call-2" {
+                        Ok("content".to_string())
+                    } else {
+                        Err(ToolError::DirectoryReadUnsupported {
+                            path: "/tmp".to_string(),
+                        })
+                    }
+                }),
+                0,
+            )
+            .await
+            .expect("streak should reset after successful tool call");
+
+        assert_eq!(result.response.content, "done");
+        assert_eq!(result.metrics.iterations, 4);
+        assert_eq!(result.metrics.total_tool_calls, 3);
     }
 }

@@ -30,7 +30,7 @@ pub use executor::{PlanExecutor, PlanOutcome, PlanResult};
 pub use handle::OrchestratorHandle;
 pub use intake::{
     ComplexityHint, IntakeAdvisor, IntakeAdvisorError, PlanHints, PlanningIntake,
-    PlanningIntakeInput, PlanningIntakeVerdict, RawIntakeAdvice,
+    PlanningIntakeInput, PlanningIntakeVerdict, RawIntakeAdvice, WorkspaceContext,
 };
 pub use intent::{Intent, IntentKind, PlanPolicy};
 pub use interactive::InteractiveOrchestrator;

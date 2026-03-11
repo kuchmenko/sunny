@@ -18,13 +18,37 @@ const MAX_OUTPUT_BYTES: usize = 100_000;
 const DEFAULT_LOG_LIMIT: usize = 50;
 
 /// Allowed flags for `git log`.
-const GIT_LOG_ALLOWED: &[&str] = &["--oneline", "-n", "--format", "--since", "--author"];
+const GIT_LOG_ALLOWED: &[&str] = &[
+    "--oneline",
+    "-n",
+    "--max-count",
+    "--decorate",
+    "--graph",
+    "--all",
+    "--no-merges",
+    "--format",
+    "--since",
+    "--author",
+];
 
 /// Allowed flags for `git diff`.
-const GIT_DIFF_ALLOWED: &[&str] = &["--staged", "--stat", "--name-only"];
+const GIT_DIFF_ALLOWED: &[&str] = &[
+    "--staged",
+    "--cached",
+    "--stat",
+    "--name-only",
+    "--name-status",
+    "--numstat",
+];
 
 /// Allowed flags for `git status`.
-const GIT_STATUS_ALLOWED: &[&str] = &["--porcelain", "--short"];
+const GIT_STATUS_ALLOWED: &[&str] = &[
+    "--porcelain",
+    "--short",
+    "--branch",
+    "-b",
+    "--untracked-files",
+];
 
 /// Read-only `git log` wrapper.
 #[derive(Debug, Default)]
@@ -44,7 +68,8 @@ impl GitLog {
     /// Every flag in `args` is validated against the allowlist.
     /// Unknown flags produce [`ToolError::PermissionDenied`].
     pub fn execute(&self, args: &str, root: &Path) -> Result<String, ToolError> {
-        let extra = validate_flags(args, GIT_LOG_ALLOWED)?;
+        let normalized_args = normalize_git_log_args(args);
+        let extra = validate_flags(&normalized_args, GIT_LOG_ALLOWED)?;
 
         let default_limit = DEFAULT_LOG_LIMIT.to_string();
         let mut cmd_args = vec!["log", "--oneline"];
@@ -116,6 +141,22 @@ fn validate_flags(args: &str, allowed: &[&str]) -> Result<Vec<String>, ToolError
     }
 
     Ok(tokens.into_iter().map(String::from).collect())
+}
+
+fn normalize_git_log_args(args: &str) -> String {
+    args.split_whitespace()
+        .map(|token| {
+            if token.starts_with('-')
+                && token.len() > 1
+                && token[1..].chars().all(|ch| ch.is_ascii_digit())
+            {
+                format!("-n {}", &token[1..])
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Run a git command and return truncated stdout.
@@ -263,6 +304,45 @@ mod tests {
     }
 
     #[test]
+    fn test_git_diff_accepts_name_status_flag() {
+        let dir = init_test_repo();
+        let root = dir.path();
+
+        fs::write(root.join("file.txt"), "one").expect("test: write file");
+        Command::new("git")
+            .args(["add", "file.txt"])
+            .current_dir(root)
+            .output()
+            .expect("test: git add");
+        Command::new("git")
+            .args(["commit", "-m", "add file"])
+            .current_dir(root)
+            .output()
+            .expect("test: git commit");
+
+        fs::write(root.join("file.txt"), "two").expect("test: modify file");
+
+        let diff = GitDiff;
+        let result = diff
+            .execute("--name-status", root)
+            .expect("should accept --name-status");
+        assert!(result.contains("file.txt"));
+    }
+
+    #[test]
+    fn test_git_status_accepts_branch_flag() {
+        let dir = init_test_repo();
+        let root = dir.path();
+
+        let status = GitStatus;
+        let result = status.execute("-b", root).expect("should accept -b");
+        assert!(
+            result.contains("##"),
+            "expected branch header, got: {result}"
+        );
+    }
+
+    #[test]
     fn test_not_a_git_repo_error() {
         let dir = tempfile::tempdir().expect("test: create temp dir");
 
@@ -272,6 +352,37 @@ mod tests {
             matches!(err, ToolError::ExecutionFailed { .. }),
             "expected ExecutionFailed for non-git dir, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn test_normalize_git_log_args_converts_numeric_shorthand() {
+        assert_eq!(normalize_git_log_args("-15 --oneline"), "-n 15 --oneline");
+        assert_eq!(normalize_git_log_args("--author=foo"), "--author=foo");
+        assert_eq!(normalize_git_log_args(""), "");
+    }
+
+    #[test]
+    fn test_git_log_accepts_max_count_long_flag() {
+        let dir = init_test_repo();
+        let root = dir.path();
+
+        fs::write(root.join("hello.txt"), "hello world").expect("test: write file");
+        Command::new("git")
+            .args(["add", "hello.txt"])
+            .current_dir(root)
+            .output()
+            .expect("test: git add");
+        Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(root)
+            .output()
+            .expect("test: git commit");
+
+        let log = GitLog;
+        let result = log
+            .execute("--max-count=1", root)
+            .expect("should accept --max-count");
+        assert!(result.contains("initial commit"));
     }
 
     #[test]

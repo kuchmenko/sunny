@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use sunny_core::orchestrator::{IntakeAdvisor, IntakeAdvisorError, RawIntakeAdvice};
+use sunny_core::orchestrator::{
+    IntakeAdvisor, IntakeAdvisorError, RawIntakeAdvice, WorkspaceContext,
+};
 use sunny_mind::{ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest};
 
 #[allow(dead_code)]
@@ -18,6 +20,10 @@ Return only valid JSON with this exact shape:
 
 Rules:
 - Select exactly one capability from: query, analyze, action, explore, advise.
+- Use workspace_context to bias decisions toward local context gathering when the user asks broad,
+  repository-scoped questions.
+- Reserve advise for explicit strategy/validation needs; do not use it as default for ambiguous
+  repository exploration requests.
 - Use null when capability or complexity is unknown.
 - Keep context_tags short, lower_snake_case preferred.
 - Respond with JSON only. No markdown, no prose.
@@ -47,7 +53,12 @@ struct RawIntakeAdvicePayload {
 
 #[async_trait::async_trait]
 impl IntakeAdvisor for LlmIntakeAdvisor {
-    async fn advise(&self, user_input: &str) -> Result<RawIntakeAdvice, IntakeAdvisorError> {
+    async fn advise(
+        &self,
+        user_input: &str,
+        workspace_context: &WorkspaceContext,
+    ) -> Result<RawIntakeAdvice, IntakeAdvisorError> {
+        let workspace_summary = workspace_context.summarize();
         let req = LlmRequest {
             messages: vec![
                 ChatMessage {
@@ -59,7 +70,10 @@ impl IntakeAdvisor for LlmIntakeAdvisor {
                 },
                 ChatMessage {
                     role: ChatRole::User,
-                    content: user_input.to_string(),
+                    content: format!(
+                        "user_input:\n{}\n\nworkspace_context:\n{}",
+                        user_input, workspace_summary
+                    ),
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
@@ -194,7 +208,7 @@ mod tests {
 
         let advisor = LlmIntakeAdvisor::new(provider.clone() as Arc<dyn LlmProvider>);
         let advice = advisor
-            .advise("where is intake trait")
+            .advise("where is intake trait", &WorkspaceContext::default())
             .await
             .expect("expected valid advice");
 
@@ -214,7 +228,10 @@ mod tests {
         assert_eq!(request.messages.len(), 2);
         assert_eq!(request.messages[0].role, ChatRole::System);
         assert_eq!(request.messages[1].role, ChatRole::User);
-        assert_eq!(request.messages[1].content, "where is intake trait");
+        assert!(request.messages[1]
+            .content
+            .contains("where is intake trait"));
+        assert!(request.messages[1].content.contains("workspace_context"));
     }
 
     #[tokio::test]
@@ -226,7 +243,7 @@ mod tests {
 
         let advisor = LlmIntakeAdvisor::new(provider as Arc<dyn LlmProvider>);
         let error = advisor
-            .advise("classify this")
+            .advise("classify this", &WorkspaceContext::default())
             .await
             .expect_err("expected parse error");
 
@@ -247,7 +264,7 @@ mod tests {
 
         let advisor = LlmIntakeAdvisor::new(provider as Arc<dyn LlmProvider>);
         let error = advisor
-            .advise("delegate work")
+            .advise("delegate work", &WorkspaceContext::default())
             .await
             .expect_err("expected invalid capability error");
 
@@ -266,7 +283,7 @@ mod tests {
 
         let advisor = LlmIntakeAdvisor::new(provider as Arc<dyn LlmProvider>);
         let error = advisor
-            .advise("what should run")
+            .advise("what should run", &WorkspaceContext::default())
             .await
             .expect_err("expected timeout mapping");
 

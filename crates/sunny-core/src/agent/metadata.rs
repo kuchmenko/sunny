@@ -1,6 +1,6 @@
 //! Agent metadata annotations for routing and capability hints.
 //!
-//! These types are NOT part of the [`Agent`] trait (that would be a breaking
+//! These types are NOT part of the [`crate::agent::Agent`] trait (that would be a breaking
 //! change). Instead, they are stored separately and used for routing decisions
 //! and observability.
 

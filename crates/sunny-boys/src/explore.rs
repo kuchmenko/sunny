@@ -13,6 +13,7 @@ use sunny_mind::{
 use tokio_util::sync::CancellationToken;
 
 use crate::git_tools::{GitDiff, GitLog, GitStatus};
+use crate::timeouts::explore_tool_loop_budget;
 use crate::tool_loop::{ToolCallError, ToolCallLoop};
 
 const MAX_TOOL_ITERATIONS: usize = 15;
@@ -87,7 +88,7 @@ impl ExploreAgent {
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "args": { "type": "string", "description": "Optional allowed git log flags" }
+                        "args": { "type": "string", "description": "Optional git log flags. Allowed: --oneline, -n <N>, --max-count=<N>, --format=..., --since=..., --author=.... Use -n 15 or --max-count=15, not -15." }
                     }
                 }),
             },
@@ -107,7 +108,7 @@ impl ExploreAgent {
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "args": { "type": "string", "description": "Optional allowed git status flags" }
+                        "args": { "type": "string", "description": "Optional git status flags. Allowed: --porcelain or --short." }
                     }
                 }),
             },
@@ -272,6 +273,26 @@ impl ExploreAgent {
                         source: Box::new(std::io::Error::other("missing 'path' argument")),
                     })?;
                 let path = Self::resolve_tool_path(root_path, path_str)?;
+                if path.is_dir() {
+                    let scan = scanner.scan(&path)?;
+                    let sample_entries: Vec<String> = scan
+                        .files
+                        .iter()
+                        .take(20)
+                        .map(|f| f.path.to_string_lossy().to_string())
+                        .collect();
+                    let payload = serde_json::json!({
+                        "error": "path_is_directory",
+                        "path": path.display().to_string(),
+                        "hint": "Use fs_scan for directories and fs_read for files",
+                        "sample_entries": sample_entries,
+                    });
+                    return serde_json::to_string(&payload).map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    });
+                }
                 let content = reader.read(&path)?;
                 let mut text = content.content;
                 Self::safe_truncate(&mut text, 4096);
@@ -296,6 +317,18 @@ impl ExploreAgent {
                             source: Box::new(std::io::Error::other("missing 'pattern' argument")),
                         })?;
                 let path = Self::resolve_tool_path(root_path, path_str)?;
+                if path.is_dir() {
+                    let payload = serde_json::json!({
+                        "error": "path_is_directory",
+                        "path": path.display().to_string(),
+                        "hint": "text_grep expects a file path. Use fs_scan to enumerate files first.",
+                    });
+                    return serde_json::to_string(&payload).map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    });
+                }
                 let file_content = reader.read(&path)?;
                 let grep = TextGrep::default();
                 let result = grep.search(&file_content.content, pattern);
@@ -376,7 +409,7 @@ impl Agent for ExploreAgent {
                 ChatMessage {
                     role: ChatRole::System,
                     content: format!(
-                        "You are an exploration-focused codebase assistant. Use fs_scan, fs_read, text_grep, git_log, git_diff, and git_status to map repository structure and locate relevant code quickly. Prefer grep-driven discovery and targeted reads over exhaustive scanning. Explore only within: {}.",
+                        "You are an exploration-focused codebase assistant. Use fs_scan, fs_read, text_grep, git_log, git_diff, and git_status to map repository structure and locate relevant code quickly. Prefer grep-driven discovery and targeted reads over exhaustive scanning. For git_log limits, use '-n <N>' or '--max-count=<N>' and never use numeric shorthand like '-15'. For git_status, use only '--porcelain' or '--short'. Explore only within: {}.",
                         root_path.display()
                     ),
                     tool_calls: None,
@@ -430,10 +463,14 @@ impl Agent for ExploreAgent {
             },
         );
 
-        let result = loop_runner
-            .run(request, executor, 0)
+        let loop_budget = explore_tool_loop_budget();
+        let result = tokio::time::timeout(loop_budget, loop_runner.run(request, executor, 0))
             .await
+            .map_err(|_| AgentError::Timeout)?
             .map_err(|err| match err {
+                ToolCallError::ProviderTimeout { .. } | ToolCallError::ToolTimeout { .. } => {
+                    AgentError::Timeout
+                }
                 ToolCallError::Cancelled => AgentError::ExecutionFailed {
                     source: Box::new(std::io::Error::other(
                         "explore operation cancelled during tool_call_loop",
@@ -639,6 +676,121 @@ mod tests {
         match response {
             AgentResponse::Success { content, .. } => {
                 assert_eq!(content, "Exploration complete");
+            }
+            AgentResponse::Error { code, message } => {
+                panic!("expected success, got error code={code}, message={message}");
+            }
+        }
+
+        fs::remove_dir_all(&repo).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn test_explore_agent_fs_read_directory_is_recoverable() {
+        let repo = init_test_repo();
+        let provider = Arc::new(ToolLoopMockProvider::new(vec![
+            LlmResponse {
+                content: "Reading root".to_string(),
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                },
+                finish_reason: "tool_calls".to_string(),
+                provider_id: ProviderId("mock".to_string()),
+                model_id: ModelId("mock-model".to_string()),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "fs_read".to_string(),
+                    arguments: serde_json::json!({ "path": repo.to_str().expect("path str") })
+                        .to_string(),
+                    execution_depth: 0,
+                }]),
+                reasoning_content: None,
+            },
+            LlmResponse {
+                content: "Recovered after directory read".to_string(),
+                usage: TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                    total_tokens: 30,
+                },
+                finish_reason: "stop".to_string(),
+                provider_id: ProviderId("mock".to_string()),
+                model_id: ModelId("mock-model".to_string()),
+                tool_calls: None,
+                reasoning_content: None,
+            },
+        ]));
+
+        let agent = ExploreAgent::new(Some(provider));
+        let response = agent
+            .handle_message(mk_msg(repo.to_str().expect("path str")), &mk_ctx())
+            .await
+            .expect("agent response with provider");
+
+        match response {
+            AgentResponse::Success { content, .. } => {
+                assert_eq!(content, "Recovered after directory read");
+            }
+            AgentResponse::Error { code, message } => {
+                panic!("expected success, got error code={code}, message={message}");
+            }
+        }
+
+        fs::remove_dir_all(&repo).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn test_explore_agent_text_grep_directory_is_recoverable() {
+        let repo = init_test_repo();
+        let provider = Arc::new(ToolLoopMockProvider::new(vec![
+            LlmResponse {
+                content: "Trying grep on root".to_string(),
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    total_tokens: 15,
+                },
+                finish_reason: "tool_calls".to_string(),
+                provider_id: ProviderId("mock".to_string()),
+                model_id: ModelId("mock-model".to_string()),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "text_grep".to_string(),
+                    arguments: serde_json::json!({
+                        "path": repo.to_str().expect("path str"),
+                        "pattern": "mod"
+                    })
+                    .to_string(),
+                    execution_depth: 0,
+                }]),
+                reasoning_content: None,
+            },
+            LlmResponse {
+                content: "Recovered after directory grep".to_string(),
+                usage: TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                    total_tokens: 30,
+                },
+                finish_reason: "stop".to_string(),
+                provider_id: ProviderId("mock".to_string()),
+                model_id: ModelId("mock-model".to_string()),
+                tool_calls: None,
+                reasoning_content: None,
+            },
+        ]));
+
+        let agent = ExploreAgent::new(Some(provider));
+        let response = agent
+            .handle_message(mk_msg(repo.to_str().expect("path str")), &mk_ctx())
+            .await
+            .expect("agent response with provider");
+
+        match response {
+            AgentResponse::Success { content, .. } => {
+                assert_eq!(content, "Recovered after directory grep");
             }
             AgentResponse::Error { code, message } => {
                 panic!("expected success, got error code={code}, message={message}");

@@ -182,6 +182,16 @@ fn map_orchestrator_error(err: &OrchestratorError) -> PromptIssue {
             format!("Invalid step transition: {from:?} -> {to:?}"),
             Some("Inspect orchestration state transitions and retry"),
         ),
+        OrchestratorError::PlanPolicyViolation { reason }
+            if reason.contains("dispatch failed:") =>
+        {
+            issue(
+                "error",
+                "agent_execution_failed",
+                reason.clone(),
+                Some("Inspect logs with request_id for root cause"),
+            )
+        }
         OrchestratorError::PlanPolicyViolation { reason } => issue(
             "error",
             "plan_policy_violation",
@@ -309,6 +319,7 @@ fn render_error_output(
         request_id,
         intent_kind,
         required_capability,
+        step_count: 1,
         dry_run,
         outcome: "error",
         response: None,
@@ -393,6 +404,7 @@ async fn execute_ask_internal(
             request_id: &request_id_text,
             intent_kind: &intent_kind,
             required_capability: &required_capability.0,
+            step_count: 1,
             dry_run: args.dry_run,
             outcome: "planned",
             response: None,
@@ -485,6 +497,14 @@ async fn execute_ask_internal(
     let mut metadata = HashMap::new();
     metadata.insert(
         "_sunny.cwd".to_string(),
+        query_root.to_string_lossy().to_string(),
+    );
+    metadata.insert(
+        "_sunny.workspace.cwd".to_string(),
+        cwd.to_string_lossy().to_string(),
+    );
+    metadata.insert(
+        "_sunny.query_root".to_string(),
         query_root.to_string_lossy().to_string(),
     );
     metadata.insert("_sunny.query".to_string(), args.input.clone());
@@ -650,6 +670,7 @@ async fn execute_ask_internal(
         request_id: &request_id_text,
         intent_kind: &intent_kind,
         required_capability: &required_capability.0,
+        step_count: parse_step_count(&response_metadata),
         dry_run: args.dry_run,
         outcome: &outcome,
         response: response_content,
@@ -680,6 +701,7 @@ struct AskOutputParams<'a> {
     request_id: &'a str,
     intent_kind: &'a str,
     required_capability: &'a str,
+    step_count: usize,
     dry_run: bool,
     outcome: &'a str,
     response: Option<String>,
@@ -701,7 +723,7 @@ fn build_ask_output(params: AskOutputParams<'_>) -> PromptOutput {
         intent_kind: params.intent_kind.to_string(),
         required_capability: Some(params.required_capability.to_string()),
         dry_run: params.dry_run,
-        step_count: 1,
+        step_count: params.step_count,
         steps_completed,
         steps_failed,
         steps_skipped: 0,
@@ -710,6 +732,28 @@ fn build_ask_output(params: AskOutputParams<'_>) -> PromptOutput {
         warnings: params.warnings,
         error: params.error,
         metadata: params.metadata,
+    }
+}
+
+fn parse_step_count(metadata: &HashMap<String, String>) -> usize {
+    let completed = metadata
+        .get("steps_completed")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let failed = metadata
+        .get("steps_failed")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let skipped = metadata
+        .get("steps_skipped")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let total = completed + failed + skipped;
+    if total == 0 {
+        1
+    } else {
+        total
     }
 }
 
@@ -1192,6 +1236,21 @@ mod tests {
             "Agent did not respond within timeout window"
         );
         assert_eq!(parsed["metadata"]["failure_stage"], "agent_dispatch");
+    }
+
+    #[test]
+    fn test_map_orchestrator_error_remaps_dispatch_reason_from_plan_policy_violation() {
+        let err = OrchestratorError::PlanPolicyViolation {
+            reason: "interactive plan execution failed: dispatch failed: execution failed: boom"
+                .to_string(),
+        };
+
+        let mapped = map_orchestrator_error(&err);
+        assert_eq!(mapped.code, "agent_execution_failed");
+        assert_eq!(
+            mapped.message,
+            "interactive plan execution failed: dispatch failed: execution failed: boom"
+        );
     }
 
     #[test]

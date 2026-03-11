@@ -62,10 +62,15 @@ mod tests {
         };
         assert_eq!(err.to_string(), "binary file skipped: /binary.exe");
 
+        let err = ToolError::DirectoryReadUnsupported {
+            path: "/tmp".to_string(),
+        };
+        assert_eq!(err.to_string(), "directory read unsupported: /tmp");
+
         // Test ExecutionFailed
         let source_err: Box<dyn Error + Send + Sync> = Box::new(std::io::Error::other("io error"));
         let err = ToolError::ExecutionFailed { source: source_err };
-        assert_eq!(err.to_string(), "tool execution failed");
+        assert_eq!(err.to_string(), "tool execution failed: io error");
     }
 
     #[test]
@@ -78,7 +83,7 @@ mod tests {
         let err = ToolError::ExecutionFailed { source: source_err };
 
         // Verify error message
-        assert_eq!(err.to_string(), "tool execution failed");
+        assert_eq!(err.to_string(), "tool execution failed: access denied");
 
         // Verify source chain exists
         let source = err.source();

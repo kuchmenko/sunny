@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, info_span};
 
 use crate::agent::{AgentError, AgentMessage, AgentResponse, Capability};
+use crate::timeouts::{orchestrator_reply_timeout, orchestrator_send_timeout};
 
 use super::telemetry::{DispatchTelemetry, NoopTelemetry};
 use super::{
@@ -127,15 +128,12 @@ impl OrchestratorHandle {
             reply: reply_tx,
         };
 
-        timeout(
-            std::time::Duration::from_secs(60),
-            self.tx.send(orchestrator_msg),
-        )
-        .await
-        .map_err(|_| OrchestratorError::AgentUnresponsive)?
-        .map_err(channel_closed_error)?;
+        timeout(orchestrator_send_timeout(), self.tx.send(orchestrator_msg))
+            .await
+            .map_err(|_| OrchestratorError::AgentUnresponsive)?
+            .map_err(channel_closed_error)?;
 
-        timeout(std::time::Duration::from_secs(60), reply_rx)
+        timeout(orchestrator_reply_timeout(), reply_rx)
             .await
             .map_err(|_| OrchestratorError::AgentUnresponsive)?
             .map_err(channel_closed_error)?
@@ -156,15 +154,12 @@ impl OrchestratorHandle {
             reply: reply_tx,
         };
 
-        timeout(
-            std::time::Duration::from_secs(60),
-            self.tx.send(orchestrator_msg),
-        )
-        .await
-        .map_err(|_| OrchestratorError::AgentUnresponsive)?
-        .map_err(channel_closed_error)?;
+        timeout(orchestrator_send_timeout(), self.tx.send(orchestrator_msg))
+            .await
+            .map_err(|_| OrchestratorError::AgentUnresponsive)?
+            .map_err(channel_closed_error)?;
 
-        timeout(std::time::Duration::from_secs(60), reply_rx)
+        timeout(orchestrator_reply_timeout(), reply_rx)
             .await
             .map_err(|_| OrchestratorError::AgentUnresponsive)?
             .map_err(channel_closed_error)?
@@ -359,9 +354,8 @@ fn strip_internal_metadata(
 
 fn map_agent_error(err: AgentError) -> OrchestratorError {
     match err {
-        AgentError::Timeout | AgentError::ExecutionFailed { .. } => {
-            OrchestratorError::AgentUnresponsive
-        }
+        AgentError::Timeout => OrchestratorError::AgentUnresponsive,
+        other if crate::agent::is_transport_failure(&other) => OrchestratorError::AgentUnresponsive,
         other => OrchestratorError::DispatchFailed { source: other },
     }
 }
@@ -517,6 +511,8 @@ mod tests {
 
     struct RequestIdEchoAgent;
 
+    struct ExecutionFailureAgent;
+
     #[async_trait::async_trait]
     impl Agent for RequestIdEchoAgent {
         fn name(&self) -> &str {
@@ -545,6 +541,27 @@ mod tests {
                     })
                 }
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for ExecutionFailureAgent {
+        fn name(&self) -> &str {
+            "execution-failure"
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability("echo".to_string())]
+        }
+
+        async fn handle_message(
+            &self,
+            _msg: AgentMessage,
+            _ctx: &AgentContext,
+        ) -> Result<AgentResponse, AgentError> {
+            Err(AgentError::ExecutionFailed {
+                source: Box::new(std::io::Error::other("domain validation failed")),
+            })
         }
     }
 
@@ -672,6 +689,42 @@ mod tests {
         assert!(logs_contain("processing agent message"));
         assert!(logs_contain(&format!("request_id={request_id_str}")));
         assert!(logs_contain(&format!("trace_id={request_id_str}")));
+
+        cancellation_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_execution_failed_maps_to_dispatch_failed() {
+        let cancellation_token = CancellationToken::new();
+        let agent_handle = AgentHandle::spawn(
+            Arc::new(ExecutionFailureAgent),
+            cancellation_token.child_token(),
+        );
+        let mut registry = AgentRegistry::new();
+        registry
+            .register(
+                "echo".to_string(),
+                agent_handle,
+                vec![Capability("echo".to_string())],
+            )
+            .expect("register should succeed");
+
+        let orchestrator = OrchestratorHandle::spawn(registry, cancellation_token.child_token());
+        let result = orchestrator
+            .dispatch(
+                "echo",
+                AgentMessage::Task {
+                    id: "t-dispatch-failed".to_string(),
+                    content: "hello".to_string(),
+                    metadata: HashMap::new(),
+                },
+            )
+            .await;
+
+        match result {
+            Err(OrchestratorError::DispatchFailed { .. }) => {}
+            other => panic!("expected DispatchFailed, got: {other:?}"),
+        }
 
         cancellation_token.cancel();
     }

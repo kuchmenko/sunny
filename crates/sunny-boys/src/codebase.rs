@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sunny_core::agent::{Agent, AgentContext, AgentError, AgentMessage, AgentResponse, Capability};
@@ -12,12 +11,12 @@ use sunny_mind::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::timeouts::workspace_tool_loop_budget;
 use crate::tool_loop::{ToolCallError, ToolCallLoop};
 
 const MAX_CONTEXT_FILES: usize = 20;
 const MAX_FILE_BYTES: usize = 2048;
 const MAX_TOOL_ITERATIONS: usize = 10;
-const TOOL_LOOP_BUDGET_SECS: u64 = 120;
 const TOOL_LOOP_READ_MAX_BYTES: usize = 4096;
 const TOOL_LOOP_SCAN_MAX_FILES: usize = 400;
 const TOOL_LOOP_MAX_READ_CALLS: usize = 6;
@@ -619,7 +618,7 @@ impl Agent for WorkspaceReadAgent {
             request_id,
             task_id,
             path = %root_path.display(),
-            tool_loop_budget_secs = TOOL_LOOP_BUDGET_SECS,
+            tool_loop_budget_secs = workspace_tool_loop_budget().as_secs(),
             "WorkspaceReadAgent using ToolCallLoop"
         );
 
@@ -701,44 +700,43 @@ impl Agent for WorkspaceReadAgent {
             },
         );
 
-        let result = match tokio::time::timeout(
-            Duration::from_secs(TOOL_LOOP_BUDGET_SECS),
-            loop_runner.run(request, executor, 0),
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(ToolCallError::Cancelled)) => {
-                return Err(Self::cancelled_error("tool_call_loop"));
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    agent = %ctx.agent_name,
-                    request_id,
-                    task_id,
-                    path = %root_path.display(),
-                    error = %err,
-                    "WorkspaceReadAgent ToolCallLoop failed; falling back to scanner+reader"
-                );
-                return self
-                    .run_fallback(&root_path, &request_id, &task_id, "tool_loop_error", ctx)
-                    .await;
-            }
-            Err(_) => {
-                tracing::warn!(
-                    agent = %ctx.agent_name,
-                    request_id,
-                    task_id,
-                    path = %root_path.display(),
-                    operation = "tool_call_loop",
-                    timeout_secs = TOOL_LOOP_BUDGET_SECS,
-                    "WorkspaceReadAgent ToolCallLoop timed out; falling back to scanner+reader"
-                );
-                return self
-                    .run_fallback(&root_path, &request_id, &task_id, "tool_loop_timeout", ctx)
-                    .await;
-            }
-        };
+        let tool_loop_budget = workspace_tool_loop_budget();
+        let result =
+            match tokio::time::timeout(tool_loop_budget, loop_runner.run(request, executor, 0))
+                .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(ToolCallError::Cancelled)) => {
+                    return Err(Self::cancelled_error("tool_call_loop"));
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        agent = %ctx.agent_name,
+                        request_id,
+                        task_id,
+                        path = %root_path.display(),
+                        error = %err,
+                        "WorkspaceReadAgent ToolCallLoop failed; falling back to scanner+reader"
+                    );
+                    return self
+                        .run_fallback(&root_path, &request_id, &task_id, "tool_loop_error", ctx)
+                        .await;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        agent = %ctx.agent_name,
+                        request_id,
+                        task_id,
+                        path = %root_path.display(),
+                        operation = "tool_call_loop",
+                        timeout_secs = tool_loop_budget.as_secs(),
+                        "WorkspaceReadAgent ToolCallLoop timed out; falling back to scanner+reader"
+                    );
+                    return self
+                        .run_fallback(&root_path, &request_id, &task_id, "tool_loop_timeout", ctx)
+                        .await;
+                }
+            };
 
         let mut metadata = HashMap::new();
         metadata.insert("mode".to_string(), "LLM_TOOL_LOOP".to_string());

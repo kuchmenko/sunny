@@ -6,7 +6,7 @@ use crate::agent::{AgentMessage, AgentResponse};
 
 use super::{
     HeuristicLoopPlanner, Intent, OrchestratorError, OrchestratorHandle, PlanExecutor, PlanOutcome,
-    PlanningIntake, PlanningIntakeInput, PlanningIntakeVerdict, RequestId,
+    PlanningIntake, PlanningIntakeInput, PlanningIntakeVerdict, RequestId, WorkspaceContext,
 };
 
 pub struct InteractiveOrchestrator<'a> {
@@ -42,6 +42,7 @@ impl<'a> InteractiveOrchestrator<'a> {
                 task: task.clone(),
                 request_id,
                 llm_enabled: self.planner.llm_enabled(),
+                workspace_context: WorkspaceContext::default(),
             })
             .await;
         let (hints, intake_verdict_label, intake_skip_reason) = match intake_verdict {
@@ -93,10 +94,24 @@ impl<'a> InteractiveOrchestrator<'a> {
 
                 Ok(AgentResponse::Success { content, metadata })
             }
-            PlanOutcome::Cancelled => Err(OrchestratorError::AgentUnresponsive),
-            PlanOutcome::Failed => Err(OrchestratorError::PlanPolicyViolation {
-                reason: "interactive plan execution failed".to_string(),
-            }),
+            PlanOutcome::Cancelled => Err(OrchestratorError::ShuttingDown),
+            PlanOutcome::Failed => {
+                let failed_reason = plan
+                    .steps
+                    .iter()
+                    .find_map(|step| match step.outcome.as_ref() {
+                        Some(super::StepOutcome::Timeout) => {
+                            Some("step timed out while waiting for agent progress".to_string())
+                        }
+                        Some(super::StepOutcome::Error { message }) => Some(message.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "interactive plan execution failed".to_string());
+
+                Err(OrchestratorError::PlanPolicyViolation {
+                    reason: format!("interactive plan execution failed: {failed_reason}"),
+                })
+            }
         }
     }
 }

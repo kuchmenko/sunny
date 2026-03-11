@@ -6,6 +6,29 @@ use tokio::time::{timeout, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentContext, AgentError, AgentMessage, AgentResponse};
+use crate::timeouts::{agent_reply_timeout, agent_send_timeout};
+
+#[derive(Debug)]
+struct AgentMailboxClosed;
+
+impl std::fmt::Display for AgentMailboxClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "agent mailbox closed")
+    }
+}
+
+impl Error for AgentMailboxClosed {}
+
+#[derive(Debug)]
+struct AgentReplyDropped;
+
+impl std::fmt::Display for AgentReplyDropped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "agent reply channel dropped")
+    }
+}
+
+impl Error for AgentReplyDropped {}
 
 pub(crate) enum AgentActorMsg {
     HandleMessage {
@@ -66,15 +89,15 @@ impl AgentHandle {
             timestamp: Instant::now(),
         };
 
-        timeout(std::time::Duration::from_secs(60), self.tx.send(actor_msg))
+        timeout(agent_send_timeout(), self.tx.send(actor_msg))
             .await
             .map_err(|_| AgentError::Timeout)?
-            .map_err(channel_closed_error)?;
+            .map_err(mailbox_closed_error)?;
 
-        timeout(std::time::Duration::from_secs(60), reply_rx)
+        timeout(agent_reply_timeout(), reply_rx)
             .await
             .map_err(|_| AgentError::Timeout)?
-            .map_err(channel_closed_error)?
+            .map_err(reply_dropped_error)?
     }
 
     pub fn name(&self) -> &str {
@@ -151,9 +174,24 @@ pub(crate) async fn run_agent_actor(
     let _ = lifecycle_tx.send(AgentLifecycleState::Stopped);
 }
 
-fn channel_closed_error(err: impl Error + Send + Sync + 'static) -> AgentError {
+fn mailbox_closed_error(_err: impl Error + Send + Sync + 'static) -> AgentError {
     AgentError::ExecutionFailed {
-        source: Box::new(err),
+        source: Box::new(AgentMailboxClosed),
+    }
+}
+
+fn reply_dropped_error(_err: impl Error + Send + Sync + 'static) -> AgentError {
+    AgentError::ExecutionFailed {
+        source: Box::new(AgentReplyDropped),
+    }
+}
+
+pub(crate) fn is_transport_failure(err: &AgentError) -> bool {
+    match err {
+        AgentError::ExecutionFailed { source } => {
+            source.is::<AgentMailboxClosed>() || source.is::<AgentReplyDropped>()
+        }
+        _ => false,
     }
 }
 
@@ -626,7 +664,7 @@ mod tests {
         let agent = Arc::new(FaultyAgent {
             panic_msg: None,
             error_response: None,
-            delay: Some(Duration::from_secs(31)),
+            delay: Some(Duration::from_secs(300)),
             stopped,
         });
         let cancellation_token = CancellationToken::new();
@@ -643,7 +681,8 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(60) + Duration::from_millis(1)).await;
+        tokio::time::advance(crate::timeouts::agent_reply_timeout() + Duration::from_millis(1))
+            .await;
 
         let result = send_task
             .await

@@ -2,6 +2,8 @@ use crate::agent::{AgentMessage, Capability};
 use crate::orchestrator::intent::Intent;
 use crate::orchestrator::RequestId;
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const ALLOWED_CAPABILITIES: &[&str] = &["query", "analyze", "action", "explore", "advise"];
@@ -12,6 +14,34 @@ pub struct PlanningIntakeInput {
     pub task: AgentMessage,
     pub request_id: RequestId,
     pub llm_enabled: bool,
+    pub workspace_context: WorkspaceContext,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceContext {
+    pub cwd: Option<String>,
+    pub query_root: Option<String>,
+    pub is_git_repo: bool,
+    pub has_cargo_toml: bool,
+    pub has_package_json: bool,
+    pub top_entries: Vec<String>,
+}
+
+impl WorkspaceContext {
+    pub fn summarize(&self) -> String {
+        let cwd = self.cwd.as_deref().unwrap_or("unknown");
+        let query_root = self.query_root.as_deref().unwrap_or("unknown");
+        let entries = if self.top_entries.is_empty() {
+            "none".to_string()
+        } else {
+            self.top_entries.join(", ")
+        };
+
+        format!(
+            "cwd={cwd}; query_root={query_root}; git_repo={}; cargo_toml={}; package_json={}; top_entries=[{entries}]",
+            self.is_git_repo, self.has_cargo_toml, self.has_package_json
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +81,11 @@ pub enum IntakeAdvisorError {
 
 #[async_trait::async_trait]
 pub trait IntakeAdvisor: Send + Sync {
-    async fn advise(&self, user_input: &str) -> Result<RawIntakeAdvice, IntakeAdvisorError>;
+    async fn advise(
+        &self,
+        user_input: &str,
+        workspace_context: &WorkspaceContext,
+    ) -> Result<RawIntakeAdvice, IntakeAdvisorError>;
 }
 
 #[derive(Debug, Clone)]
@@ -78,11 +112,18 @@ impl PlanningIntake {
 
     pub async fn evaluate(&self, input: PlanningIntakeInput) -> PlanningIntakeVerdict {
         let default_verdict = || PlanningIntakeVerdict::Proceed(PlanHints::default());
+        let workspace_context = merge_workspace_context(
+            input.workspace_context.clone(),
+            derive_workspace_context(&input.task),
+        );
 
         let verdict = if !input.llm_enabled {
             default_verdict()
         } else if let Some(advisor) = self.advisor.as_ref() {
-            match advisor.advise(&input.intent.raw_input).await {
+            match advisor
+                .advise(&input.intent.raw_input, &workspace_context)
+                .await
+            {
                 Ok(raw_advice) => match parse_raw_advice(raw_advice) {
                     Ok(hints) => PlanningIntakeVerdict::Proceed(hints),
                     Err(error) => {
@@ -114,11 +155,95 @@ impl PlanningIntake {
 
         tracing::info!(
             event = "orchestrator.intake.evaluated",
-            verdict = verdict_label
+            verdict = verdict_label,
+            workspace_context = %workspace_context.summarize()
         );
 
         verdict
     }
+}
+
+fn merge_workspace_context(
+    explicit: WorkspaceContext,
+    derived: WorkspaceContext,
+) -> WorkspaceContext {
+    WorkspaceContext {
+        cwd: explicit.cwd.or(derived.cwd),
+        query_root: explicit.query_root.or(derived.query_root),
+        is_git_repo: explicit.is_git_repo || derived.is_git_repo,
+        has_cargo_toml: explicit.has_cargo_toml || derived.has_cargo_toml,
+        has_package_json: explicit.has_package_json || derived.has_package_json,
+        top_entries: if explicit.top_entries.is_empty() {
+            derived.top_entries
+        } else {
+            explicit.top_entries
+        },
+    }
+}
+
+fn derive_workspace_context(task: &AgentMessage) -> WorkspaceContext {
+    let AgentMessage::Task {
+        content, metadata, ..
+    } = task;
+
+    let cwd = metadata
+        .get("_sunny.cwd")
+        .cloned()
+        .or_else(|| metadata.get("_sunny.workspace.cwd").cloned());
+    let query_root = metadata
+        .get("_sunny.query_root")
+        .cloned()
+        .or_else(|| metadata.get("_sunny.cwd").cloned())
+        .or_else(|| {
+            if content.trim().is_empty() {
+                None
+            } else {
+                Some(content.clone())
+            }
+        });
+
+    let scan_root = query_root
+        .as_deref()
+        .map(PathBuf::from)
+        .or_else(|| cwd.as_deref().map(PathBuf::from));
+
+    let mut context = WorkspaceContext {
+        cwd,
+        query_root,
+        ..WorkspaceContext::default()
+    };
+
+    if let Some(root) = scan_root {
+        let normalized = normalize_scan_root(&root);
+        context.is_git_repo = normalized.join(".git").exists();
+        context.has_cargo_toml = normalized.join("Cargo.toml").exists();
+        context.has_package_json = normalized.join("package.json").exists();
+        context.top_entries = list_top_entries(&normalized);
+    }
+
+    context
+}
+
+fn normalize_scan_root(root: &Path) -> PathBuf {
+    if root.is_dir() {
+        root.to_path_buf()
+    } else {
+        root.parent().unwrap_or(root).to_path_buf()
+    }
+}
+
+fn list_top_entries(root: &Path) -> Vec<String> {
+    let mut names = match fs::read_dir(root) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect::<Vec<_>>(),
+        Err(_) => return Vec::new(),
+    };
+
+    names.sort();
+    names.truncate(8);
+    names
 }
 
 impl Default for PlanningIntake {
@@ -205,7 +330,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IntakeAdvisor for StubAdvisor {
-        async fn advise(&self, user_input: &str) -> Result<RawIntakeAdvice, IntakeAdvisorError> {
+        async fn advise(
+            &self,
+            user_input: &str,
+            _workspace_context: &WorkspaceContext,
+        ) -> Result<RawIntakeAdvice, IntakeAdvisorError> {
             self.last_input
                 .lock()
                 .expect("stub advisor lock poisoned")
@@ -231,6 +360,7 @@ mod tests {
             },
             request_id: RequestId::new(),
             llm_enabled: false,
+            workspace_context: WorkspaceContext::default(),
         }
     }
 
@@ -341,5 +471,21 @@ mod tests {
                 panic!("expected Proceed, got Skip: {reason}")
             }
         }
+    }
+
+    #[test]
+    fn test_workspace_context_summary() {
+        let context = WorkspaceContext {
+            cwd: Some("/repo".to_string()),
+            query_root: Some("/repo/src".to_string()),
+            is_git_repo: true,
+            has_cargo_toml: true,
+            has_package_json: false,
+            top_entries: vec!["Cargo.toml".to_string(), "src".to_string()],
+        };
+        let summary = context.summarize();
+        assert!(summary.contains("cwd=/repo"));
+        assert!(summary.contains("query_root=/repo/src"));
+        assert!(summary.contains("git_repo=true"));
     }
 }

@@ -26,6 +26,7 @@ pub mod oracle;
 pub mod registry;
 pub mod review;
 pub mod tavily;
+pub(crate) mod timeouts;
 pub mod tool_loop;
 
 pub use analyze::{AnalysisMode, AnalysisResult, AnalyzeAgent};

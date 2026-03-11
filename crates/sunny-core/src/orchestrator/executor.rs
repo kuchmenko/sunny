@@ -83,49 +83,68 @@ impl<'a> PlanExecutor<'a> {
             });
         }
 
+        plan.validate_dependencies()?;
+
         let request_id = parse_request_id(&plan.request_id);
         let mut cancelled = false;
+        let mut steps_executed = 0usize;
+        let mut completed_steps: Vec<String> = Vec::new();
 
-        for idx in 0..plan.steps.len() {
+        while steps_executed < plan.steps.len() {
             if cancel.is_cancelled() {
-                skip_remaining_steps(plan, idx)?;
+                skip_unprocessed_steps(plan)?;
                 cancelled = true;
                 break;
             }
 
-            if idx >= plan.policy.max_steps as usize {
-                skip_remaining_steps(plan, idx)?;
+            if steps_executed >= plan.policy.max_steps as usize {
+                skip_unprocessed_steps(plan)?;
                 warn!(
                     event = "orchestrator.plan.warning",
                     plan_id = %plan.plan_id,
                     warning_kind = "step_limit_exceeded",
-                    steps_executed = idx,
+                    steps_executed,
                     max_steps = plan.policy.max_steps
                 );
                 info!(
                     event = EVENT_PLAN_ERROR,
                     plan_id = %plan.plan_id,
                     error_kind = "step_limit_exceeded",
-                    steps_executed = idx,
+                    steps_executed,
                     max_steps = plan.policy.max_steps
                 );
 
                 return Err(PlanError::StepLimitExceeded {
-                    executed: idx,
+                    executed: steps_executed,
                     max_steps: plan.policy.max_steps,
                 }
                 .into());
             }
 
-            let step = &mut plan.steps[idx];
+            let Some(step_idx) = next_ready_step_idx(plan, &completed_steps) else {
+                if plan
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step.state, StepState::Planned | StepState::Ready))
+                {
+                    skip_unprocessed_steps(plan)?;
+                    return Err(OrchestratorError::PlanPolicyViolation {
+                        reason: "no executable step found; dependency graph is unsatisfied"
+                            .to_string(),
+                    });
+                }
+                break;
+            };
+
+            let step = &mut plan.steps[step_idx];
             step.transition(StepState::Ready)?;
             step.transition(StepState::Running)?;
 
+            let mut terminal_outcome: Option<StepOutcome> = None;
             loop {
                 if cancel.is_cancelled() {
                     step.transition(StepState::Cancelled)?;
                     step.set_outcome(StepOutcome::Cancelled);
-                    skip_remaining_steps(plan, idx + 1)?;
                     cancelled = true;
                     break;
                 }
@@ -166,30 +185,51 @@ impl<'a> PlanExecutor<'a> {
 
                 match step_outcome {
                     StepOutcome::Success { .. } => {
-                        step.set_outcome(step_outcome);
-                        step.transition(StepState::Completed)?;
+                        terminal_outcome = Some(step_outcome);
                         break;
                     }
                     StepOutcome::Error { .. } | StepOutcome::Timeout => {
                         if step.attempt <= plan.policy.max_retries {
                             continue;
                         }
-
-                        step.set_outcome(step_outcome);
-                        step.transition(StepState::Failed)?;
+                        terminal_outcome = Some(step_outcome);
                         break;
                     }
                     StepOutcome::Cancelled => {
-                        step.set_outcome(StepOutcome::Cancelled);
-                        step.transition(StepState::Cancelled)?;
-                        skip_remaining_steps(plan, idx + 1)?;
-                        cancelled = true;
+                        terminal_outcome = Some(StepOutcome::Cancelled);
                         break;
                     }
                 }
             }
 
-            if cancelled {
+            if let Some(step_outcome) = terminal_outcome {
+                match step_outcome {
+                    StepOutcome::Success { .. } => {
+                        step.set_outcome(step_outcome);
+                        step.transition(StepState::Completed)?;
+                        completed_steps.push(step.step_id.clone());
+                    }
+                    StepOutcome::Error { .. } | StepOutcome::Timeout => {
+                        step.set_outcome(step_outcome);
+                        step.transition(StepState::Failed)?;
+                        skip_unprocessed_steps(plan)?;
+                    }
+                    StepOutcome::Cancelled => {
+                        step.set_outcome(StepOutcome::Cancelled);
+                        if step.state != StepState::Cancelled {
+                            step.transition(StepState::Cancelled)?;
+                        }
+                        cancelled = true;
+                        skip_unprocessed_steps(plan)?;
+                    }
+                }
+            } else if cancelled {
+                skip_unprocessed_steps(plan)?;
+            }
+
+            steps_executed += 1;
+
+            if cancelled || plan.steps[step_idx].state == StepState::Failed {
                 break;
             }
         }
@@ -248,11 +288,19 @@ fn parse_request_id(raw: &str) -> RequestId {
     }
 }
 
-fn skip_remaining_steps(
-    plan: &mut ExecutionPlan,
-    from_idx: usize,
-) -> Result<(), OrchestratorError> {
-    for step in plan.steps.iter_mut().skip(from_idx) {
+fn next_ready_step_idx(plan: &ExecutionPlan, completed_steps: &[String]) -> Option<usize> {
+    plan.steps.iter().position(|step| {
+        matches!(step.state, StepState::Planned)
+            && step.is_ready_with(completed_steps)
+            && !step
+                .depends_on
+                .iter()
+                .any(|dependency| dependency == &step.step_id)
+    })
+}
+
+fn skip_unprocessed_steps(plan: &mut ExecutionPlan) -> Result<(), OrchestratorError> {
+    for step in &mut plan.steps {
         if matches!(step.state, StepState::Planned | StepState::Ready) {
             step.transition(StepState::Skipped)?;
             step.set_outcome(StepOutcome::Cancelled);
@@ -754,5 +802,60 @@ mod tests {
         assert_eq!(result.execution_depth, 1);
 
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_executor_respects_dependency_graph_readiness() {
+        let cancel = CancellationToken::new();
+        let mut registry = crate::orchestrator::AgentRegistry::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        let recorder = AgentHandle::spawn(
+            Arc::new(RecordingAgent { seen: seen.clone() }),
+            cancel.child_token(),
+        );
+        registry
+            .register(
+                "analyzer-graph".to_string(),
+                recorder,
+                vec![Capability("analyze".to_string())],
+            )
+            .expect("register recorder");
+
+        let orchestrator = crate::orchestrator::OrchestratorHandle::spawn_with_routing(
+            registry,
+            Box::new(crate::orchestrator::NameRouting),
+            cancel.child_token(),
+        );
+
+        let mut plan = make_plan("plan-deps", &uuid::Uuid::new_v4().to_string());
+        plan.add_step(PlanStep::new_with_metadata(
+            "step-2".to_string(),
+            "second".to_string(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+            HashMap::new(),
+            vec!["step-1".to_string()],
+        ))
+        .expect("add dependent step");
+        plan.add_step(PlanStep::new(
+            "step-1".to_string(),
+            "first".to_string(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+        ))
+        .expect("add root step");
+
+        let executor = PlanExecutor::new(&orchestrator);
+        let result = executor
+            .execute(&mut plan, cancel.child_token())
+            .await
+            .expect("plan executes");
+
+        assert_eq!(result.overall_outcome, PlanOutcome::Success);
+        assert_eq!(
+            *seen.lock().await,
+            vec!["step-1".to_string(), "step-2".to_string()]
+        );
     }
 }

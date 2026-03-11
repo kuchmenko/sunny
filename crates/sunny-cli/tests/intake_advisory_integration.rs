@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sunny_core::agent::{AgentMessage, Capability};
 use sunny_core::orchestrator::{
     HeuristicLoopPlanner, IntakeAdvisor, Intent, IntentKind, PlanHints, PlanPolicy, PlanningIntake,
-    PlanningIntakeInput, PlanningIntakeVerdict, RequestId,
+    PlanningIntakeInput, PlanningIntakeVerdict, RequestId, WorkspaceContext,
 };
 use sunny_mind::{LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage};
 
@@ -95,7 +95,7 @@ fn make_task(id: &str, content: &str) -> AgentMessage {
 }
 
 #[tokio::test]
-async fn test_intake_advisory_pipeline_routes_to_advise() {
+async fn test_intake_advisory_pipeline_rebalances_advise_for_ambiguous_query() {
     let call_count = Arc::new(AtomicUsize::new(0));
     let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
         response: Ok(make_llm_response(
@@ -112,6 +112,7 @@ async fn test_intake_advisory_pipeline_routes_to_advise() {
             task: make_task("task-1", "help me choose next steps"),
             request_id: RequestId::new(),
             llm_enabled: true,
+            workspace_context: WorkspaceContext::default(),
         })
         .await;
 
@@ -130,10 +131,16 @@ async fn test_intake_advisory_pipeline_routes_to_advise() {
         )
         .expect("plan should build");
 
-    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps.len(), 4);
     assert_eq!(
-        plan.steps[0].required_capability,
-        Some(Capability("advise".to_string()))
+        plan.steps
+            .iter()
+            .find(|step| {
+                step.metadata.get("_sunny.stage").map(String::as_str) == Some("plan_finalize")
+            })
+            .expect("finalize step")
+            .required_capability,
+        Some(Capability("query".to_string()))
     );
     assert_eq!(call_count.load(Ordering::SeqCst), 1);
 }
@@ -154,6 +161,7 @@ async fn test_intake_advisory_error_fallback() {
             task: make_task("task-2", "analyze this change"),
             request_id: RequestId::new(),
             llm_enabled: true,
+            workspace_context: WorkspaceContext::default(),
         })
         .await;
 
@@ -188,6 +196,7 @@ async fn test_intake_advisory_skipped_when_llm_disabled() {
             task: make_task("task-3", "what should happen"),
             request_id: RequestId::new(),
             llm_enabled: false,
+            workspace_context: WorkspaceContext::default(),
         })
         .await;
 
@@ -213,9 +222,15 @@ async fn test_planner_uses_classifier_when_no_intake_hints() {
         .build_plan(intent, task, RequestId::new(), None)
         .expect("plan should build without hints");
 
-    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps.len(), 2);
     assert_eq!(
-        plan.steps[0].required_capability,
+        plan.steps
+            .iter()
+            .find(|step| {
+                step.metadata.get("_sunny.stage").map(String::as_str) == Some("plan_finalize")
+            })
+            .expect("finalize step")
+            .required_capability,
         Some(Capability("query".to_string()))
     );
 }
