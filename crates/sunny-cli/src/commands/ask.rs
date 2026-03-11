@@ -10,11 +10,12 @@ use tokio_util::sync::CancellationToken;
 use sunny_boys::build_boys_registry;
 use sunny_core::agent::{AgentMessage, AgentResponse, Capability};
 use sunny_core::orchestrator::{
-    HeuristicLoopPlanner, IntentClassifier, IntentKind, InteractiveOrchestrator, OrchestratorError,
-    OrchestratorHandle, PlanPolicy, PlanningIntake, RequestId,
+    HeuristicLoopPlanner, IntakeAdvisor, IntentClassifier, IntentKind, InteractiveOrchestrator,
+    OrchestratorError, OrchestratorHandle, PlanPolicy, PlanningIntake, RequestId,
 };
-use sunny_mind::{KimiProvider, LlmProvider};
+use sunny_mind::{KimiProvider, LlmProvider, OllamaProvider};
 
+use crate::commands::intake_advisor::LlmIntakeAdvisor;
 use crate::output::{
     format_prompt_json, format_prompt_pretty, format_prompt_text, PromptIssue, PromptOutput,
 };
@@ -518,8 +519,29 @@ async fn execute_ask_internal(
         },
         llm_enabled,
     );
+    let make_intake_advisor = |ollama| -> Arc<dyn IntakeAdvisor> {
+        let provider: Arc<dyn LlmProvider> = Arc::new(ollama);
+        Arc::new(LlmIntakeAdvisor::new(provider))
+    };
+    let intake_advisor: Option<Arc<dyn IntakeAdvisor>> = if llm_enabled {
+        match OllamaProvider::from_env() {
+            Ok(ollama) => {
+                tracing::info!(
+                    model = ollama.model_id(),
+                    "Ollama intake provider initialized"
+                );
+                Some(make_intake_advisor(ollama))
+            }
+            Err(e) => {
+                tracing::warn!("Ollama intake not available: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let interactive =
-        InteractiveOrchestrator::new(&orchestrator, planner, PlanningIntake::new(None));
+        InteractiveOrchestrator::new(&orchestrator, planner, PlanningIntake::new(intake_advisor));
 
     let dispatch_result = interactive
         .execute(intent, task_msg, cancel.child_token(), request_id)

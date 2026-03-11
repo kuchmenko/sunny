@@ -16,8 +16,8 @@ tracing = "0.1" # dep: structured logging
 tracing-subscriber = "0.3" # dep: logging output for CLI
 dotenvy = "0.15" # dep: load .env variables for provider configuration
 thiserror = "1" # dep: error handling for CLI commands
+async-trait = "0.1" # dep: IntakeAdvisor trait impl
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] } # dep: async test runtime
-async-trait = "0.1" # dep: impl LlmProvider for mock in integration tests
 tempfile = "3" # dep: isolated fixture directories for integration tests
