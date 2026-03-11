@@ -11,7 +11,7 @@ const DEFAULT_KIMI_API_MODEL: &str = "kimi-k2.5";
 const DEFAULT_KIMI_CODING_BASE_URL: &str = "https://api.kimi.com/coding/v1";
 const DEFAULT_KIMI_CODING_MODEL: &str = "kimi-for-coding";
 const DEFAULT_KIMI_CODING_USER_AGENT: &str = "kimi-cli/1.0";
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KimiAuthMode {
@@ -136,13 +136,67 @@ impl KimiProvider {
     pub fn auth_mode(&self) -> &'static str {
         self.auth_mode.as_str()
     }
+
+    /// Parse the HTTP response into LlmResponse
+    async fn parse_response(&self, response: reqwest::Response) -> Result<LlmResponse, LlmError> {
+        let body: KimiChatResponse =
+            response
+                .json()
+                .await
+                .map_err(|err| LlmError::InvalidResponse {
+                    message: err.to_string(),
+                })?;
+
+        let first_choice = body
+            .choices
+            .first()
+            .ok_or_else(|| LlmError::InvalidResponse {
+                message: "missing choices[0] in provider response".to_string(),
+            })?;
+
+        let content = if !first_choice.message.content.trim().is_empty() {
+            first_choice.message.content.clone()
+        } else {
+            first_choice
+                .message
+                .reasoning_content
+                .clone()
+                .unwrap_or_default()
+        };
+
+        let tool_calls = first_choice
+            .message
+            .tool_calls
+            .clone()
+            .map(|calls| {
+                calls
+                    .into_iter()
+                    .map(map_kimi_tool_call)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+
+        Ok(LlmResponse {
+            content,
+            usage: TokenUsage {
+                input_tokens: body.usage.prompt_tokens,
+                output_tokens: body.usage.completion_tokens,
+                total_tokens: body.usage.total_tokens,
+            },
+            finish_reason: first_choice.finish_reason.clone(),
+            provider_id: ProviderId(self.provider_id().to_string()),
+            model_id: ModelId(self.model.clone()),
+            tool_calls,
+            reasoning_content: first_choice.message.reasoning_content.clone(),
+        })
+    }
 }
 
 /// Wire format for a single message in an outbound Kimi chat request.
 ///
 /// Maps our domain [`crate::ChatMessage`] to the OpenAI-compatible message schema.
 /// Kimi uses the same wire format as OpenAI; other providers will implement their own mapping.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(untagged)]
 enum KimiOutboundMessage {
     /// user / system / plain assistant (no tool calls) messages.
@@ -164,14 +218,14 @@ enum KimiOutboundMessage {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct KimiRequestToolCall {
     id: String,
     r#type: &'static str,
     function: KimiRequestToolCallFunction,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct KimiRequestToolCallFunction {
     name: String,
     arguments: String,
@@ -225,7 +279,7 @@ fn map_to_kimi_message(msg: crate::ChatMessage) -> Result<KimiOutboundMessage, L
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct KimiChatRequest {
     model: String,
     messages: Vec<KimiOutboundMessage>,
@@ -239,20 +293,20 @@ struct KimiChatRequest {
     tool_choice: Option<KimiToolChoice>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct KimiToolDefinition {
     r#type: &'static str,
     function: KimiToolFunction,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct KimiToolFunction {
     name: String,
     description: String,
     parameters: serde_json::Value,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(untagged)]
 enum KimiToolChoice {
     Mode(&'static str),
@@ -262,7 +316,7 @@ enum KimiToolChoice {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct KimiToolChoiceFunction {
     name: String,
 }
@@ -443,6 +497,36 @@ impl LlmProvider for KimiProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read error body>".to_string());
+
+            // Check if this is a temperature error for kimi-k2.5
+            if body.contains("invalid temperature") && body.contains("only 1 is allowed") {
+                eprintln!(
+                    "WARN: Kimi model {} requires temperature=1 (requested: {}), retrying with override",
+                    self.model,
+                    payload.temperature.unwrap_or(1.0)
+                );
+
+                // Retry with temperature=1
+                let mut retry_payload = payload.clone();
+                retry_payload.temperature = Some(1.0);
+
+                let retry_response = self
+                    .client
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .timeout(self.timeout)
+                    .json(&retry_payload)
+                    .send()
+                    .await
+                    .map_err(|err| LlmError::Transport {
+                        source: Box::new(err),
+                    })?;
+
+                if retry_response.status().is_success() {
+                    return self.parse_response(retry_response).await;
+                }
+            }
+
             return Err(LlmError::Transport {
                 source: Box::new(std::io::Error::other(format!(
                     "unexpected provider status: {} body: {}",

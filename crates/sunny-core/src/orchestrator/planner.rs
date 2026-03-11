@@ -178,7 +178,7 @@ impl HeuristicLoopPlanner {
             StepId::new().to_string(),
             content,
             Some(required_capability),
-            30_000,
+            60_000,
             with_task_id(metadata, task_id),
         ))?;
 

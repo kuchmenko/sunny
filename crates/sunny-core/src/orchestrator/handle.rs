@@ -128,14 +128,14 @@ impl OrchestratorHandle {
         };
 
         timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(60),
             self.tx.send(orchestrator_msg),
         )
         .await
         .map_err(|_| OrchestratorError::AgentUnresponsive)?
         .map_err(channel_closed_error)?;
 
-        timeout(std::time::Duration::from_secs(30), reply_rx)
+        timeout(std::time::Duration::from_secs(60), reply_rx)
             .await
             .map_err(|_| OrchestratorError::AgentUnresponsive)?
             .map_err(channel_closed_error)?
@@ -157,14 +157,14 @@ impl OrchestratorHandle {
         };
 
         timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(60),
             self.tx.send(orchestrator_msg),
         )
         .await
         .map_err(|_| OrchestratorError::AgentUnresponsive)?
         .map_err(channel_closed_error)?;
 
-        timeout(std::time::Duration::from_secs(30), reply_rx)
+        timeout(std::time::Duration::from_secs(60), reply_rx)
             .await
             .map_err(|_| OrchestratorError::AgentUnresponsive)?
             .map_err(channel_closed_error)?

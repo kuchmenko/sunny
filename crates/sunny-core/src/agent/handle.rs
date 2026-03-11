@@ -66,12 +66,12 @@ impl AgentHandle {
             timestamp: Instant::now(),
         };
 
-        timeout(std::time::Duration::from_secs(30), self.tx.send(actor_msg))
+        timeout(std::time::Duration::from_secs(60), self.tx.send(actor_msg))
             .await
             .map_err(|_| AgentError::Timeout)?
             .map_err(channel_closed_error)?;
 
-        timeout(std::time::Duration::from_secs(30), reply_rx)
+        timeout(std::time::Duration::from_secs(60), reply_rx)
             .await
             .map_err(|_| AgentError::Timeout)?
             .map_err(channel_closed_error)?
@@ -643,7 +643,7 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(30) + Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(60) + Duration::from_millis(1)).await;
 
         let result = send_task
             .await

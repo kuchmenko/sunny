@@ -7,7 +7,7 @@ use sunny_core::agent::{
 };
 use sunny_mind::{ChatMessage, ChatRole, LlmProvider, LlmRequest};
 
-const PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
+const PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct OracleAgent {
     provider: Option<Arc<dyn LlmProvider>>,
@@ -51,7 +51,7 @@ impl OracleAgent {
                     reasoning_content: None,
                 },
             ],
-            max_tokens: Some(4096),
+            max_tokens: Some(32000),
             temperature: Some(0.7),
             tools: None,
             tool_choice: None,
@@ -229,7 +229,7 @@ mod tests {
         assert!(request.tools.is_none());
         assert!(request.tool_choice.is_none());
         assert_eq!(request.temperature, Some(0.7));
-        assert_eq!(request.max_tokens, Some(4096));
+        assert_eq!(request.max_tokens, Some(32000));
 
         match response {
             AgentResponse::Success { content, .. } => {
