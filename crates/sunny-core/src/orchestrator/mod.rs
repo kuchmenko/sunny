@@ -1,4 +1,5 @@
 pub mod classifier;
+pub mod completion_gate;
 pub mod context;
 pub mod error;
 pub mod events;
@@ -17,6 +18,7 @@ pub mod supervision;
 pub mod telemetry;
 
 pub use classifier::IntentClassifier;
+pub use completion_gate::{evaluate_completion, CompletionGateResult};
 pub use context::{PlanId, RequestId, StepId};
 pub use error::{OrchestratorError, PlanError, RegistryError};
 pub use events::{
@@ -34,7 +36,7 @@ pub use intake::{
 };
 pub use intent::{Intent, IntentKind, PlanPolicy};
 pub use interactive::InteractiveOrchestrator;
-pub use plan::{ExecutionPlan, PlanStep, StepOutcome, StepState};
+pub use plan::{ExecutionPlan, PlanStep, ResponseMode, StepOutcome, StepState};
 pub use planner::ExecutionProfile;
 pub use planner::HeuristicLoopPlanner;
 pub use prompt_spec::{

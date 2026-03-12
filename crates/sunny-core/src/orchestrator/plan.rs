@@ -194,6 +194,47 @@ pub struct ExecutionPlan {
     pub policy: PlanPolicy,
 }
 
+/// ResponseMode represents the mode used to generate a response in the orchestrator.
+/// It replaces string-based mode identifiers with a strongly-typed enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseMode {
+    /// Directly produce a response from the LLM with no fallback loops.
+    LlmDirect,
+    /// Fall back to a tool loop (fallback path) for the response generation.
+    ToolLoopFallback,
+    /// Compose a response using context information (non-fallback).
+    ContextComposed,
+    /// Fall back to using a template-driven response.
+    TemplateFallback,
+}
+
+impl ResponseMode {
+    /// Returns true if this mode represents a fallback path.
+    pub fn is_fallback(&self) -> bool {
+        matches!(
+            self,
+            ResponseMode::ToolLoopFallback | ResponseMode::TemplateFallback
+        )
+    }
+}
+
+impl From<&str> for ResponseMode {
+    fn from(s: &str) -> Self {
+        match s {
+            // LLM related direct modes
+            "LLM_ENRICHED" | "LLM_TOOL_LOOP" => Self::LlmDirect,
+            // Tool loop fallback modes
+            "TOOL_ONLY_FALLBACK" | "TOOL_LOOP_FALLBACK" => Self::ToolLoopFallback,
+            // Context composed (non-fallback)
+            "CONTEXT_COMPOSED" | "CONTEXT_COMPOSED_FALLBACK" => Self::ContextComposed,
+            // Template fallback path
+            "TEMPLATE_FALLBACK" => Self::TemplateFallback,
+            // Fallback to a reasonable default to avoid panics on unknown inputs
+            _ => Self::LlmDirect,
+        }
+    }
+}
+
 impl ExecutionPlan {
     /// Creates a new execution plan.
     pub fn new(plan_id: String, request_id: String, intent: Intent, policy: PlanPolicy) -> Self {
@@ -280,6 +321,41 @@ mod tests {
         // Running → Completed
         assert!(step.transition(StepState::Completed).is_ok());
         assert_eq!(step.state, StepState::Completed);
+    }
+
+    #[test]
+    fn test_from_str_mapping() {
+        // Basic mappings
+        assert_eq!(ResponseMode::from("LLM_ENRICHED"), ResponseMode::LlmDirect);
+        assert_eq!(ResponseMode::from("LLM_TOOL_LOOP"), ResponseMode::LlmDirect);
+        assert_eq!(
+            ResponseMode::from("TOOL_ONLY_FALLBACK"),
+            ResponseMode::ToolLoopFallback
+        );
+        assert_eq!(
+            ResponseMode::from("TOOL_LOOP_FALLBACK"),
+            ResponseMode::ToolLoopFallback
+        );
+        assert_eq!(
+            ResponseMode::from("CONTEXT_COMPOSED"),
+            ResponseMode::ContextComposed
+        );
+        assert_eq!(
+            ResponseMode::from("CONTEXT_COMPOSED_FALLBACK"),
+            ResponseMode::ContextComposed
+        );
+        assert_eq!(
+            ResponseMode::from("TEMPLATE_FALLBACK"),
+            ResponseMode::TemplateFallback
+        );
+    }
+
+    #[test]
+    fn test_is_fallback_variants() {
+        assert!(!ResponseMode::LlmDirect.is_fallback());
+        assert!(!ResponseMode::ContextComposed.is_fallback());
+        assert!(ResponseMode::ToolLoopFallback.is_fallback());
+        assert!(ResponseMode::TemplateFallback.is_fallback());
     }
 
     #[test]

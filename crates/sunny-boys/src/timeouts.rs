@@ -57,6 +57,16 @@ fn duration_from_env_secs(key: &str, default_secs: u64) -> Duration {
     )
 }
 
+// Helper to read a usize-like environment variable with a sane default.
+// Mirrors duration_from_env_secs pattern but for usize values.
+pub(crate) fn usize_from_env(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

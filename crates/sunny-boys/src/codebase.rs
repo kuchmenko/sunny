@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use sunny_core::agent::{Agent, AgentContext, AgentError, AgentMessage, AgentResponse, Capability};
@@ -14,13 +15,48 @@ use tokio_util::sync::CancellationToken;
 use crate::timeouts::workspace_tool_loop_budget;
 use crate::tool_loop::{ToolCallError, ToolCallLoop};
 
-const MAX_CONTEXT_FILES: usize = 20;
-const MAX_FILE_BYTES: usize = 2048;
-const MAX_TOOL_ITERATIONS: usize = 10;
-const TOOL_LOOP_READ_MAX_BYTES: usize = 4096;
-const TOOL_LOOP_SCAN_MAX_FILES: usize = 400;
-const TOOL_LOOP_MAX_READ_CALLS: usize = 6;
-const FALLBACK_READ_CONCURRENCY: usize = 6;
+static MAX_CONTEXT_FILES: OnceLock<usize> = OnceLock::new();
+static MAX_FILE_BYTES: OnceLock<usize> = OnceLock::new();
+static MAX_TOOL_ITERATIONS: OnceLock<usize> = OnceLock::new();
+static TOOL_LOOP_READ_MAX_BYTES: OnceLock<usize> = OnceLock::new();
+static TOOL_LOOP_SCAN_MAX_FILES: OnceLock<usize> = OnceLock::new();
+static TOOL_LOOP_MAX_READ_CALLS: OnceLock<usize> = OnceLock::new();
+static FALLBACK_READ_CONCURRENCY: OnceLock<usize> = OnceLock::new();
+
+// Env-backed accessors for the above settings
+pub(crate) fn max_context_files() -> usize {
+    *MAX_CONTEXT_FILES
+        .get_or_init(|| crate::timeouts::usize_from_env("SUNNY_MAX_CONTEXT_FILES", 20))
+}
+
+pub(crate) fn max_file_bytes() -> usize {
+    *MAX_FILE_BYTES.get_or_init(|| crate::timeouts::usize_from_env("SUNNY_MAX_FILE_BYTES", 2048))
+}
+
+pub(crate) fn max_tool_iterations() -> usize {
+    *MAX_TOOL_ITERATIONS
+        .get_or_init(|| crate::timeouts::usize_from_env("SUNNY_MAX_TOOL_ITERATIONS", 10))
+}
+
+pub(crate) fn tool_loop_read_max_bytes() -> usize {
+    *TOOL_LOOP_READ_MAX_BYTES
+        .get_or_init(|| crate::timeouts::usize_from_env("SUNNY_TOOL_LOOP_READ_MAX_BYTES", 4096))
+}
+
+pub(crate) fn tool_loop_scan_max_files() -> usize {
+    *TOOL_LOOP_SCAN_MAX_FILES
+        .get_or_init(|| crate::timeouts::usize_from_env("SUNNY_TOOL_LOOP_SCAN_MAX_FILES", 400))
+}
+
+pub(crate) fn tool_loop_max_read_calls() -> usize {
+    *TOOL_LOOP_MAX_READ_CALLS
+        .get_or_init(|| crate::timeouts::usize_from_env("SUNNY_TOOL_LOOP_MAX_READ_CALLS", 6))
+}
+
+pub(crate) fn fallback_read_concurrency() -> usize {
+    *FALLBACK_READ_CONCURRENCY
+        .get_or_init(|| crate::timeouts::usize_from_env("SUNNY_FALLBACK_READ_CONCURRENCY", 6))
+}
 
 fn tool_uses_read_budget(name: &str) -> bool {
     matches!(name, "fs_read" | "text_grep")
@@ -56,6 +92,14 @@ struct TaskInput {
     query: String,
     request_id: String,
     task_id: String,
+    probe_paths: Vec<String>,
+    allow_broad_fallback: bool,
+}
+
+struct FallbackConfig {
+    fallback_reason: String,
+    probe_paths: Vec<String>,
+    allow_broad_fallback: bool,
 }
 
 impl WorkspaceReadAgent {
@@ -224,11 +268,29 @@ impl WorkspaceReadAgent {
                     .cloned()
                     .unwrap_or_else(|| "missing".to_string());
 
+                let probe_paths = metadata
+                    .get("_sunny.probe.paths")
+                    .map(|value| {
+                        value
+                            .split(';')
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                let allow_broad_fallback = metadata
+                    .get("_sunny.probe.allow_broad_fallback")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+
                 Ok(TaskInput {
                     root_path,
                     query,
                     request_id,
                     task_id: id,
+                    probe_paths,
+                    allow_broad_fallback,
                 })
             }
         }
@@ -310,7 +372,7 @@ impl WorkspaceReadAgent {
                 let files: Vec<String> = scan
                     .files
                     .iter()
-                    .take(TOOL_LOOP_SCAN_MAX_FILES)
+                    .take(tool_loop_scan_max_files())
                     .map(|f| f.path.to_string_lossy().to_string())
                     .collect();
                 serde_json::to_string(&files).map_err(|e| ToolError::ExecutionFailed {
@@ -332,7 +394,7 @@ impl WorkspaceReadAgent {
                 let path = Self::resolve_tool_path(root_path, path_str)?;
                 let content = reader.read(&path)?;
                 let mut text = content.content;
-                Self::safe_truncate(&mut text, TOOL_LOOP_READ_MAX_BYTES);
+                Self::safe_truncate(&mut text, tool_loop_read_max_bytes());
                 Ok(text)
             }
             "text_grep" => {
@@ -420,12 +482,23 @@ impl WorkspaceReadAgent {
         }
     }
 
+    fn resolve_probe_file_paths(root_path: &Path, probe_paths: &[String]) -> Vec<PathBuf> {
+        let mut resolved: Vec<PathBuf> = probe_paths
+            .iter()
+            .filter_map(|probe_path| Self::resolve_tool_path(root_path, probe_path).ok())
+            .filter(|path| path.is_file() && Self::is_fallback_candidate(path))
+            .collect();
+        resolved.sort();
+        resolved.dedup();
+        resolved
+    }
+
     async fn run_fallback(
         &self,
         root_path: &Path,
         request_id: &str,
         task_id: &str,
-        fallback_reason: &str,
+        config: &FallbackConfig,
         ctx: &AgentContext,
     ) -> Result<AgentResponse, AgentError> {
         tracing::info!(
@@ -433,36 +506,58 @@ impl WorkspaceReadAgent {
             request_id,
             task_id,
             path = %root_path.display(),
-            max_concurrency = FALLBACK_READ_CONCURRENCY,
+            max_concurrency = fallback_read_concurrency(),
             "WorkspaceReadAgent using fallback scanner+reader"
         );
 
-        let scanner = self.scanner.clone();
-        let root_path_buf = root_path.to_path_buf();
-        let scan = tokio::task::spawn_blocking(move || scanner.scan(&root_path_buf))
-            .await
-            .map_err(|join_err| AgentError::ExecutionFailed {
-                source: Box::new(std::io::Error::other(format!(
-                    "fallback scan task failed: {join_err}"
-                ))),
-            })?
-            .map_err(|e| AgentError::ExecutionFailed {
-                source: Box::new(e),
-            })?;
+        let requires_targeted =
+            config.fallback_reason != "no_provider" && !config.allow_broad_fallback;
+        let (selected, scanned_file_count, scanned_total_size_bytes) = if requires_targeted {
+            let resolved = Self::resolve_probe_file_paths(root_path, &config.probe_paths);
+            let total_size = resolved
+                .iter()
+                .filter_map(|path| std::fs::metadata(path).ok())
+                .map(|meta| meta.len())
+                .sum::<u64>();
+            (resolved.clone(), resolved.len(), total_size)
+        } else {
+            let scanner = self.scanner.clone();
+            let root_path_buf = root_path.to_path_buf();
+            let scan = tokio::task::spawn_blocking(move || scanner.scan(&root_path_buf))
+                .await
+                .map_err(|join_err| AgentError::ExecutionFailed {
+                    source: Box::new(std::io::Error::other(format!(
+                        "fallback scan task failed: {join_err}"
+                    ))),
+                })?
+                .map_err(|e| AgentError::ExecutionFailed {
+                    source: Box::new(e),
+                })?;
 
-        let mut scanned_files = scan.files;
-        scanned_files.sort_by(|a, b| {
-            Self::fallback_priority(&a.path)
-                .cmp(&Self::fallback_priority(&b.path))
-                .then_with(|| a.path.to_string_lossy().cmp(&b.path.to_string_lossy()))
-        });
+            let mut scanned_files = scan.files;
+            scanned_files.sort_by(|a, b| {
+                Self::fallback_priority(&a.path)
+                    .cmp(&Self::fallback_priority(&b.path))
+                    .then_with(|| a.path.to_string_lossy().cmp(&b.path.to_string_lossy()))
+            });
 
-        let selected = scanned_files
-            .iter()
-            .filter(|f| Self::is_fallback_candidate(&f.path))
-            .take(MAX_CONTEXT_FILES)
-            .map(|f| f.path.clone())
-            .collect::<Vec<_>>();
+            let selected = scanned_files
+                .iter()
+                .filter(|f| Self::is_fallback_candidate(&f.path))
+                .take(max_context_files())
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>();
+            let total_size = scanned_files.iter().map(|f| f.size_bytes).sum::<u64>();
+            (selected, scanned_files.len(), total_size)
+        };
+
+        let mut fallback_detail: Option<String> = None;
+        if requires_targeted && selected.is_empty() {
+            fallback_detail = Some(
+                "targeted fallback required after tool-loop failure, but no probe targets were resolved"
+                    .to_string(),
+            );
+        }
 
         let mut files: Vec<(usize, CodebaseFile)> = Vec::new();
         let mut skipped_file_count: usize = 0;
@@ -475,7 +570,7 @@ impl WorkspaceReadAgent {
                 return Err(Self::cancelled_error("fallback"));
             }
 
-            while idx < selected.len() && in_flight < FALLBACK_READ_CONCURRENCY {
+            while idx < selected.len() && in_flight < fallback_read_concurrency() {
                 let reader = self.reader.clone();
                 let root = root_path.to_path_buf();
                 let path = selected[idx].clone();
@@ -509,7 +604,7 @@ impl WorkspaceReadAgent {
                 match result {
                     Ok((current_idx, root, path, Ok(content))) => {
                         let mut text = content.content;
-                        let truncated = Self::safe_truncate(&mut text, MAX_FILE_BYTES);
+                        let truncated = Self::safe_truncate(&mut text, max_file_bytes());
                         let rel_path = Self::display_path(&root, &path);
                         files.push((
                             current_idx,
@@ -547,8 +642,8 @@ impl WorkspaceReadAgent {
         let files = files.into_iter().map(|(_, file)| file).collect::<Vec<_>>();
 
         let result = CodebaseResult {
-            file_count: scanned_files.len(),
-            total_size_bytes: scanned_files.iter().map(|f| f.size_bytes).sum(),
+            file_count: scanned_file_count,
+            total_size_bytes: scanned_total_size_bytes,
             files,
         };
 
@@ -558,12 +653,18 @@ impl WorkspaceReadAgent {
 
         let mut metadata = HashMap::new();
         metadata.insert("mode".to_string(), "TOOL_ONLY_FALLBACK".to_string());
-        metadata.insert("fallback_reason".to_string(), fallback_reason.to_string());
+        metadata.insert(
+            "fallback_reason".to_string(),
+            config.fallback_reason.clone(),
+        );
         metadata.insert("file_count".to_string(), result.file_count.to_string());
         metadata.insert(
             "skipped_file_count".to_string(),
             skipped_file_count.to_string(),
         );
+        if let Some(detail) = fallback_detail {
+            metadata.insert("fallback_detail".to_string(), detail);
+        }
 
         tracing::info!(
             agent = %ctx.agent_name,
@@ -596,6 +697,8 @@ impl Agent for WorkspaceReadAgent {
         let query = task_input.query;
         let request_id = task_input.request_id;
         let task_id = task_input.task_id;
+        let probe_paths = task_input.probe_paths;
+        let allow_broad_fallback = task_input.allow_broad_fallback;
 
         tracing::info!(
             agent = %ctx.agent_name,
@@ -609,7 +712,17 @@ impl Agent for WorkspaceReadAgent {
 
         let Some(provider) = &self.provider else {
             return self
-                .run_fallback(&root_path, &request_id, &task_id, "no_provider", ctx)
+                .run_fallback(
+                    &root_path,
+                    &request_id,
+                    &task_id,
+                    &FallbackConfig {
+                        fallback_reason: "no_provider".to_string(),
+                        probe_paths: probe_paths.clone(),
+                        allow_broad_fallback: true,
+                    },
+                    ctx,
+                )
                 .await;
         };
 
@@ -632,7 +745,7 @@ impl Agent for WorkspaceReadAgent {
                      Read at most {} files and stop when enough context is gathered. \
                      Provide a concise summary of structure and key modules.",
                     root_path.display(),
-                    TOOL_LOOP_MAX_READ_CALLS
+                    tool_loop_max_read_calls()
                 ),
                 tool_calls: None,
                 tool_call_id: None,
@@ -659,7 +772,7 @@ impl Agent for WorkspaceReadAgent {
         let loop_runner = ToolCallLoop::new(
             provider.clone(),
             ToolPolicy::default_ask(),
-            MAX_TOOL_ITERATIONS,
+            max_tool_iterations(),
             self.cancel.child_token(),
         );
 
@@ -674,12 +787,13 @@ impl Agent for WorkspaceReadAgent {
             move |_id: &str, name: &str, arguments: &str, _depth: usize| {
                 if tool_uses_read_budget(name) {
                     let count = read_calls_for_tool.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count > TOOL_LOOP_MAX_READ_CALLS {
+                    if count > tool_loop_max_read_calls() {
                         return Err(ToolError::ExecutionFailed {
-                        source: Box::new(std::io::Error::other(format!(
-                            "read-like tool call budget exceeded for {name}: {count} > {TOOL_LOOP_MAX_READ_CALLS}"
-                        ))),
-                    });
+                            source: Box::new(std::io::Error::other(format!(
+                                "read-like tool call budget exceeded for {name}: {count} > {}",
+                                tool_loop_max_read_calls()
+                            ))),
+                        });
                     }
                 }
 
@@ -719,7 +833,17 @@ impl Agent for WorkspaceReadAgent {
                         "WorkspaceReadAgent ToolCallLoop failed; falling back to scanner+reader"
                     );
                     return self
-                        .run_fallback(&root_path, &request_id, &task_id, "tool_loop_error", ctx)
+                        .run_fallback(
+                            &root_path,
+                            &request_id,
+                            &task_id,
+                            &FallbackConfig {
+                                fallback_reason: "tool_loop_error".to_string(),
+                                probe_paths: probe_paths.clone(),
+                                allow_broad_fallback,
+                            },
+                            ctx,
+                        )
                         .await;
                 }
                 Err(_) => {
@@ -733,7 +857,17 @@ impl Agent for WorkspaceReadAgent {
                         "WorkspaceReadAgent ToolCallLoop timed out; falling back to scanner+reader"
                     );
                     return self
-                        .run_fallback(&root_path, &request_id, &task_id, "tool_loop_timeout", ctx)
+                        .run_fallback(
+                            &root_path,
+                            &request_id,
+                            &task_id,
+                            &FallbackConfig {
+                                fallback_reason: "tool_loop_timeout".to_string(),
+                                probe_paths: probe_paths.clone(),
+                                allow_broad_fallback,
+                            },
+                            ctx,
+                        )
                         .await;
                 }
             };
@@ -786,7 +920,7 @@ mod tests {
     };
 
     use super::{
-        tool_uses_read_budget, CodebaseResult, WorkspaceReadAgent, TOOL_LOOP_MAX_READ_CALLS,
+        tool_loop_max_read_calls, tool_uses_read_budget, CodebaseResult, WorkspaceReadAgent,
     };
 
     fn mk_ctx() -> AgentContext {
@@ -1187,7 +1321,10 @@ mod tests {
 
         let requests = seen.lock().await;
         let system_prompt = &requests[0].messages[0].content;
-        assert!(system_prompt.contains(&format!("Read at most {} files", TOOL_LOOP_MAX_READ_CALLS)));
+        assert!(system_prompt.contains(&format!(
+            "Read at most {} files",
+            tool_loop_max_read_calls()
+        )));
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
@@ -1225,7 +1362,7 @@ mod tests {
                 });
             }
 
-            let tool_calls = (0..=TOOL_LOOP_MAX_READ_CALLS)
+            let tool_calls = (0..=tool_loop_max_read_calls())
                 .map(|idx| ToolCall {
                     id: format!("call-{idx}"),
                     name: "text_grep".to_string(),
@@ -1305,7 +1442,10 @@ mod tests {
             metadata.get("fallback_reason").map(String::as_str),
             Some("tool_loop_error")
         );
-        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files.len(), 0);
+        assert!(metadata
+            .get("fallback_detail")
+            .is_some_and(|value| value.contains("targeted fallback required")));
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
