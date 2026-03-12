@@ -11,7 +11,7 @@ use sunny_boys::build_boys_registry;
 use sunny_core::agent::{AgentMessage, AgentResponse, Capability};
 use sunny_core::orchestrator::{
     HeuristicLoopPlanner, IntakeAdvisor, IntentClassifier, IntentKind, InteractiveOrchestrator,
-    OrchestratorError, OrchestratorHandle, PlanPolicy, PlanningIntake, RequestId,
+    OrchestratorError, OrchestratorHandle, PlanPolicy, PlanningIntake, RequestId, ResponseMode,
 };
 use sunny_mind::{KimiProvider, LlmProvider, OllamaProvider};
 
@@ -210,7 +210,10 @@ fn map_orchestrator_error(err: &OrchestratorError) -> PromptIssue {
 fn warnings_from_metadata(metadata: &HashMap<String, String>) -> Vec<PromptIssue> {
     let mut warnings = Vec::new();
 
-    if metadata.get("mode").map(String::as_str) == Some("TOOL_ONLY_FALLBACK") {
+    if metadata
+        .get("mode")
+        .is_some_and(|mode| ResponseMode::from(mode.as_str()) == ResponseMode::ToolLoopFallback)
+    {
         let reason = metadata
             .get("fallback_reason")
             .cloned()
@@ -996,7 +999,7 @@ mod tests {
             .await
             .expect("analyze should keep working");
         assert!(
-            output.contains("TOOL_ONLY_FALLBACK"),
+            output.contains(ResponseMode::ToolLoopFallback.as_str()),
             "expected analyze output marker, got: {output}"
         );
 
@@ -1246,7 +1249,10 @@ mod tests {
     #[test]
     fn test_warnings_from_metadata_for_fallback_and_skips() {
         let mut metadata = HashMap::new();
-        metadata.insert("mode".to_string(), "TOOL_ONLY_FALLBACK".to_string());
+        metadata.insert(
+            "mode".to_string(),
+            ResponseMode::ToolLoopFallback.to_string(),
+        );
         metadata.insert(
             "fallback_reason".to_string(),
             "tool_loop_timeout".to_string(),

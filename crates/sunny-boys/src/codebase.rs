@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use sunny_core::agent::{Agent, AgentContext, AgentError, AgentMessage, AgentResponse, Capability};
+use sunny_core::orchestrator::ResponseMode;
 use sunny_core::tool::{FileReader, FileScanner, TextGrep, ToolError, ToolPolicy};
 use sunny_mind::{
     ChatMessage, ChatRole, LlmProvider, LlmRequest, ToolCall, ToolChoice, ToolDefinition,
@@ -96,8 +97,29 @@ struct TaskInput {
     allow_broad_fallback: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackReason {
+    NoProvider,
+    ToolLoopError,
+    ToolLoopTimeout,
+}
+
+impl FallbackReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoProvider => "no_provider",
+            Self::ToolLoopError => "tool_loop_error",
+            Self::ToolLoopTimeout => "tool_loop_timeout",
+        }
+    }
+
+    const fn requires_targeted(self) -> bool {
+        !matches!(self, Self::NoProvider)
+    }
+}
+
 struct FallbackConfig {
-    fallback_reason: String,
+    fallback_reason: FallbackReason,
     probe_paths: Vec<String>,
     allow_broad_fallback: bool,
 }
@@ -524,7 +546,7 @@ impl WorkspaceReadAgent {
         );
 
         let requires_targeted =
-            config.fallback_reason != "no_provider" && !config.allow_broad_fallback;
+            config.fallback_reason.requires_targeted() && !config.allow_broad_fallback;
         let (selected, scanned_file_count, scanned_total_size_bytes) = if requires_targeted {
             let resolved = Self::resolve_probe_file_paths(root_path, &config.probe_paths);
             let total_size = resolved
@@ -665,10 +687,13 @@ impl WorkspaceReadAgent {
         })?;
 
         let mut metadata = HashMap::new();
-        metadata.insert("mode".to_string(), "TOOL_ONLY_FALLBACK".to_string());
+        metadata.insert(
+            "mode".to_string(),
+            ResponseMode::ToolLoopFallback.to_string(),
+        );
         metadata.insert(
             "fallback_reason".to_string(),
-            config.fallback_reason.clone(),
+            config.fallback_reason.as_str().to_string(),
         );
         metadata.insert("file_count".to_string(), result.file_count.to_string());
         metadata.insert(
@@ -730,7 +755,7 @@ impl Agent for WorkspaceReadAgent {
                     &request_id,
                     &task_id,
                     &FallbackConfig {
-                        fallback_reason: "no_provider".to_string(),
+                        fallback_reason: FallbackReason::NoProvider,
                         probe_paths: probe_paths.clone(),
                         allow_broad_fallback: true,
                     },
@@ -844,7 +869,7 @@ impl Agent for WorkspaceReadAgent {
                             &request_id,
                             &task_id,
                             &FallbackConfig {
-                                fallback_reason: "tool_loop_error".to_string(),
+                                fallback_reason: FallbackReason::ToolLoopError,
                                 probe_paths: probe_paths.clone(),
                                 allow_broad_fallback,
                             },
@@ -868,7 +893,7 @@ impl Agent for WorkspaceReadAgent {
                             &request_id,
                             &task_id,
                             &FallbackConfig {
-                                fallback_reason: "tool_loop_timeout".to_string(),
+                                fallback_reason: FallbackReason::ToolLoopTimeout,
                                 probe_paths: probe_paths.clone(),
                                 allow_broad_fallback,
                             },
@@ -914,6 +939,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use sunny_core::orchestrator::ResponseMode;
     use sunny_core::tool::{FileReader, FileScanner, ToolError};
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
@@ -1466,7 +1492,7 @@ mod tests {
         let (result, metadata) = parse_success(response);
         assert_eq!(
             metadata.get("mode").map(String::as_str),
-            Some("TOOL_ONLY_FALLBACK")
+            Some(ResponseMode::ToolLoopFallback.as_str())
         );
         assert_eq!(
             metadata.get("fallback_reason").map(String::as_str),

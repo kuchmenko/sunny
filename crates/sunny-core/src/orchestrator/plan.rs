@@ -209,12 +209,27 @@ pub enum ResponseMode {
 }
 
 impl ResponseMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LlmDirect => "LLM_DIRECT",
+            Self::ToolLoopFallback => "TOOL_ONLY_FALLBACK",
+            Self::ContextComposed => "CONTEXT_COMPOSED",
+            Self::TemplateFallback => "TEMPLATE_FALLBACK",
+        }
+    }
+
     /// Returns true if this mode represents a fallback path.
     pub fn is_fallback(&self) -> bool {
         matches!(
             self,
             ResponseMode::ToolLoopFallback | ResponseMode::TemplateFallback
         )
+    }
+}
+
+impl std::fmt::Display for ResponseMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str((*self).as_str())
     }
 }
 
@@ -356,6 +371,23 @@ mod tests {
         assert!(!ResponseMode::ContextComposed.is_fallback());
         assert!(ResponseMode::ToolLoopFallback.is_fallback());
         assert!(ResponseMode::TemplateFallback.is_fallback());
+    }
+
+    #[test]
+    fn test_display_uses_stable_metadata_strings() {
+        assert_eq!(ResponseMode::LlmDirect.to_string(), "LLM_DIRECT");
+        assert_eq!(
+            ResponseMode::ToolLoopFallback.to_string(),
+            "TOOL_ONLY_FALLBACK"
+        );
+        assert_eq!(
+            ResponseMode::ContextComposed.to_string(),
+            "CONTEXT_COMPOSED"
+        );
+        assert_eq!(
+            ResponseMode::TemplateFallback.to_string(),
+            "TEMPLATE_FALLBACK"
+        );
     }
 
     #[test]
