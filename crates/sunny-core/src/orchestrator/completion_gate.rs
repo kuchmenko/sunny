@@ -215,4 +215,13 @@ mod tests {
 
         assert_eq!(count_citations(response, &extensions), 2);
     }
+
+    #[test]
+    fn test_citations_multilanguage() {
+        let extensions = WorkspaceExtensions::common_extensions();
+        let response =
+            "See src/main.py, web/app.js; services/server.go: (backend/App.java) for parity.";
+
+        assert_eq!(count_citations(response, &extensions), 4);
+    }
 }

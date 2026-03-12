@@ -237,7 +237,7 @@ impl From<&str> for ResponseMode {
     fn from(s: &str) -> Self {
         match s {
             // LLM related direct modes
-            "LLM_ENRICHED" | "LLM_TOOL_LOOP" => Self::LlmDirect,
+            "LLM_DIRECT" | "LLM_ENRICHED" | "LLM_TOOL_LOOP" => Self::LlmDirect,
             // Tool loop fallback modes
             "TOOL_ONLY_FALLBACK" | "TOOL_LOOP_FALLBACK" => Self::ToolLoopFallback,
             // Context composed (non-fallback)
@@ -388,6 +388,24 @@ mod tests {
             ResponseMode::TemplateFallback.to_string(),
             "TEMPLATE_FALLBACK"
         );
+    }
+
+    #[test]
+    fn test_response_mode_enum_coverage() {
+        let cases = [
+            ("LLM_DIRECT", ResponseMode::LlmDirect),
+            ("LLM_ENRICHED", ResponseMode::LlmDirect),
+            ("LLM_TOOL_LOOP", ResponseMode::LlmDirect),
+            ("TOOL_ONLY_FALLBACK", ResponseMode::ToolLoopFallback),
+            ("TOOL_LOOP_FALLBACK", ResponseMode::ToolLoopFallback),
+            ("CONTEXT_COMPOSED", ResponseMode::ContextComposed),
+            ("CONTEXT_COMPOSED_FALLBACK", ResponseMode::ContextComposed),
+            ("TEMPLATE_FALLBACK", ResponseMode::TemplateFallback),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(ResponseMode::from(input), expected, "mode {input}");
+        }
     }
 
     #[test]
