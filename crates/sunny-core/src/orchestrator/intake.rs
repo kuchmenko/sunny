@@ -277,7 +277,7 @@ fn normalize_scan_root(root: &Path) -> PathBuf {
     }
 }
 
-fn list_top_entries(root: &Path) -> Vec<String> {
+pub fn list_top_entries(root: &Path) -> Vec<String> {
     let mut names = match fs::read_dir(root) {
         Ok(entries) => entries
             .filter_map(Result::ok)
@@ -287,7 +287,7 @@ fn list_top_entries(root: &Path) -> Vec<String> {
     };
 
     names.sort();
-    names.truncate(8);
+    names.truncate(20);
     names
 }
 
@@ -563,5 +563,62 @@ mod tests {
         assert!(registry.is_allowed("query"));
         assert!(registry.is_allowed("delegate"));
         assert!(!registry.is_allowed("analyze"));
+    }
+
+    #[test]
+    fn test_list_top_entries_includes_crates_directory() {
+        let temp = std::env::temp_dir().join(format!(
+            "sunny_intake_crates_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+
+        // Create 12 entries so that 'crates' (9th alphabetically) is included
+        // with truncate(20) but would have been excluded with truncate(8).
+        let dirs = [
+            ".git", "assets", "benches", "build", "ci", "config", "contrib", "crates", "docs",
+            "examples", "scripts", "src",
+        ];
+        for name in &dirs {
+            fs::create_dir_all(temp.join(name)).expect("create subdir");
+        }
+
+        let entries = list_top_entries(&temp);
+        assert!(
+            entries.contains(&"crates".to_string()),
+            "expected 'crates' in entries: {entries:?}"
+        );
+        assert!(
+            entries.len() > 8,
+            "expected more than 8 entries: {entries:?}"
+        );
+
+        fs::remove_dir_all(&temp).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn test_list_top_entries_sorts_alphabetically() {
+        let temp = std::env::temp_dir().join(format!(
+            "sunny_intake_sort_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("create temp dir");
+
+        for name in ["zebra", "alpha", "middle"] {
+            fs::create_dir_all(temp.join(name)).expect("create subdir");
+        }
+
+        let entries = list_top_entries(&temp);
+        assert_eq!(entries, vec!["alpha", "middle", "zebra"]);
+
+        fs::remove_dir_all(&temp).expect("cleanup temp dir");
     }
 }

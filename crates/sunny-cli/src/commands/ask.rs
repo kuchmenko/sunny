@@ -513,6 +513,21 @@ async fn execute_ask_internal(
     metadata.insert("_sunny.query".to_string(), args.input.clone());
     metadata.insert("_sunny.request_id".to_string(), request_id_text.clone());
 
+    // Wire probe paths from workspace top-level entries so WorkspaceReadAgent
+    // can target its file scanning to relevant directories.
+    let top_entries = sunny_core::orchestrator::intake::list_top_entries(&query_root);
+    let source_dirs: Vec<&str> = top_entries
+        .iter()
+        .filter(|name| {
+            // Include directories that likely contain source code
+            !name.starts_with('.') && !name.contains('.')
+        })
+        .map(String::as_str)
+        .collect();
+    if !source_dirs.is_empty() {
+        metadata.insert("_sunny.probe.paths".to_string(), source_dirs.join(";"));
+    }
+
     let task_content = if required_capability.0 == "query" {
         query_root.to_string_lossy().to_string()
     } else {
@@ -1288,5 +1303,59 @@ mod tests {
     #[test]
     fn test_summarize_query_response_returns_none_for_non_json() {
         assert!(summarize_query_response("plain text response").is_none());
+    }
+
+    #[test]
+    fn test_probe_paths_metadata_contains_source_dirs() {
+        let temp = mk_temp_dir("probe_paths");
+
+        // Create a mix of dotfiles, extension-files, and plain directories
+        fs::create_dir_all(temp.join(".git")).expect("mkdir .git");
+        fs::create_dir_all(temp.join("src")).expect("mkdir src");
+        fs::create_dir_all(temp.join("crates")).expect("mkdir crates");
+        fs::create_dir_all(temp.join("tests")).expect("mkdir tests");
+        fs::write(temp.join("Cargo.toml"), "[package]").expect("write Cargo.toml");
+        fs::write(temp.join("README.md"), "# readme").expect("write README.md");
+
+        let top_entries = sunny_core::orchestrator::intake::list_top_entries(&temp);
+        let source_dirs: Vec<&str> = top_entries
+            .iter()
+            .filter(|name| !name.starts_with('.') && !name.contains('.'))
+            .map(String::as_str)
+            .collect();
+
+        assert!(
+            source_dirs.contains(&"src"),
+            "expected 'src' in source_dirs: {source_dirs:?}"
+        );
+        assert!(
+            source_dirs.contains(&"crates"),
+            "expected 'crates' in source_dirs: {source_dirs:?}"
+        );
+        assert!(
+            source_dirs.contains(&"tests"),
+            "expected 'tests' in source_dirs: {source_dirs:?}"
+        );
+        // Dotfiles and extension files should be excluded
+        assert!(
+            !source_dirs.iter().any(|d| d.starts_with('.')),
+            "dotfiles should be excluded: {source_dirs:?}"
+        );
+        assert!(
+            !source_dirs.iter().any(|d| d.contains('.')),
+            "extension files should be excluded: {source_dirs:?}"
+        );
+
+        // Verify semicolon-separated format
+        let joined = source_dirs.join(";");
+        assert!(!joined.is_empty(), "probe paths should not be empty");
+        for segment in joined.split(';') {
+            assert!(
+                !segment.trim().is_empty(),
+                "no empty segments in probe paths"
+            );
+        }
+
+        fs::remove_dir_all(&temp).expect("cleanup");
     }
 }
