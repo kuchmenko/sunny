@@ -7,6 +7,7 @@ use crate::agent::{AgentMessage, AgentResponse};
 use super::{
     HeuristicLoopPlanner, Intent, OrchestratorError, OrchestratorHandle, PlanExecutor, PlanOutcome,
     PlanningIntake, PlanningIntakeInput, PlanningIntakeVerdict, RequestId, WorkspaceContext,
+    WorkspaceExtensions,
 };
 
 pub struct InteractiveOrchestrator<'a> {
@@ -43,6 +44,7 @@ impl<'a> InteractiveOrchestrator<'a> {
                 request_id,
                 llm_enabled: self.planner.llm_enabled(),
                 workspace_context: WorkspaceContext::default(),
+                workspace_extensions: WorkspaceExtensions::common_extensions(),
             })
             .await;
         let (hints, intake_verdict_label, intake_skip_reason) = match intake_verdict {

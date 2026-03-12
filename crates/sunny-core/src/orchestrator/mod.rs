@@ -4,6 +4,7 @@ pub mod context;
 pub mod error;
 pub mod events;
 pub mod executor;
+pub mod extensions;
 pub mod handle;
 pub mod intake;
 pub mod intent;
@@ -29,6 +30,7 @@ pub use events::{
     EVENT_TOOL_EXEC_START, OUTCOME_CANCELLED, OUTCOME_ERROR, OUTCOME_SUCCESS, OUTCOME_TIMEOUT,
 };
 pub use executor::{PlanExecutor, PlanOutcome, PlanResult};
+pub use extensions::WorkspaceExtensions;
 pub use handle::OrchestratorHandle;
 pub use intake::{
     ComplexityHint, IntakeAdvisor, IntakeAdvisorError, PlanHints, PlanningIntake,

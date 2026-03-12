@@ -1,6 +1,7 @@
 use crate::agent::{AgentMessage, Capability};
 use crate::orchestrator::intent::Intent;
 use crate::orchestrator::RequestId;
+use crate::orchestrator::WorkspaceExtensions;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ pub struct PlanningIntakeInput {
     pub request_id: RequestId,
     pub llm_enabled: bool,
     pub workspace_context: WorkspaceContext,
+    pub workspace_extensions: WorkspaceExtensions,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -361,6 +363,7 @@ mod tests {
             request_id: RequestId::new(),
             llm_enabled: false,
             workspace_context: WorkspaceContext::default(),
+            workspace_extensions: WorkspaceExtensions::common_extensions(),
         }
     }
 
