@@ -1289,4 +1289,294 @@ mod tests {
 
         cancel.cancel();
     }
+
+    #[tokio::test]
+    async fn test_multistep_plan_evidence_reaches_final_step() {
+        let cancel = CancellationToken::new();
+        let mut registry = crate::orchestrator::AgentRegistry::new();
+        let received_by_step = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            "step-1".to_string(),
+            AgentResponse::Success {
+                content: "File A contains function foo()".to_string(),
+                metadata: HashMap::new(),
+            },
+        );
+        responses.insert(
+            "step-2".to_string(),
+            AgentResponse::Success {
+                content: "Found 5 usages of foo() in module bar".to_string(),
+                metadata: HashMap::new(),
+            },
+        );
+        responses.insert(
+            "step-3".to_string(),
+            AgentResponse::Success {
+                content: "analysis complete".to_string(),
+                metadata: HashMap::new(),
+            },
+        );
+
+        let recorder = AgentHandle::spawn(
+            Arc::new(ContentCapturingAgent {
+                responses,
+                received_by_step: received_by_step.clone(),
+            }),
+            cancel.child_token(),
+        );
+        registry
+            .register(
+                "analyzer-e2e".to_string(),
+                recorder,
+                vec![Capability("analyze".to_string())],
+            )
+            .expect("register agent");
+
+        let orchestrator = crate::orchestrator::OrchestratorHandle::spawn_with_routing(
+            registry,
+            Box::new(crate::orchestrator::NameRouting),
+            cancel.child_token(),
+        );
+
+        let mut plan = make_plan("plan-e2e-evidence", &uuid::Uuid::new_v4().to_string());
+        plan.add_step(PlanStep::new(
+            "step-1".to_string(),
+            "collect sources".to_string(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+        ))
+        .expect("add step 1");
+        plan.add_step(PlanStep::new(
+            "step-2".to_string(),
+            "explore usages".to_string(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+        ))
+        .expect("add step 2");
+        let original_action_3 = "synthesize findings".to_string();
+        plan.add_step(PlanStep::new_with_metadata(
+            "step-3".to_string(),
+            original_action_3.clone(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+            HashMap::new(),
+            vec!["step-1".to_string(), "step-2".to_string()],
+        ))
+        .expect("add step 3");
+
+        let executor = PlanExecutor::new(&orchestrator);
+        let result = executor
+            .execute(&mut plan, cancel.child_token())
+            .await
+            .expect("plan executes");
+
+        assert_eq!(result.overall_outcome, PlanOutcome::Success);
+        let received = received_by_step.lock().await;
+        let step3_content = received.get("step-3").expect("step-3 content captured");
+        assert!(
+            step3_content.contains("<gathered_evidence>"),
+            "evidence block missing"
+        );
+        assert!(
+            step3_content.contains("File A contains function foo()"),
+            "step-1 evidence missing"
+        );
+        assert!(
+            step3_content.contains("Found 5 usages of foo() in module bar"),
+            "step-2 evidence missing"
+        );
+        assert!(
+            step3_content.contains(&original_action_3),
+            "original action missing"
+        );
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_multistep_plan_partial_failure_evidence() {
+        let cancel = CancellationToken::new();
+        let mut registry = crate::orchestrator::AgentRegistry::new();
+        let received_by_step = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            "step-1".to_string(),
+            AgentResponse::Success {
+                content: "Found code patterns".to_string(),
+                metadata: HashMap::new(),
+            },
+        );
+        responses.insert(
+            "step-2".to_string(),
+            AgentResponse::Error {
+                code: "fail".to_string(),
+                message: "step 2 failed".to_string(),
+            },
+        );
+        responses.insert(
+            "step-3".to_string(),
+            AgentResponse::Success {
+                content: "done".to_string(),
+                metadata: HashMap::new(),
+            },
+        );
+
+        let recorder = AgentHandle::spawn(
+            Arc::new(ContentCapturingAgent {
+                responses,
+                received_by_step: received_by_step.clone(),
+            }),
+            cancel.child_token(),
+        );
+        registry
+            .register(
+                "analyzer-partial".to_string(),
+                recorder,
+                vec![Capability("analyze".to_string())],
+            )
+            .expect("register agent");
+
+        let orchestrator = crate::orchestrator::OrchestratorHandle::spawn_with_routing(
+            registry,
+            Box::new(crate::orchestrator::NameRouting),
+            cancel.child_token(),
+        );
+
+        let mut plan = make_plan("plan-partial-failure", &uuid::Uuid::new_v4().to_string());
+        plan.policy.max_retries = 0;
+        plan.add_step(PlanStep::new(
+            "step-1".to_string(),
+            "collect".to_string(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+        ))
+        .expect("add step 1");
+        plan.add_step(PlanStep::new(
+            "step-2".to_string(),
+            "explore".to_string(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+        ))
+        .expect("add step 2");
+        let original_action_3 = "synthesize".to_string();
+        plan.add_step(PlanStep::new_with_metadata(
+            "step-3".to_string(),
+            original_action_3.clone(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+            HashMap::new(),
+            vec!["step-1".to_string(), "step-2".to_string()],
+        ))
+        .expect("add step 3");
+
+        let executor = PlanExecutor::new(&orchestrator);
+        let result = executor
+            .execute(&mut plan, cancel.child_token())
+            .await
+            .expect("plan executes with failure");
+
+        // Step 2 fails → skip_unprocessed_steps runs → step 3 is Skipped before dispatch.
+        assert_eq!(result.overall_outcome, PlanOutcome::Failed);
+        assert_eq!(
+            plan.steps[0].state,
+            StepState::Completed,
+            "step 1 should complete"
+        );
+        assert_eq!(plan.steps[1].state, StepState::Failed, "step 2 should fail");
+        assert_eq!(
+            plan.steps[2].state,
+            StepState::Skipped,
+            "step 3 should be skipped"
+        );
+
+        // Verify compose_evidence_action for step 3 only includes step 1 evidence.
+        let composed =
+            compose_evidence_action(&original_action_3, &plan, &plan.steps[2].depends_on);
+        assert!(
+            composed.contains("Found code patterns"),
+            "step 1 evidence should be included"
+        );
+        assert!(
+            !composed.contains("step 2 failed"),
+            "failed step 2 evidence must not be included"
+        );
+        assert!(
+            composed.contains(&original_action_3),
+            "original action must be present"
+        );
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_single_step_plan_no_evidence_composition() {
+        let cancel = CancellationToken::new();
+        let mut registry = crate::orchestrator::AgentRegistry::new();
+        let received_by_step = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut responses = HashMap::new();
+        let original_action = "standalone analysis".to_string();
+        responses.insert(
+            "step-solo".to_string(),
+            AgentResponse::Success {
+                content: "done".to_string(),
+                metadata: HashMap::new(),
+            },
+        );
+
+        let recorder = AgentHandle::spawn(
+            Arc::new(ContentCapturingAgent {
+                responses,
+                received_by_step: received_by_step.clone(),
+            }),
+            cancel.child_token(),
+        );
+        registry
+            .register(
+                "analyzer-solo".to_string(),
+                recorder,
+                vec![Capability("analyze".to_string())],
+            )
+            .expect("register agent");
+
+        let orchestrator = crate::orchestrator::OrchestratorHandle::spawn_with_routing(
+            registry,
+            Box::new(crate::orchestrator::NameRouting),
+            cancel.child_token(),
+        );
+
+        let mut plan = make_plan("plan-solo", &uuid::Uuid::new_v4().to_string());
+        plan.add_step(PlanStep::new(
+            "step-solo".to_string(),
+            original_action.clone(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+        ))
+        .expect("add solo step");
+
+        let executor = PlanExecutor::new(&orchestrator);
+        let result = executor
+            .execute(&mut plan, cancel.child_token())
+            .await
+            .expect("single step plan executes");
+
+        assert_eq!(result.overall_outcome, PlanOutcome::Success);
+        let received = received_by_step.lock().await;
+        let content = received
+            .get("step-solo")
+            .expect("step-solo content captured");
+        assert_eq!(
+            content, &original_action,
+            "single step must receive original action unchanged"
+        );
+        assert!(
+            !content.contains("<gathered_evidence>"),
+            "no evidence blocks for steps without dependencies"
+        );
+
+        cancel.cancel();
+    }
 }
