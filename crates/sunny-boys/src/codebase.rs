@@ -819,12 +819,20 @@ impl Agent for WorkspaceReadAgent {
                 if tool_uses_read_budget(name) {
                     let count = read_calls_for_tool.fetch_add(1, Ordering::Relaxed) + 1;
                     if count > tool_loop_max_read_calls() {
-                        return Err(ToolError::ExecutionFailed {
-                            source: Box::new(std::io::Error::other(format!(
-                                "read-like tool call budget exceeded for {name}: {count} > {}",
-                                tool_loop_max_read_calls()
-                            ))),
-                        });
+                        tracing::info!(
+                            agent = "workspace-read",
+                            tool_name = %name,
+                            call_count = count,
+                            budget = tool_loop_max_read_calls(),
+                            event = "tool.read_budget.degraded",
+                            "read budget exceeded; returning degraded result"
+                        );
+                        return Ok(format!(
+                            "[READ BUDGET EXCEEDED] Tool {} call #{} skipped. Budget: {}.",
+                            name,
+                            count,
+                            tool_loop_max_read_calls()
+                        ));
                     }
                 }
 
@@ -1466,7 +1474,7 @@ mod tests {
         async fn chat(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
             if self.response_sent.swap(true, AtomicOrdering::SeqCst) {
                 return Ok(LlmResponse {
-                    content: "unused".to_string(),
+                    content: "{\"file_count\":0,\"total_size_bytes\":0,\"files\":[]}".to_string(),
                     usage: TokenUsage {
                         input_tokens: 0,
                         output_tokens: 0,
@@ -1552,18 +1560,17 @@ mod tests {
             .expect("agent response");
 
         let (result, metadata) = parse_success(response);
+        // Budget exhaustion now returns degraded success; tool loop completes normally.
         assert_eq!(
             metadata.get("mode").map(String::as_str),
-            Some(ResponseMode::ToolLoopFallback.as_str())
+            Some("LLM_TOOL_LOOP"),
+            "budget exhaustion should complete via tool loop, not trigger fallback"
         );
-        assert_eq!(
-            metadata.get("fallback_reason").map(String::as_str),
-            Some("tool_loop_error")
+        assert!(
+            !metadata.contains_key("fallback_reason"),
+            "fallback_reason should be absent when budget is handled gracefully"
         );
         assert_eq!(result.files.len(), 0);
-        assert!(metadata
-            .get("fallback_detail")
-            .is_some_and(|value| value.contains("targeted fallback required")));
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
