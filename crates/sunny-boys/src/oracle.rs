@@ -1,13 +1,10 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use sunny_core::agent::{
     Agent, AgentContext, AgentCost, AgentError, AgentMessage, AgentMetadata, AgentMode,
     AgentResponse, Capability,
 };
 use sunny_mind::{ChatMessage, ChatRole, LlmProvider, LlmRequest};
-
-const PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct OracleAgent {
     provider: Option<Arc<dyn LlmProvider>>,
@@ -26,11 +23,15 @@ impl OracleAgent {
         }
     }
 
-    fn build_system_prompt() -> &'static str {
-        "You are Oracle, a strategic advisor for high-stakes decisions.\
-         Reason step-by-step internally, then provide a concise recommendation.\
-         Explicitly cover trade-offs, key risks, and alternatives.\
-         Prioritize actionable recommendations with clear rationale and assumptions."
+    fn build_system_prompt(task_context: &str) -> String {
+        let context_hint: String = task_context.chars().take(200).collect();
+        format!(
+            "You are Oracle, a strategic advisor for high-stakes decisions. \
+             Reason step-by-step internally, then provide a concise recommendation. \
+             Explicitly cover trade-offs, key risks, and alternatives. \
+             Prioritize actionable recommendations with clear rationale and assumptions. \
+             Context: {context_hint}"
+        )
     }
 
     fn build_prompt(content: &str) -> LlmRequest {
@@ -38,7 +39,7 @@ impl OracleAgent {
             messages: vec![
                 ChatMessage {
                     role: ChatRole::System,
-                    content: Self::build_system_prompt().to_string(),
+                    content: Self::build_system_prompt(content),
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
@@ -100,13 +101,15 @@ impl Agent for OracleAgent {
 
         tracing::info!(agent = %ctx.agent_name, query_len = trimmed.len(), "OracleAgent started");
 
-        let response =
-            tokio::time::timeout(PROVIDER_TIMEOUT, provider.chat(Self::build_prompt(trimmed)))
-                .await
-                .map_err(|_| AgentError::Timeout)?
-                .map_err(|err| AgentError::ExecutionFailed {
-                    source: Box::new(err),
-                })?;
+        let response = tokio::time::timeout(
+            crate::timeouts::tool_provider_timeout(),
+            provider.chat(Self::build_prompt(trimmed)),
+        )
+        .await
+        .map_err(|_| AgentError::Timeout)?
+        .map_err(|err| AgentError::ExecutionFailed {
+            source: Box::new(err),
+        })?;
 
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("mode".to_string(), "SINGLE_SHOT".to_string());
@@ -282,9 +285,10 @@ mod tests {
 
     #[test]
     fn test_oracle_agent_system_prompt_structure() {
-        let prompt = OracleAgent::build_system_prompt();
+        let prompt = OracleAgent::build_system_prompt("test context");
         assert!(prompt.contains("strategic advisor"));
         assert!(prompt.contains("trade-offs"));
         assert!(prompt.contains("recommendations"));
+        assert!(prompt.contains("test context"));
     }
 }

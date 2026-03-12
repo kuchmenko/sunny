@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use sunny_core::agent::{Agent, AgentContext, AgentError, AgentMessage, AgentResponse, Capability};
 use sunny_mind::{ChatMessage, ChatRole, LlmProvider, LlmRequest};
@@ -9,28 +8,9 @@ pub struct CritiqueAgent {
     provider: Option<Arc<dyn LlmProvider>>,
 }
 
-const PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
-
 impl CritiqueAgent {
     pub fn new(provider: Option<Arc<dyn LlmProvider>>) -> Self {
         Self { provider }
-    }
-
-    fn build_critique_template(content: &str) -> String {
-        format!(
-            "CRITIQUE REPORT\n\
-             ===============\n\
-             Status: PENDING_CRITIQUE\n\
-             Input length: {} chars\n\n\
-             Sections:\n\
-             - Feasibility: [not yet analyzed]\n\
-             - Risks: [not yet analyzed]\n\
-             - Gaps: [not yet analyzed]\n\
-             - Improvements: [not yet analyzed]\n\n\
-             Raw proposal:\n\
-             {content}",
-            content.len()
-        )
     }
 
     fn build_prompt(content: &str) -> LlmRequest {
@@ -38,7 +18,7 @@ impl CritiqueAgent {
             messages: vec![
                 ChatMessage {
                     role: ChatRole::System,
-                    content: "Produce a concise critique covering feasibility, risks, gaps, and improvements. Stay grounded in the provided input.".to_string(),
+                    content: "You are a senior technical reviewer. Analyze the provided content and deliver your critique directly. Be specific about risks, gaps, and improvements. Reference concrete details from the input.".to_string(),
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
@@ -51,7 +31,7 @@ impl CritiqueAgent {
                     reasoning_content: None,
                 },
             ],
-            max_tokens: Some(600),
+            max_tokens: Some(4096),
             temperature: Some(0.7),
             tools: None,
             tool_choice: None,
@@ -88,23 +68,30 @@ impl Agent for CritiqueAgent {
             });
         }
 
+        let provider = self
+            .provider
+            .as_ref()
+            .ok_or_else(|| AgentError::ExecutionFailed {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "critique provider is not configured",
+                )),
+            })?;
+
         tracing::info!(agent = %ctx.agent_name, content_len = trimmed.len(), "CritiqueAgent started");
 
         let mut metadata = HashMap::new();
-        let feedback = if let Some(provider) = &self.provider {
-            let response =
-                tokio::time::timeout(PROVIDER_TIMEOUT, provider.chat(Self::build_prompt(trimmed)))
-                    .await
-                    .map_err(|_| AgentError::Timeout)?
-                    .map_err(|err| AgentError::ExecutionFailed {
-                        source: Box::new(err),
-                    })?;
-            metadata.insert("mode".to_string(), "LLM_ENRICHED".to_string());
-            response.content.trim().to_string()
-        } else {
-            metadata.insert("mode".to_string(), "TEMPLATE".to_string());
-            Self::build_critique_template(trimmed)
-        };
+        let response = tokio::time::timeout(
+            crate::timeouts::tool_provider_timeout(),
+            provider.chat(Self::build_prompt(trimmed)),
+        )
+        .await
+        .map_err(|_| AgentError::Timeout)?
+        .map_err(|err| AgentError::ExecutionFailed {
+            source: Box::new(err),
+        })?;
+        metadata.insert("mode".to_string(), "LLM_ENRICHED".to_string());
+        let feedback = response.content.trim().to_string();
 
         tracing::info!(agent = %ctx.agent_name, "CritiqueAgent completed");
         Ok(AgentResponse::Success {
@@ -171,7 +158,7 @@ mod tests {
         }
 
         async fn chat(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
-            tokio::time::sleep(Duration::from_secs(31)).await;
+            tokio::time::sleep(Duration::from_secs(91)).await;
             Err(LlmError::InvalidResponse {
                 message: "provider call should have timed out".to_string(),
             })
@@ -202,21 +189,30 @@ mod tests {
     #[tokio::test]
     async fn test_critique_agent_handles_task() {
         let agent = CritiqueAgent::new(None);
-        let response = agent
+        let err = agent
             .handle_message(mk_msg("Deploy microservices to prod"), &mk_ctx())
             .await
-            .expect("should succeed");
+            .expect_err("missing provider should return error");
 
-        match response {
-            AgentResponse::Success { content, metadata } => {
-                assert!(content.contains("CRITIQUE REPORT"));
-                assert!(content.contains("Deploy microservices to prod"));
-                assert_eq!(metadata.get("mode").map(String::as_str), Some("TEMPLATE"));
+        match err {
+            AgentError::ExecutionFailed { source } => {
+                assert_eq!(source.to_string(), "critique provider is not configured");
             }
-            AgentResponse::Error { code, message } => {
-                panic!("expected success, got error code={code}, message={message}");
+            other => {
+                panic!("expected execution failed error, got {other:?}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_critique_agent_without_provider_returns_error() {
+        let agent = CritiqueAgent::new(None);
+        let err = agent
+            .handle_message(mk_msg("Deploy microservices to prod"), &mk_ctx())
+            .await
+            .expect_err("missing provider should return error");
+
+        assert!(matches!(err, AgentError::ExecutionFailed { .. }));
     }
 
     #[tokio::test]

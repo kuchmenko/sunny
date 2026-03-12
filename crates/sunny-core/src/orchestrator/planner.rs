@@ -1,5 +1,6 @@
 use crate::agent::{AgentMessage, Capability};
 use crate::orchestrator::intent::{Intent, PlanPolicy};
+use crate::orchestrator::WorkspaceExtensions;
 use crate::orchestrator::{ExecutionPlan, OrchestratorError, PlanId, PlanStep, RequestId, StepId};
 use crate::timeouts::{plan_context_timeout_ms, plan_stage_timeout_ms};
 use std::collections::HashMap;
@@ -349,8 +350,24 @@ fn is_ambiguous_query(intent: &Intent, content: &str) -> bool {
     ];
 
     let has_broad_term = broad_terms.iter().any(|term| lowered.contains(term));
-    let has_explicit_path_hint =
-        lowered.contains("/") || lowered.contains(".rs") || lowered.contains("cargo");
+    let common_extensions = WorkspaceExtensions::common_extensions();
+    let has_known_extension = lowered.split_whitespace().any(|token| {
+        let candidate = token.trim_matches(|ch: char| {
+            ch == ','
+                || ch == ';'
+                || ch == ':'
+                || ch == ')'
+                || ch == '('
+                || ch == '"'
+                || ch == '\''
+                || ch == '`'
+        });
+        candidate
+            .rsplit_once('.')
+            .map(|(_, ext)| common_extensions.contains_extension(ext))
+            .unwrap_or(false)
+    });
+    let has_explicit_path_hint = lowered.contains("/") || has_known_extension;
 
     has_broad_term && !has_explicit_path_hint
 }

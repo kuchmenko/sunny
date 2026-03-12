@@ -1,4 +1,5 @@
 use crate::orchestrator::IntentKind;
+use crate::orchestrator::WorkspaceExtensions;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,9 +67,12 @@ pub fn evaluate_completion(
     response: &str,
     metadata: &HashMap<String, String>,
     config: &GateConfig,
+    extensions: &WorkspaceExtensions,
 ) -> CompletionGateResult {
     match intent_kind {
-        IntentKind::Analyze => evaluate_analyze_completion(request, response, metadata, config),
+        IntentKind::Analyze => {
+            evaluate_analyze_completion(request, response, metadata, config, extensions)
+        }
         IntentKind::Query | IntentKind::Action => CompletionGateResult {
             passed: true,
             reason_code: "passed_non_analyze".to_string(),
@@ -82,9 +86,10 @@ fn evaluate_analyze_completion(
     response: &str,
     metadata: &HashMap<String, String>,
     config: &GateConfig,
+    extensions: &WorkspaceExtensions,
 ) -> CompletionGateResult {
     let mut details = HashMap::new();
-    let citation_count = count_citations(response);
+    let citation_count = count_citations(response, extensions);
     let min_len_ok = response.trim().len() >= config.min_response_length;
     let mode = metadata.get("mode").cloned().unwrap_or_default();
     let request_alignment = lexical_alignment_score(request, response, config);
@@ -141,7 +146,7 @@ fn normalize_terms(text: &str, min_term_length: usize) -> std::collections::Hash
         .collect()
 }
 
-fn count_citations(response: &str) -> usize {
+fn count_citations(response: &str, extensions: &WorkspaceExtensions) -> usize {
     let mut count = 0usize;
     for token in response.split_whitespace() {
         let candidate = token.trim_matches(|ch: char| {
@@ -154,11 +159,7 @@ fn count_citations(response: &str) -> usize {
                 || ch == '\''
                 || ch == '`'
         });
-        if candidate.contains('/')
-            && (candidate.ends_with(".rs")
-                || candidate.ends_with(".toml")
-                || candidate.ends_with(".md"))
-        {
+        if candidate.contains('/') && extensions.is_code_file(candidate) {
             count += 1;
         }
     }
@@ -167,7 +168,9 @@ fn count_citations(response: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::count_citations;
     use super::GateConfig;
+    use crate::orchestrator::WorkspaceExtensions;
 
     #[test]
     fn test_gate_config_defaults() {
@@ -195,5 +198,21 @@ mod tests {
         std::env::remove_var("SUNNY_GATE_MIN_ALIGNMENT");
         std::env::remove_var("SUNNY_GATE_MIN_CITATIONS");
         std::env::remove_var("SUNNY_GATE_MIN_TERM_LENGTH");
+    }
+
+    #[test]
+    fn test_citations_count_python() {
+        let extensions = WorkspaceExtensions::common_extensions();
+        let response = "See src/main.py and app/utils/helpers.py for the implementation.";
+
+        assert_eq!(count_citations(response, &extensions), 2);
+    }
+
+    #[test]
+    fn test_citations_count_js() {
+        let extensions = WorkspaceExtensions::common_extensions();
+        let response = "Frontend updates are in src/app.ts and web/components/button.tsx";
+
+        assert_eq!(count_citations(response, &extensions), 2);
     }
 }
