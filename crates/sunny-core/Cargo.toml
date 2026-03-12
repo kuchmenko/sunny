@@ -12,6 +12,7 @@ tracing = "0.1" # dep: structured logging, no println per AGENTS.md
 walkdir = "2" # dep: recursive directory traversal for filesystem tools
 ignore = "0.4" # dep: .gitignore-aware filesystem scanning
 uuid = { version = "1", features = ["v4"] } # dep: UUID generation for event/span correlation IDs
+regex = "1" # dep: regex support for text_grep LLM-driven code search
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] } # dep: test utilities for async tests

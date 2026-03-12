@@ -363,7 +363,7 @@ impl WorkspaceReadAgent {
             },
             ToolDefinition {
                 name: "text_grep".to_string(),
-                description: "Search for a text pattern in a file and return matching lines"
+                description: "Search for a regex pattern in a file and return matching lines (falls back to literal substring if invalid regex)"
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -805,7 +805,12 @@ impl Agent for WorkspaceReadAgent {
             ToolPolicy::default_ask(),
             max_tool_iterations(),
             self.cancel.child_token(),
-        );
+        )
+        .with_dedup_tools(std::collections::HashSet::from([
+            "fs_read".to_string(),
+            "fs_scan".to_string(),
+            "text_grep".to_string(),
+        ]));
 
         let scanner = self.scanner.clone();
         let reader = self.reader.clone();

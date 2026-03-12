@@ -111,7 +111,12 @@ impl<'a> InteractiveOrchestrator<'a> {
                     .unwrap_or_else(|| "interactive plan execution failed".to_string());
 
                 Err(OrchestratorError::PlanPolicyViolation {
-                    reason: format!("interactive plan execution failed: {failed_reason}"),
+                    reason: format!(
+                        "interactive plan execution failed: {failed_reason} [steps_completed={} steps_failed={} steps_skipped={}]",
+                        result.steps_completed,
+                        result.steps_failed,
+                        result.steps_skipped,
+                    ),
                 })
             }
         }

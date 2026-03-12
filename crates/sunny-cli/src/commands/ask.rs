@@ -322,7 +322,7 @@ fn render_error_output(
         request_id,
         intent_kind,
         required_capability,
-        step_count: 1,
+        step_count: parse_step_count(&metadata),
         dry_run,
         outcome: "error",
         response: None,
@@ -599,6 +599,25 @@ async fn execute_ask_internal(
             if matches!(err, OrchestratorError::AgentUnresponsive) {
                 metadata.insert("timeout_source".to_string(), "orchestrator".to_string());
             }
+            let err_str = err.to_string();
+            metadata.insert(
+                "steps_completed".to_string(),
+                extract_count(&err_str, "steps_completed")
+                    .unwrap_or(0)
+                    .to_string(),
+            );
+            metadata.insert(
+                "steps_failed".to_string(),
+                extract_count(&err_str, "steps_failed")
+                    .unwrap_or(1)
+                    .to_string(),
+            );
+            metadata.insert(
+                "steps_skipped".to_string(),
+                extract_count(&err_str, "steps_skipped")
+                    .unwrap_or(0)
+                    .to_string(),
+            );
 
             tracing::info!(
                 name: EVENT_CLI_COMMAND_END,
@@ -732,7 +751,19 @@ fn build_ask_output(params: AskOutputParams<'_>) -> PromptOutput {
     let (steps_completed, steps_failed) = match params.outcome {
         "success" => (1, 0),
         "planned" => (0, 0),
-        _ => (0, 1),
+        _ => {
+            let sc = params
+                .metadata
+                .get("steps_completed")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let sf = params
+                .metadata
+                .get("steps_failed")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            (sc, sf)
+        }
     };
 
     PromptOutput {
@@ -751,6 +782,16 @@ fn build_ask_output(params: AskOutputParams<'_>) -> PromptOutput {
         error: params.error,
         metadata: params.metadata,
     }
+}
+
+fn extract_count(s: &str, key: &str) -> Option<usize> {
+    let prefix = format!("{key}=");
+    s.find(&prefix).and_then(|pos| {
+        s[pos + prefix.len()..]
+            .split(|c: char| c.is_whitespace() || c == ']')
+            .next()
+            .and_then(|v| v.parse().ok())
+    })
 }
 
 fn parse_step_count(metadata: &HashMap<String, String>) -> usize {
@@ -1357,5 +1398,25 @@ mod tests {
         }
 
         fs::remove_dir_all(&temp).expect("cleanup");
+    }
+
+    #[test]
+    fn test_render_error_with_step_counts() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("steps_completed".to_string(), "3".to_string());
+        metadata.insert("steps_failed".to_string(), "1".to_string());
+        metadata.insert("steps_skipped".to_string(), "0".to_string());
+        let step_count = parse_step_count(&metadata);
+        // step_count = completed + failed + skipped = 3 + 1 + 0 = 4
+        assert_eq!(step_count, 4);
+    }
+
+    #[test]
+    fn test_extract_count_from_error_string() {
+        let err = "interactive plan execution failed: some error [steps_completed=2 steps_failed=1 steps_skipped=0]";
+        assert_eq!(extract_count(err, "steps_completed"), Some(2));
+        assert_eq!(extract_count(err, "steps_failed"), Some(1));
+        assert_eq!(extract_count(err, "steps_skipped"), Some(0));
+        assert_eq!(extract_count(err, "missing_key"), None);
     }
 }

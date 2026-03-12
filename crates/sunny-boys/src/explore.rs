@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use std::sync::OnceLock;
@@ -23,6 +24,16 @@ pub(crate) fn max_tool_iterations() -> usize {
         .get_or_init(|| crate::timeouts::usize_from_env("SUNNY_MAX_TOOL_ITERATIONS_EXPLORE", 15))
 }
 
+static TOOL_LOOP_MAX_READ_CALLS_EXPLORE: OnceLock<usize> = OnceLock::new();
+pub(crate) fn explore_max_read_calls() -> usize {
+    *TOOL_LOOP_MAX_READ_CALLS_EXPLORE.get_or_init(|| {
+        crate::timeouts::usize_from_env("SUNNY_TOOL_LOOP_MAX_READ_CALLS_EXPLORE", 12)
+    })
+}
+
+fn tool_uses_read_budget_explore(name: &str) -> bool {
+    matches!(name, "fs_read" | "text_grep")
+}
 pub struct ExploreAgent {
     provider: Option<Arc<dyn LlmProvider>>,
     scanner: Arc<FileScanner>,
@@ -76,7 +87,7 @@ impl ExploreAgent {
             },
             ToolDefinition {
                 name: "text_grep".to_string(),
-                description: "Search for a text pattern in a file and return matching lines"
+                description: "Search for a regex pattern in a file and return matching lines (falls back to literal substring if invalid regex)"
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -414,7 +425,7 @@ impl Agent for ExploreAgent {
                 ChatMessage {
                     role: ChatRole::System,
                     content: format!(
-                        "You are an exploration-focused codebase assistant. Use fs_scan, fs_read, text_grep, git_log, git_diff, and git_status to map repository structure and locate relevant code quickly. Prefer grep-driven discovery and targeted reads over exhaustive scanning. For git_log limits, use '-n <N>' or '--max-count=<N>' and never use numeric shorthand like '-15'. For git_status, use only '--porcelain' or '--short'. Explore only within: {}.",
+                        "You are an exploration-focused codebase assistant. Use fs_scan, fs_read, text_grep, git_log, git_diff, and git_status to map repository structure and locate relevant code quickly. Prefer grep-driven discovery and targeted reads over exhaustive scanning. For git_log limits, use '-n <N>' or '--max-count=<N>' and never use numeric shorthand like '-15'. For git_status, use only '--porcelain' or '--short'. Explore only within: {}. You have a limited read budget — use grep to find relevant code before reading files. Avoid re-reading files already in your conversation history — results are cached per session.",
                         root_path.display()
                     ),
                     tool_calls: None,
@@ -440,7 +451,12 @@ impl Agent for ExploreAgent {
             Self::build_tool_policy(),
             max_tool_iterations(),
             self.cancel.child_token(),
-        );
+        )
+        .with_dedup_tools(std::collections::HashSet::from([
+            "fs_read".to_string(),
+            "fs_scan".to_string(),
+            "text_grep".to_string(),
+        ]));
 
         let scanner = self.scanner.clone();
         let reader = self.reader.clone();
@@ -448,8 +464,30 @@ impl Agent for ExploreAgent {
         let git_log = Arc::new(GitLog);
         let git_diff = Arc::new(GitDiff);
         let git_status = Arc::new(GitStatus);
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let read_calls_for_tool = read_calls.clone();
         let executor = Arc::new(
             move |_id: &str, name: &str, arguments: &str, _depth: usize| {
+                if tool_uses_read_budget_explore(name) {
+                    let count = read_calls_for_tool.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count > explore_max_read_calls() {
+                        tracing::info!(
+                            agent = "explore",
+                            tool_name = %name,
+                            call_count = count,
+                            budget = explore_max_read_calls(),
+                            event = "explore.read_budget.exceeded",
+                            "read budget exceeded; returning degraded result"
+                        );
+                        return Ok(format!(
+                            "[READ BUDGET EXCEEDED] Tool {} call #{} skipped. Budget: {}.",
+                            name,
+                            count,
+                            explore_max_read_calls()
+                        ));
+                    }
+                }
+
                 let tool_call = ToolCall {
                     id: "exec".to_string(),
                     name: name.to_string(),
@@ -514,6 +552,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::explore::tool_uses_read_budget_explore;
     use tokio::sync::Mutex;
 
     use sunny_core::agent::{Agent, AgentContext, AgentMessage, AgentResponse, Capability};
@@ -819,5 +858,19 @@ mod tests {
         assert!(names.contains(&"git_log".to_string()));
         assert!(names.contains(&"git_diff".to_string()));
         assert!(names.contains(&"git_status".to_string()));
+    }
+
+    #[test]
+    fn test_explore_read_budget_enforced() {
+        assert!(tool_uses_read_budget_explore("fs_read"));
+        assert!(tool_uses_read_budget_explore("text_grep"));
+        assert!(!tool_uses_read_budget_explore("fs_scan"));
+    }
+
+    #[test]
+    fn test_explore_read_budget_excludes_scan() {
+        assert!(!tool_uses_read_budget_explore("fs_scan"));
+        assert!(!tool_uses_read_budget_explore("git_log"));
+        assert!(!tool_uses_read_budget_explore("git_diff"));
     }
 }
