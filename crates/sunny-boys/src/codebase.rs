@@ -854,6 +854,14 @@ impl Agent for WorkspaceReadAgent {
                 Ok(Err(ToolCallError::Cancelled)) => {
                     return Err(Self::cancelled_error("tool_call_loop"));
                 }
+                Ok(Err(ToolCallError::Llm { source })) => {
+                    return Err(AgentError::ExecutionFailed {
+                        source: Box::new(source),
+                    });
+                }
+                Ok(Err(ToolCallError::ProviderTimeout { .. })) => {
+                    return Err(AgentError::Timeout);
+                }
                 Ok(Err(err)) => {
                     tracing::warn!(
                         agent = %ctx.agent_name,
@@ -1011,6 +1019,8 @@ mod tests {
 
     struct MockProvider;
 
+    struct FailingProvider;
+
     #[async_trait::async_trait]
     impl LlmProvider for MockProvider {
         fn provider_id(&self) -> &str {
@@ -1034,6 +1044,23 @@ mod tests {
                 model_id: ModelId("mock-model".to_string()),
                 tool_calls: None,
                 reasoning_content: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailingProvider {
+        fn provider_id(&self) -> &str {
+            "mock"
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-failing-model"
+        }
+
+        async fn chat(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            Err(LlmError::InvalidResponse {
+                message: "workspace llm unavailable".to_string(),
             })
         }
     }
@@ -1109,7 +1136,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_workspace_read_agent_fallback_without_provider() {
+    async fn test_workspace_read_uses_scanner_when_no_provider() {
         let dir = mk_temp_dir("fallback");
         fs::write(dir.join("test.txt"), "test content\n").expect("write file");
 
@@ -1124,6 +1151,41 @@ mod tests {
         assert_eq!(result.file_count, 1);
         assert_eq!(result.files.len(), 1);
         assert_eq!(metadata.get("file_count").map(String::as_str), Some("1"));
+        assert_eq!(
+            metadata.get("mode").map(String::as_str),
+            Some(ResponseMode::ToolLoopFallback.as_str())
+        );
+        assert_eq!(
+            metadata.get("fallback_reason").map(String::as_str),
+            Some("no_provider")
+        );
+
+        fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn test_workspace_read_fails_when_provider_configured_but_dead() {
+        let dir = mk_temp_dir("dead_provider");
+        fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
+
+        let agent = WorkspaceReadAgent::new(Some(Arc::new(FailingProvider)));
+        let err = agent
+            .handle_message(mk_msg(dir.to_str().expect("path str")), &mk_ctx())
+            .await
+            .expect_err("dead provider should return an error");
+
+        match err {
+            AgentError::ExecutionFailed { source } => {
+                assert_eq!(
+                    source.to_string(),
+                    "invalid response from provider: workspace llm unavailable"
+                );
+            }
+            AgentError::Timeout => panic!("expected execution error, got timeout"),
+            AgentError::NotFound { id } => {
+                panic!("expected execution error, got not found for id={id}")
+            }
+        }
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }

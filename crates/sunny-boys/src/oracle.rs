@@ -160,6 +160,8 @@ mod tests {
         seen_request: Arc<Mutex<Option<LlmRequest>>>,
     }
 
+    struct FailingProvider;
+
     #[async_trait::async_trait]
     impl LlmProvider for MockProvider {
         fn provider_id(&self) -> &str {
@@ -184,6 +186,23 @@ mod tests {
                 model_id: ModelId("mock-oracle".to_string()),
                 tool_calls: None,
                 reasoning_content: self.reasoning_content.map(str::to_string),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailingProvider {
+        fn provider_id(&self) -> &str {
+            "mock"
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-failing-oracle"
+        }
+
+        async fn chat(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            Err(LlmError::InvalidResponse {
+                message: "oracle llm unavailable".to_string(),
             })
         }
     }
@@ -253,6 +272,28 @@ mod tests {
             .expect_err("missing provider should return AgentError");
 
         assert!(matches!(err, AgentError::ExecutionFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_oracle_fails_when_provider_configured_but_dead() {
+        let agent = OracleAgent::new(Some(Arc::new(FailingProvider)));
+        let err = agent
+            .handle_message(mk_msg("Advise on pricing strategy"), &mk_ctx())
+            .await
+            .expect_err("dead provider should return an error");
+
+        match err {
+            AgentError::ExecutionFailed { source } => {
+                assert_eq!(
+                    source.to_string(),
+                    "invalid response from provider: oracle llm unavailable"
+                );
+            }
+            AgentError::Timeout => panic!("expected execution error, got timeout"),
+            AgentError::NotFound { id } => {
+                panic!("expected execution error, got not found for id={id}")
+            }
+        }
     }
 
     #[tokio::test]

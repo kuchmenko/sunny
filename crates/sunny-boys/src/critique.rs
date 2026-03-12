@@ -120,6 +120,8 @@ mod tests {
 
     struct HangingProvider;
 
+    struct FailingProvider;
+
     #[async_trait::async_trait]
     impl LlmProvider for MockProvider {
         fn provider_id(&self) -> &str {
@@ -161,6 +163,23 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(91)).await;
             Err(LlmError::InvalidResponse {
                 message: "provider call should have timed out".to_string(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailingProvider {
+        fn provider_id(&self) -> &str {
+            "mock"
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-failing-critique"
+        }
+
+        async fn chat(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            Err(LlmError::InvalidResponse {
+                message: "critique llm unavailable".to_string(),
             })
         }
     }
@@ -240,6 +259,28 @@ mod tests {
             }
             AgentResponse::Error { code, message } => {
                 panic!("expected success, got error code={code}, message={message}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_critique_fails_when_provider_configured_but_dead() {
+        let agent = CritiqueAgent::new(Some(Arc::new(FailingProvider)));
+        let err = agent
+            .handle_message(mk_msg("Deploy microservices to prod"), &mk_ctx())
+            .await
+            .expect_err("dead provider should return an error");
+
+        match err {
+            AgentError::ExecutionFailed { source } => {
+                assert_eq!(
+                    source.to_string(),
+                    "invalid response from provider: critique llm unavailable"
+                );
+            }
+            AgentError::Timeout => panic!("expected execution error, got timeout"),
+            AgentError::NotFound { id } => {
+                panic!("expected execution error, got not found for id={id}")
             }
         }
     }
