@@ -42,14 +42,14 @@ fn test_ask_runtime_variants_baseline_outputs_are_json_and_valid() {
         "dry-run should include request_id"
     );
 
-    // 2) analyze baseline: expect success and analyze intent
+    // 2) analyze baseline: ReviewAgent hard-fails without provider — expect error outcome
     let output2 = sunny_cli()
         .args(["ask", "analyze this", "--no-llm", "--format", "json"])
         .output()
         .expect("should run sunny ask analyze");
-    assert!(output2.status.success(), "analyze should exit successfully");
+    // ReviewAgent hard-fails without provider, so process exits with error code
     let v2: Value = serde_json::from_slice(&output2.stdout).expect("valid JSON output for analyze");
-    assert_eq!(v2.get("outcome").and_then(|s| s.as_str()), Some("success"));
+    assert_eq!(v2.get("outcome").and_then(|s| s.as_str()), Some("error"));
     assert_eq!(
         v2.get("intent_kind").and_then(|s| s.as_str()),
         Some("analyze")
@@ -68,14 +68,14 @@ fn test_ask_runtime_variants_baseline_outputs_are_json_and_valid() {
         Some("query")
     );
 
-    // 4) action baseline: expect success and action intent
+    // 4) action baseline: CritiqueAgent hard-fails without provider — expect error outcome
     let output4 = sunny_cli()
         .args(["ask", "create plan", "--no-llm", "--format", "json"])
         .output()
         .expect("should run sunny ask action");
-    assert!(output4.status.success(), "action should exit successfully");
+    // CritiqueAgent hard-fails without provider, so process exits with error code
     let v4: Value = serde_json::from_slice(&output4.stdout).expect("valid JSON output for action");
-    assert_eq!(v4.get("outcome").and_then(|s| s.as_str()), Some("success"));
+    assert_eq!(v4.get("outcome").and_then(|s| s.as_str()), Some("error"));
     assert_eq!(
         v4.get("intent_kind").and_then(|s| s.as_str()),
         Some("action")

@@ -1,14 +1,66 @@
 use crate::agent::Capability;
 use crate::orchestrator::intent::{Intent, IntentKind};
 
-/// Keywords that map to `IntentKind::Analyze`.
-const ANALYZE_KEYWORDS: &[&str] = &["analyze", "scan", "review"];
+const DEFAULT_ANALYZE_KEYWORDS: &[&str] = &["analyze", "scan", "review"];
 
 #[cfg(test)]
 const QUERY_KEYWORDS: &[&str] = &["what", "how", "explain", "describe"];
 
 /// Keywords that map to `IntentKind::Action`.
-const ACTION_KEYWORDS: &[&str] = &["create", "add", "modify", "delete", "update"];
+const DEFAULT_ACTION_KEYWORDS: &[&str] = &["create", "add", "modify", "delete", "update"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifierConfig {
+    pub analyze_keywords: Vec<String>,
+    pub action_keywords: Vec<String>,
+}
+
+impl ClassifierConfig {
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+
+        Self {
+            analyze_keywords: parse_keyword_list_from_env(
+                "SUNNY_ANALYZE_KEYWORDS",
+                defaults.analyze_keywords,
+            ),
+            action_keywords: parse_keyword_list_from_env(
+                "SUNNY_ACTION_KEYWORDS",
+                defaults.action_keywords,
+            ),
+        }
+    }
+}
+
+impl Default for ClassifierConfig {
+    fn default() -> Self {
+        Self {
+            analyze_keywords: DEFAULT_ANALYZE_KEYWORDS
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            action_keywords: DEFAULT_ACTION_KEYWORDS
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        }
+    }
+}
+
+fn parse_keyword_list_from_env(key: &str, default: Vec<String>) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(|token| token.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .filter(|keywords| !keywords.is_empty())
+        .unwrap_or(default)
+}
 
 /// Keyword-based intent classifier.
 ///
@@ -17,12 +69,14 @@ const ACTION_KEYWORDS: &[&str] = &["create", "add", "modify", "delete", "update"
 /// `str::contains()`. Falls back to [`IntentKind::Query`] when no keyword
 /// matches (safest default — read-only semantics).
 #[derive(Debug, Clone)]
-pub struct IntentClassifier;
+pub struct IntentClassifier {
+    config: ClassifierConfig,
+}
 
 impl IntentClassifier {
     /// Create a new `IntentClassifier`.
-    pub fn new() -> Self {
-        Self
+    pub fn new(config: ClassifierConfig) -> Self {
+        Self { config }
     }
 
     /// Classify user input into an [`Intent`].
@@ -33,9 +87,19 @@ impl IntentClassifier {
     pub fn classify(&self, input: &str) -> Intent {
         let lower = input.to_lowercase();
 
-        let kind = if ANALYZE_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        let kind = if self
+            .config
+            .analyze_keywords
+            .iter()
+            .any(|kw| lower.contains(kw))
+        {
             IntentKind::Analyze
-        } else if ACTION_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        } else if self
+            .config
+            .action_keywords
+            .iter()
+            .any(|kw| lower.contains(kw))
+        {
             IntentKind::Action
         } else {
             IntentKind::Query
@@ -57,7 +121,7 @@ impl IntentClassifier {
 
 impl Default for IntentClassifier {
     fn default() -> Self {
-        Self::new()
+        Self::new(ClassifierConfig::default())
     }
 }
 
@@ -66,7 +130,7 @@ mod tests {
     use super::*;
 
     fn classifier() -> IntentClassifier {
-        IntentClassifier::new()
+        IntentClassifier::default()
     }
 
     #[test]
@@ -218,5 +282,16 @@ mod tests {
                 "keyword '{kw}' should map to Query"
             );
         }
+    }
+
+    #[test]
+    fn test_classifier_with_custom_keywords() {
+        let classifier = IntentClassifier::new(ClassifierConfig {
+            analyze_keywords: vec!["analyze".to_string(), "investigate".to_string()],
+            action_keywords: vec!["create".to_string()],
+        });
+
+        let intent = classifier.classify("please investigate this issue");
+        assert_eq!(intent.kind, IntentKind::Analyze);
     }
 }

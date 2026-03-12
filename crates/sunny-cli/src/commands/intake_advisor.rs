@@ -1,12 +1,9 @@
 use std::sync::Arc;
 
 use sunny_core::orchestrator::{
-    IntakeAdvisor, IntakeAdvisorError, RawIntakeAdvice, WorkspaceContext,
+    CapabilityRegistry, IntakeAdvisor, IntakeAdvisorError, RawIntakeAdvice, WorkspaceContext,
 };
 use sunny_mind::{ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest};
-
-#[allow(dead_code)]
-const ALLOWED_CAPABILITIES: &[&str] = &["query", "analyze", "action", "explore", "advise"];
 
 #[allow(dead_code)]
 pub const INTAKE_SYSTEM_PROMPT: &str = r#"You are Sunny intake routing advisor.
@@ -94,7 +91,7 @@ impl IntakeAdvisor for LlmIntakeAdvisor {
                 let normalized = capability.trim().to_ascii_lowercase();
                 if normalized.is_empty() {
                     None
-                } else if ALLOWED_CAPABILITIES.contains(&normalized.as_str()) {
+                } else if CapabilityRegistry::default().is_allowed(&normalized) {
                     Some(normalized)
                 } else {
                     return Err(IntakeAdvisorError::InvalidCapability(capability));

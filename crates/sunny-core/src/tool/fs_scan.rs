@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use ignore::gitignore::GitignoreBuilder;
+use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
@@ -10,8 +11,24 @@ use crate::orchestrator::events::{
     OUTCOME_SUCCESS,
 };
 
-const DEFAULT_MAX_FILES: usize = 10_000;
-const DEFAULT_MAX_DEPTH: usize = 50;
+static DEFAULT_MAX_FILES: OnceLock<usize> = OnceLock::new();
+static DEFAULT_MAX_DEPTH: OnceLock<usize> = OnceLock::new();
+
+pub(crate) fn default_max_files() -> usize {
+    *DEFAULT_MAX_FILES.get_or_init(|| usize_from_env("SUNNY_DEFAULT_MAX_FILES", 10_000))
+}
+
+pub(crate) fn default_max_depth() -> usize {
+    *DEFAULT_MAX_DEPTH.get_or_init(|| usize_from_env("SUNNY_DEFAULT_MAX_DEPTH", 50))
+}
+
+fn usize_from_env(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
 const DEFAULT_IGNORE_DIRS: &[&str] = &[".git", "target", "node_modules", ".sisyphus/evidence"];
 
 /// Recursively scans directories collecting file metadata.
@@ -43,8 +60,8 @@ pub struct ScanResult {
 impl Default for FileScanner {
     fn default() -> Self {
         Self {
-            max_files: DEFAULT_MAX_FILES,
-            max_depth: DEFAULT_MAX_DEPTH,
+            max_files: default_max_files(),
+            max_depth: default_max_depth(),
             ignore_dirs: DEFAULT_IGNORE_DIRS
                 .iter()
                 .map(|s| (*s).to_string())

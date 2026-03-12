@@ -1,8 +1,10 @@
 pub mod classifier;
+pub mod completion_gate;
 pub mod context;
 pub mod error;
 pub mod events;
 pub mod executor;
+pub mod extensions;
 pub mod handle;
 pub mod intake;
 pub mod intent;
@@ -16,7 +18,8 @@ pub mod routing;
 pub mod supervision;
 pub mod telemetry;
 
-pub use classifier::IntentClassifier;
+pub use classifier::{ClassifierConfig, IntentClassifier};
+pub use completion_gate::{evaluate_completion, CompletionGateResult, GateConfig};
 pub use context::{PlanId, RequestId, StepId};
 pub use error::{OrchestratorError, PlanError, RegistryError};
 pub use events::{
@@ -27,14 +30,15 @@ pub use events::{
     EVENT_TOOL_EXEC_START, OUTCOME_CANCELLED, OUTCOME_ERROR, OUTCOME_SUCCESS, OUTCOME_TIMEOUT,
 };
 pub use executor::{PlanExecutor, PlanOutcome, PlanResult};
+pub use extensions::WorkspaceExtensions;
 pub use handle::OrchestratorHandle;
 pub use intake::{
-    ComplexityHint, IntakeAdvisor, IntakeAdvisorError, PlanHints, PlanningIntake,
-    PlanningIntakeInput, PlanningIntakeVerdict, RawIntakeAdvice, WorkspaceContext,
+    CapabilityRegistry, ComplexityHint, IntakeAdvisor, IntakeAdvisorError, PlanHints,
+    PlanningIntake, PlanningIntakeInput, PlanningIntakeVerdict, RawIntakeAdvice, WorkspaceContext,
 };
 pub use intent::{Intent, IntentKind, PlanPolicy};
 pub use interactive::InteractiveOrchestrator;
-pub use plan::{ExecutionPlan, PlanStep, StepOutcome, StepState};
+pub use plan::{ExecutionPlan, PlanStep, ResponseMode, StepOutcome, StepState};
 pub use planner::ExecutionProfile;
 pub use planner::HeuristicLoopPlanner;
 pub use prompt_spec::{

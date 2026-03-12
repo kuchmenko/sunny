@@ -109,7 +109,7 @@ async fn test_planner_integration_plan_route_dispatch_flow() {
 
     let orchestrator = OrchestratorHandle::spawn(registry, cancellation.child_token());
 
-    let classifier = IntentClassifier::new();
+    let classifier = IntentClassifier::default();
     let intent = classifier.classify("analyze this code");
 
     assert_eq!(intent.kind, IntentKind::Analyze);

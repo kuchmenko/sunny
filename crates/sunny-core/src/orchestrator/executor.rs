@@ -421,7 +421,7 @@ mod tests {
     }
 
     fn make_plan(plan_id: &str, request_id: &str) -> ExecutionPlan {
-        let intent = IntentClassifier::new().classify("analyze this request");
+        let intent = IntentClassifier::default().classify("analyze this request");
         ExecutionPlan::new(
             plan_id.to_string(),
             request_id.to_string(),
@@ -435,7 +435,7 @@ mod tests {
     }
 
     fn make_plan_with_policy(plan_id: &str, request_id: &str, policy: PlanPolicy) -> ExecutionPlan {
-        let intent = IntentClassifier::new().classify("analyze this request");
+        let intent = IntentClassifier::default().classify("analyze this request");
         ExecutionPlan::new(plan_id.to_string(), request_id.to_string(), intent, policy)
     }
 

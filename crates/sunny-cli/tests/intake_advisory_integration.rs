@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sunny_core::agent::{AgentMessage, Capability};
 use sunny_core::orchestrator::{
     HeuristicLoopPlanner, IntakeAdvisor, Intent, IntentKind, PlanHints, PlanPolicy, PlanningIntake,
-    PlanningIntakeInput, PlanningIntakeVerdict, RequestId, WorkspaceContext,
+    PlanningIntakeInput, PlanningIntakeVerdict, RequestId, WorkspaceContext, WorkspaceExtensions,
 };
 use sunny_mind::{LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage};
 
@@ -113,6 +113,7 @@ async fn test_intake_advisory_pipeline_rebalances_advise_for_ambiguous_query() {
             request_id: RequestId::new(),
             llm_enabled: true,
             workspace_context: WorkspaceContext::default(),
+            workspace_extensions: WorkspaceExtensions::common_extensions(),
         })
         .await;
 
@@ -162,6 +163,7 @@ async fn test_intake_advisory_error_fallback() {
             request_id: RequestId::new(),
             llm_enabled: true,
             workspace_context: WorkspaceContext::default(),
+            workspace_extensions: WorkspaceExtensions::common_extensions(),
         })
         .await;
 
@@ -197,6 +199,7 @@ async fn test_intake_advisory_skipped_when_llm_disabled() {
             request_id: RequestId::new(),
             llm_enabled: false,
             workspace_context: WorkspaceContext::default(),
+            workspace_extensions: WorkspaceExtensions::common_extensions(),
         })
         .await;
 

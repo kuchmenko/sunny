@@ -194,6 +194,62 @@ pub struct ExecutionPlan {
     pub policy: PlanPolicy,
 }
 
+/// ResponseMode represents the mode used to generate a response in the orchestrator.
+/// It replaces string-based mode identifiers with a strongly-typed enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseMode {
+    /// Directly produce a response from the LLM with no fallback loops.
+    LlmDirect,
+    /// Fall back to a tool loop (fallback path) for the response generation.
+    ToolLoopFallback,
+    /// Compose a response using context information (non-fallback).
+    ContextComposed,
+    /// Fall back to using a template-driven response.
+    TemplateFallback,
+}
+
+impl ResponseMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LlmDirect => "LLM_DIRECT",
+            Self::ToolLoopFallback => "TOOL_ONLY_FALLBACK",
+            Self::ContextComposed => "CONTEXT_COMPOSED",
+            Self::TemplateFallback => "TEMPLATE_FALLBACK",
+        }
+    }
+
+    /// Returns true if this mode represents a fallback path.
+    pub fn is_fallback(&self) -> bool {
+        matches!(
+            self,
+            ResponseMode::ToolLoopFallback | ResponseMode::TemplateFallback
+        )
+    }
+}
+
+impl std::fmt::Display for ResponseMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str((*self).as_str())
+    }
+}
+
+impl From<&str> for ResponseMode {
+    fn from(s: &str) -> Self {
+        match s {
+            // LLM related direct modes
+            "LLM_DIRECT" | "LLM_ENRICHED" | "LLM_TOOL_LOOP" => Self::LlmDirect,
+            // Tool loop fallback modes
+            "TOOL_ONLY_FALLBACK" | "TOOL_LOOP_FALLBACK" => Self::ToolLoopFallback,
+            // Context composed (non-fallback)
+            "CONTEXT_COMPOSED" | "CONTEXT_COMPOSED_FALLBACK" => Self::ContextComposed,
+            // Template fallback path
+            "TEMPLATE_FALLBACK" => Self::TemplateFallback,
+            // Fallback to a reasonable default to avoid panics on unknown inputs
+            _ => Self::LlmDirect,
+        }
+    }
+}
+
 impl ExecutionPlan {
     /// Creates a new execution plan.
     pub fn new(plan_id: String, request_id: String, intent: Intent, policy: PlanPolicy) -> Self {
@@ -280,6 +336,76 @@ mod tests {
         // Running → Completed
         assert!(step.transition(StepState::Completed).is_ok());
         assert_eq!(step.state, StepState::Completed);
+    }
+
+    #[test]
+    fn test_from_str_mapping() {
+        // Basic mappings
+        assert_eq!(ResponseMode::from("LLM_ENRICHED"), ResponseMode::LlmDirect);
+        assert_eq!(ResponseMode::from("LLM_TOOL_LOOP"), ResponseMode::LlmDirect);
+        assert_eq!(
+            ResponseMode::from("TOOL_ONLY_FALLBACK"),
+            ResponseMode::ToolLoopFallback
+        );
+        assert_eq!(
+            ResponseMode::from("TOOL_LOOP_FALLBACK"),
+            ResponseMode::ToolLoopFallback
+        );
+        assert_eq!(
+            ResponseMode::from("CONTEXT_COMPOSED"),
+            ResponseMode::ContextComposed
+        );
+        assert_eq!(
+            ResponseMode::from("CONTEXT_COMPOSED_FALLBACK"),
+            ResponseMode::ContextComposed
+        );
+        assert_eq!(
+            ResponseMode::from("TEMPLATE_FALLBACK"),
+            ResponseMode::TemplateFallback
+        );
+    }
+
+    #[test]
+    fn test_is_fallback_variants() {
+        assert!(!ResponseMode::LlmDirect.is_fallback());
+        assert!(!ResponseMode::ContextComposed.is_fallback());
+        assert!(ResponseMode::ToolLoopFallback.is_fallback());
+        assert!(ResponseMode::TemplateFallback.is_fallback());
+    }
+
+    #[test]
+    fn test_display_uses_stable_metadata_strings() {
+        assert_eq!(ResponseMode::LlmDirect.to_string(), "LLM_DIRECT");
+        assert_eq!(
+            ResponseMode::ToolLoopFallback.to_string(),
+            "TOOL_ONLY_FALLBACK"
+        );
+        assert_eq!(
+            ResponseMode::ContextComposed.to_string(),
+            "CONTEXT_COMPOSED"
+        );
+        assert_eq!(
+            ResponseMode::TemplateFallback.to_string(),
+            "TEMPLATE_FALLBACK"
+        );
+    }
+
+    #[test]
+    fn test_response_mode_enum_coverage() {
+        let cases = [
+            ("LLM_DIRECT", ResponseMode::LlmDirect),
+            ("LLM_ENRICHED", ResponseMode::LlmDirect),
+            ("LLM_TOOL_LOOP", ResponseMode::LlmDirect),
+            ("TOOL_ONLY_FALLBACK", ResponseMode::ToolLoopFallback),
+            ("TOOL_LOOP_FALLBACK", ResponseMode::ToolLoopFallback),
+            ("CONTEXT_COMPOSED", ResponseMode::ContextComposed),
+            ("CONTEXT_COMPOSED_FALLBACK", ResponseMode::ContextComposed),
+            ("TEMPLATE_FALLBACK", ResponseMode::TemplateFallback),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(ResponseMode::from(input), expected, "mode {input}");
+        }
     }
 
     #[test]
