@@ -376,7 +376,7 @@ async fn execute_ask_internal(
         ));
     }
 
-    let classifier = IntentClassifier::new();
+    let classifier = IntentClassifier::default();
     let intent = classifier.classify(&args.input);
 
     let intent_kind = match intent.kind {
