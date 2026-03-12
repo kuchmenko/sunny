@@ -132,6 +132,19 @@ impl WorkspaceReadAgent {
         }
     }
 
+    fn build_system_prompt(query: &str, root_path: &Path) -> String {
+        format!(
+            "The user asked: {}. Explore the codebase at: {} using the fs_scan, fs_read, and text_grep tools. \
+             Focus on what the user asked, prioritize key architecture files over exhaustive reads, \
+             make at most {} tool calls, read at most {} files, and stop when you have enough context. \
+             Be specific and reference actual file paths in your findings.",
+            query.trim(),
+            root_path.display(),
+            max_tool_iterations(),
+            tool_loop_max_read_calls()
+        )
+    }
+
     fn contains_git_component(path: &Path) -> bool {
         path.components()
             .any(|component| component.as_os_str() == std::ffi::OsStr::new(".git"))
@@ -736,38 +749,31 @@ impl Agent for WorkspaceReadAgent {
         );
 
         let request = LlmRequest {
-        messages: vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: format!(
-                    "You are a codebase analysis assistant. Use the fs_scan, fs_read, and text_grep tools to explore the codebase at: {}. \
-                     Focus on key architecture files and avoid exhaustive reads. \
-                     Read at most {} files and stop when enough context is gathered. \
-                     Provide a concise summary of structure and key modules.",
-                    root_path.display(),
-                    tool_loop_max_read_calls()
-                ),
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: format!(
-                    "User request: {}\nAnalyze the codebase at: {}",
-                    query,
-                    root_path.display()
-                ),
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-            },
-        ],
-        max_tokens: Some(2048),
-        temperature: Some(1.0),
-        tools: Some(Self::build_tool_definitions()),
-        tool_choice: Some(ToolChoice::Auto),
-    };
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: Self::build_system_prompt(&query, &root_path),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: format!(
+                        "User request: {}\nAnalyze the codebase at: {}",
+                        query,
+                        root_path.display()
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+            ],
+            max_tokens: Some(2048),
+            temperature: Some(1.0),
+            tools: Some(Self::build_tool_definitions()),
+            tool_choice: Some(ToolChoice::Auto),
+        };
 
         let loop_runner = ToolCallLoop::new(
             provider.clone(),
@@ -920,7 +926,8 @@ mod tests {
     };
 
     use super::{
-        tool_loop_max_read_calls, tool_uses_read_budget, CodebaseResult, WorkspaceReadAgent,
+        max_tool_iterations, tool_loop_max_read_calls, tool_uses_read_budget, CodebaseResult,
+        WorkspaceReadAgent,
     };
 
     fn mk_ctx() -> AgentContext {
@@ -934,6 +941,18 @@ mod tests {
             id: "task-1".to_string(),
             content: path.to_string(),
             metadata: HashMap::new(),
+        }
+    }
+
+    fn mk_msg_with_query(path: &str, query: &str) -> AgentMessage {
+        let mut metadata = HashMap::new();
+        metadata.insert("_sunny.cwd".to_string(), path.to_string());
+        metadata.insert("_sunny.query".to_string(), query.to_string());
+
+        AgentMessage::Task {
+            id: "task-1".to_string(),
+            content: path.to_string(),
+            metadata,
         }
     }
 
@@ -1294,6 +1313,7 @@ mod tests {
     async fn test_workspace_read_agent_prompt_matches_read_budget() {
         let dir = mk_temp_dir("prompt_budget");
         fs::write(dir.join("main.rs"), "fn main() {}\n").expect("write file");
+        let query = "trace how the planner builds the execution graph";
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(RequestCapturingProvider {
@@ -1315,16 +1335,26 @@ mod tests {
         let agent = WorkspaceReadAgent::new(Some(provider));
 
         agent
-            .handle_message(mk_msg(dir.to_str().expect("path str")), &mk_ctx())
+            .handle_message(
+                mk_msg_with_query(dir.to_str().expect("path str"), query),
+                &mk_ctx(),
+            )
             .await
             .expect("agent response");
 
         let requests = seen.lock().await;
         let system_prompt = &requests[0].messages[0].content;
+        assert!(system_prompt.contains(query));
+        assert!(system_prompt.contains(&dir.display().to_string()));
         assert!(system_prompt.contains(&format!(
-            "Read at most {} files",
+            "make at most {} tool calls",
+            max_tool_iterations()
+        )));
+        assert!(system_prompt.contains(&format!(
+            "read at most {} files",
             tool_loop_max_read_calls()
         )));
+        assert!(system_prompt.starts_with("The user asked:"));
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
