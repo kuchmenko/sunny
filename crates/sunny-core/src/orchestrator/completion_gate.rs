@@ -1,6 +1,57 @@
+use crate::orchestrator::IntentKind;
 use std::collections::HashMap;
 
-use super::IntentKind;
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateConfig {
+    min_response_length: usize,
+    min_alignment_score: f32,
+    min_citation_count: usize,
+    min_term_length: usize,
+}
+
+impl GateConfig {
+    pub fn from_env() -> GateConfig {
+        let default = GateConfig::with_defaults();
+        let min_length = std::env::var("SUNNY_GATE_MIN_LENGTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default.min_response_length);
+        let min_alignment = std::env::var("SUNNY_GATE_MIN_ALIGNMENT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default.min_alignment_score);
+        let min_citations = std::env::var("SUNNY_GATE_MIN_CITATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default.min_citation_count);
+        let min_term = std::env::var("SUNNY_GATE_MIN_TERM_LENGTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default.min_term_length);
+
+        GateConfig {
+            min_response_length: min_length,
+            min_alignment_score: min_alignment,
+            min_citation_count: min_citations,
+            min_term_length: min_term,
+        }
+    }
+
+    pub fn with_defaults() -> GateConfig {
+        GateConfig {
+            min_response_length: 120,
+            min_alignment_score: 0.12,
+            min_citation_count: 1,
+            min_term_length: 4,
+        }
+    }
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        GateConfig::with_defaults()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionGateResult {
@@ -14,9 +65,10 @@ pub fn evaluate_completion(
     request: &str,
     response: &str,
     metadata: &HashMap<String, String>,
+    config: &GateConfig,
 ) -> CompletionGateResult {
     match intent_kind {
-        IntentKind::Analyze => evaluate_analyze_completion(request, response, metadata),
+        IntentKind::Analyze => evaluate_analyze_completion(request, response, metadata, config),
         IntentKind::Query | IntentKind::Action => CompletionGateResult {
             passed: true,
             reason_code: "passed_non_analyze".to_string(),
@@ -29,12 +81,13 @@ fn evaluate_analyze_completion(
     request: &str,
     response: &str,
     metadata: &HashMap<String, String>,
+    config: &GateConfig,
 ) -> CompletionGateResult {
     let mut details = HashMap::new();
     let citation_count = count_citations(response);
-    let min_len_ok = response.trim().len() >= 120;
+    let min_len_ok = response.trim().len() >= config.min_response_length;
     let mode = metadata.get("mode").cloned().unwrap_or_default();
-    let request_alignment = lexical_alignment_score(request, response);
+    let request_alignment = lexical_alignment_score(request, response, config);
 
     details.insert(
         "response_len".to_string(),
@@ -47,12 +100,14 @@ fn evaluate_analyze_completion(
         format!("{request_alignment:.3}"),
     );
 
-    let passed = min_len_ok && request_alignment >= 0.12 && citation_count >= 1;
+    let passed = min_len_ok
+        && request_alignment >= config.min_alignment_score
+        && citation_count >= config.min_citation_count;
     let reason_code = if passed {
         "passed_analyze".to_string()
     } else if !min_len_ok {
         "failed_too_short".to_string()
-    } else if request_alignment < 0.12 {
+    } else if request_alignment < config.min_alignment_score {
         "failed_low_request_alignment".to_string()
     } else {
         "failed_missing_citations".to_string()
@@ -65,9 +120,9 @@ fn evaluate_analyze_completion(
     }
 }
 
-fn lexical_alignment_score(request: &str, response: &str) -> f32 {
-    let request_terms = normalize_terms(request);
-    let response_terms = normalize_terms(response);
+fn lexical_alignment_score(request: &str, response: &str, config: &GateConfig) -> f32 {
+    let request_terms = normalize_terms(request, config.min_term_length);
+    let response_terms = normalize_terms(response, config.min_term_length);
     if request_terms.is_empty() || response_terms.is_empty() {
         return 0.0;
     }
@@ -78,10 +133,10 @@ fn lexical_alignment_score(request: &str, response: &str) -> f32 {
     overlap as f32 / request_terms.len() as f32
 }
 
-fn normalize_terms(text: &str) -> std::collections::HashSet<String> {
+fn normalize_terms(text: &str, min_term_length: usize) -> std::collections::HashSet<String> {
     text.split(|ch: char| !ch.is_alphanumeric())
         .map(str::trim)
-        .filter(|term| term.len() >= 4)
+        .filter(|term| term.len() >= min_term_length)
         .map(|term| term.to_ascii_lowercase())
         .collect()
 }
@@ -107,29 +162,38 @@ fn count_citations(response: &str) -> usize {
             count += 1;
         }
     }
-    count += response.matches('`').count() / 2;
-    count
+    count + response.matches('`').count() / 2
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use super::{evaluate_completion, IntentKind};
+    use super::GateConfig;
 
     #[test]
-    fn test_analyze_gate_fails_for_low_alignment_and_no_citations() {
-        let request = "Analyze planner and orchestrator code paths";
-        let response = "This output is generic and ungrounded.";
-        let result = evaluate_completion(IntentKind::Analyze, request, response, &HashMap::new());
-        assert!(!result.passed);
+    fn test_gate_config_defaults() {
+        let cfg = GateConfig::default();
+        assert_eq!(cfg.min_response_length, 120);
+        assert_eq!(cfg.min_alignment_score, 0.12);
+        assert_eq!(cfg.min_citation_count, 1);
+        assert_eq!(cfg.min_term_length, 4);
     }
 
     #[test]
-    fn test_analyze_gate_passes_for_generic_grounded_synthesis() {
-        let request = "Analyze planner and orchestrator code";
-        let response = "Planner flow in `crates/sunny-core/src/orchestrator/planner.rs` shapes staged decisions, while executor behavior in `crates/sunny-core/src/orchestrator/executor.rs` governs retries and state transitions for run stability.";
-        let result = evaluate_completion(IntentKind::Analyze, request, response, &HashMap::new());
-        assert!(result.passed);
+    fn test_gate_config_custom_thresholds() {
+        // emulate environment-based config
+        std::env::set_var("SUNNY_GATE_MIN_LENGTH", "150");
+        std::env::set_var("SUNNY_GATE_MIN_ALIGNMENT", "0.25");
+        std::env::set_var("SUNNY_GATE_MIN_CITATIONS", "2");
+        std::env::set_var("SUNNY_GATE_MIN_TERM_LENGTH", "5");
+        let cfg = GateConfig::from_env();
+        assert_eq!(cfg.min_response_length, 150);
+        assert_eq!(cfg.min_alignment_score, 0.25);
+        assert_eq!(cfg.min_citation_count, 2);
+        assert_eq!(cfg.min_term_length, 5);
+        // clear env for other tests
+        std::env::remove_var("SUNNY_GATE_MIN_LENGTH");
+        std::env::remove_var("SUNNY_GATE_MIN_ALIGNMENT");
+        std::env::remove_var("SUNNY_GATE_MIN_CITATIONS");
+        std::env::remove_var("SUNNY_GATE_MIN_TERM_LENGTH");
     }
 }

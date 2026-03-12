@@ -19,7 +19,7 @@ pub mod supervision;
 pub mod telemetry;
 
 pub use classifier::IntentClassifier;
-pub use completion_gate::{evaluate_completion, CompletionGateResult};
+pub use completion_gate::{evaluate_completion, CompletionGateResult, GateConfig};
 pub use context::{PlanId, RequestId, StepId};
 pub use error::{OrchestratorError, PlanError, RegistryError};
 pub use events::{

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::sync::OnceLock;
 use sunny_core::agent::{
     Agent, AgentContext, AgentCost, AgentError, AgentMessage, AgentMetadata, AgentMode,
     AgentResponse, Capability,
@@ -16,7 +17,11 @@ use crate::git_tools::{GitDiff, GitLog, GitStatus};
 use crate::timeouts::explore_tool_loop_budget;
 use crate::tool_loop::{ToolCallError, ToolCallLoop};
 
-const MAX_TOOL_ITERATIONS: usize = 15;
+static MAX_TOOL_ITERATIONS: OnceLock<usize> = OnceLock::new();
+pub(crate) fn max_tool_iterations() -> usize {
+    *MAX_TOOL_ITERATIONS
+        .get_or_init(|| crate::timeouts::usize_from_env("SUNNY_MAX_TOOL_ITERATIONS_EXPLORE", 15))
+}
 
 pub struct ExploreAgent {
     provider: Option<Arc<dyn LlmProvider>>,
@@ -433,7 +438,7 @@ impl Agent for ExploreAgent {
         let loop_runner = ToolCallLoop::new(
             provider.clone(),
             Self::build_tool_policy(),
-            MAX_TOOL_ITERATIONS,
+            max_tool_iterations(),
             self.cancel.child_token(),
         );
 
