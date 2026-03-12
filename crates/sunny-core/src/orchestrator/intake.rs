@@ -2,12 +2,55 @@ use crate::agent::{AgentMessage, Capability};
 use crate::orchestrator::intent::Intent;
 use crate::orchestrator::RequestId;
 use crate::orchestrator::WorkspaceExtensions;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const ALLOWED_CAPABILITIES: &[&str] = &["query", "analyze", "action", "explore", "advise"];
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityRegistry {
+    allowed: HashSet<String>,
+}
+
+impl CapabilityRegistry {
+    pub fn from_env() -> Self {
+        Self::from_env_value(std::env::var("SUNNY_CAPABILITIES").ok().as_deref())
+    }
+
+    pub fn is_allowed(&self, cap: &str) -> bool {
+        self.allowed.contains(cap)
+    }
+
+    fn from_env_value(value: Option<&str>) -> Self {
+        match value {
+            Some(raw) => {
+                let allowed = raw
+                    .split(',')
+                    .map(|capability| capability.trim().to_ascii_lowercase())
+                    .filter(|capability| !capability.is_empty())
+                    .collect::<HashSet<_>>();
+
+                if allowed.is_empty() {
+                    Self::default()
+                } else {
+                    Self { allowed }
+                }
+            }
+            None => Self::default(),
+        }
+    }
+}
+
+impl Default for CapabilityRegistry {
+    fn default() -> Self {
+        Self {
+            allowed: ["query", "analyze", "action", "explore", "advise"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PlanningIntakeInput {
@@ -260,7 +303,7 @@ fn parse_raw_advice(raw_advice: RawIntakeAdvice) -> Result<PlanHints, IntakeAdvi
             let normalized = capability.trim().to_ascii_lowercase();
             if normalized.is_empty() {
                 None
-            } else if ALLOWED_CAPABILITIES.contains(&normalized.as_str()) {
+            } else if CapabilityRegistry::default().is_allowed(&normalized) {
                 Some(Capability(normalized))
             } else {
                 return Err(IntakeAdvisorError::InvalidCapability(capability));
@@ -307,7 +350,9 @@ fn parse_raw_advice(raw_advice: RawIntakeAdvice) -> Result<PlanHints, IntakeAdvi
 mod tests {
     use super::*;
     use crate::orchestrator::intent::IntentKind;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[derive(Debug)]
     struct StubAdvisor {
@@ -490,5 +535,33 @@ mod tests {
         assert!(summary.contains("cwd=/repo"));
         assert!(summary.contains("query_root=/repo/src"));
         assert!(summary.contains("git_repo=true"));
+    }
+
+    #[test]
+    fn test_capability_registry_default_includes_all() {
+        let registry = CapabilityRegistry::default();
+
+        for capability in ["query", "analyze", "action", "explore", "advise"] {
+            assert!(
+                registry.is_allowed(capability),
+                "expected default registry to allow {capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_capability_registry_from_env() {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned");
+
+        std::env::set_var("SUNNY_CAPABILITIES", "query, delegate");
+        let registry = CapabilityRegistry::from_env();
+        std::env::remove_var("SUNNY_CAPABILITIES");
+
+        assert!(registry.is_allowed("query"));
+        assert!(registry.is_allowed("delegate"));
+        assert!(!registry.is_allowed("analyze"));
     }
 }
