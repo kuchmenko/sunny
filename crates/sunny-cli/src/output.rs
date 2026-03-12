@@ -143,13 +143,7 @@ pub fn format_prompt_text(output: &PromptOutput) -> String {
     }
 
     if let Some(response) = &output.response {
-        let (preview, truncated) = response_preview(response, 4000);
-        result.push_str(&format!("Response: {}\n", preview));
-        if truncated {
-            result.push_str(
-                "Response truncated. Use --format json for full payload or check debug logs.\n",
-            );
-        }
+        result.push_str(&format!("Response: {}\n", response));
     }
 
     if !output.warnings.is_empty() {
@@ -204,11 +198,7 @@ pub fn format_prompt_pretty(output: &PromptOutput) -> String {
     }
 
     if let Some(response) = &output.response {
-        let (preview, truncated) = response_preview(response, 4000);
-        result.push_str(&format!("\n💬 Response:\n{}\n", preview));
-        if truncated {
-            result.push_str("ℹ️ Response truncated. Use --format json for full payload.\n");
-        }
+        result.push_str(&format!("\n\u{1f4ac} Response:\n{}\n", response));
     }
 
     if !output.warnings.is_empty() {
@@ -229,16 +219,6 @@ pub fn format_prompt_pretty(output: &PromptOutput) -> String {
     }
 
     result
-}
-
-fn response_preview(response: &str, max_chars: usize) -> (String, bool) {
-    let count = response.chars().count();
-    if count <= max_chars {
-        return (response.to_string(), false);
-    }
-
-    let preview = response.chars().take(max_chars).collect::<String>();
-    (preview, true)
 }
 
 #[cfg(test)]
@@ -335,11 +315,16 @@ mod tests {
     }
 
     #[test]
-    fn test_format_prompt_text_truncates_large_response() {
+    fn test_format_prompt_text_large_response_not_truncated() {
         let mut output = sample_prompt_output();
-        output.response = Some("x".repeat(5000));
+        let long = "x".repeat(5000);
+        output.response = Some(long.clone());
 
         let formatted = format_prompt_text(&output);
-        assert!(formatted.contains("Response truncated."));
+        assert!(
+            formatted.contains(&long),
+            "full response must appear in output"
+        );
+        assert!(!formatted.contains("Response truncated."));
     }
 }
