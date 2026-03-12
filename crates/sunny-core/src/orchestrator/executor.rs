@@ -369,7 +369,7 @@ fn compose_evidence_action(
             let max_section_len = MAX_EVIDENCE_BYTES / evidence_parts.len();
             let max_content_len = max_section_len.saturating_sub(section_overhead);
             if content.len() > max_content_len {
-                let marker = format!("\n[TRUNCATED - {}B -> {}B]", content.len(), max_content_len);
+                let marker = format!("\n[TRUNCATED — {}B → {}B]", content.len(), max_content_len);
                 let marker_len = marker.len();
                 let content_slice_len = max_content_len.saturating_sub(marker_len);
                 format!("{}{}", &content[..content_slice_len], marker)
