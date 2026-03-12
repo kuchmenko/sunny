@@ -136,6 +136,20 @@ impl<'a> PlanExecutor<'a> {
                 break;
             };
 
+            let composed_action = {
+                let step = &plan.steps[step_idx];
+                let composed = compose_evidence_action(&step.action, plan, &step.depends_on);
+                if !step.depends_on.is_empty() {
+                    tracing::debug!(
+                        event = "orchestrator.step.evidence_composed",
+                        step_id = %step.step_id,
+                        dependency_count = step.depends_on.len(),
+                        total_evidence_bytes = composed.len().saturating_sub(step.action.len()),
+                    );
+                }
+                composed
+            };
+
             let step = &mut plan.steps[step_idx];
             step.transition(StepState::Ready)?;
             step.transition(StepState::Running)?;
@@ -157,7 +171,7 @@ impl<'a> PlanExecutor<'a> {
                             capability,
                             AgentMessage::Task {
                                 id: step.step_id.clone(),
-                                content: step.action.clone(),
+                                content: composed_action.clone(),
                                 metadata: step.metadata.clone(),
                             },
                             request_id,
@@ -310,6 +324,70 @@ fn skip_unprocessed_steps(plan: &mut ExecutionPlan) -> Result<(), OrchestratorEr
     Ok(())
 }
 
+fn compose_evidence_action(
+    original_action: &str,
+    plan: &ExecutionPlan,
+    depends_on: &[String],
+) -> String {
+    if depends_on.is_empty() {
+        return original_action.to_string();
+    }
+
+    const MAX_EVIDENCE_BYTES: usize = 32768;
+
+    let evidence_parts: Vec<(String, String, String)> = plan
+        .steps
+        .iter()
+        .filter(|s| depends_on.contains(&s.step_id))
+        .filter_map(|s| {
+            if let Some(StepOutcome::Success { content }) = &s.outcome {
+                let capability = s
+                    .required_capability
+                    .as_ref()
+                    .map(|capability| capability.0.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                Some((s.step_id.clone(), capability, content.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if evidence_parts.is_empty() {
+        return original_action.to_string();
+    }
+
+    let total_raw: usize = evidence_parts.iter().map(|(_, _, c)| c.len()).sum();
+
+    let mut composed = String::new();
+    for (step_id, capability, content) in &evidence_parts {
+        let truncated_content = if total_raw > MAX_EVIDENCE_BYTES {
+            let section_overhead = format!(
+                "<gathered_evidence>\n## Evidence from step \"{step_id}\" ({capability})\n\n</gathered_evidence>\n"
+            )
+            .len();
+            let max_section_len = MAX_EVIDENCE_BYTES / evidence_parts.len();
+            let max_content_len = max_section_len.saturating_sub(section_overhead);
+            if content.len() > max_content_len {
+                let marker = format!("\n[TRUNCATED - {}B -> {}B]", content.len(), max_content_len);
+                let marker_len = marker.len();
+                let content_slice_len = max_content_len.saturating_sub(marker_len);
+                format!("{}{}", &content[..content_slice_len], marker)
+            } else {
+                content.clone()
+            }
+        } else {
+            content.clone()
+        };
+        composed.push_str(&format!(
+            "<gathered_evidence>\n## Evidence from step \"{step_id}\" ({capability})\n{truncated_content}\n</gathered_evidence>\n"
+        ));
+    }
+
+    composed.push_str(original_action);
+    composed
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -328,7 +406,7 @@ mod tests {
         StepState,
     };
 
-    use super::{PlanExecutor, PlanOutcome};
+    use super::{compose_evidence_action, PlanExecutor, PlanOutcome};
 
     struct FlakyAgent {
         fail_attempts: u32,
@@ -394,6 +472,7 @@ mod tests {
 
     struct RecordingAgent {
         seen: Arc<Mutex<Vec<String>>>,
+        received_content: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -411,12 +490,49 @@ mod tests {
             msg: AgentMessage,
             _ctx: &AgentContext,
         ) -> Result<AgentResponse, AgentError> {
-            let AgentMessage::Task { id, .. } = msg;
+            let AgentMessage::Task { id, content, .. } = msg;
             self.seen.lock().await.push(id);
+            self.received_content.lock().await.push(content);
             Ok(AgentResponse::Success {
                 content: "ok".to_string(),
                 metadata: HashMap::new(),
             })
+        }
+    }
+
+    struct ContentCapturingAgent {
+        responses: HashMap<String, AgentResponse>,
+        received_by_step: Arc<Mutex<HashMap<String, String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for ContentCapturingAgent {
+        fn name(&self) -> &str {
+            "content-capturer"
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability("analyze".to_string())]
+        }
+
+        async fn handle_message(
+            &self,
+            msg: AgentMessage,
+            _ctx: &AgentContext,
+        ) -> Result<AgentResponse, AgentError> {
+            let AgentMessage::Task { id, content, .. } = msg;
+            self.received_by_step
+                .lock()
+                .await
+                .insert(id.clone(), content);
+            Ok(self
+                .responses
+                .get(&id)
+                .cloned()
+                .unwrap_or(AgentResponse::Success {
+                    content: "ok".to_string(),
+                    metadata: HashMap::new(),
+                }))
         }
     }
 
@@ -444,9 +560,13 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut registry = crate::orchestrator::AgentRegistry::new();
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let received_content = Arc::new(Mutex::new(Vec::new()));
 
         let recorder = AgentHandle::spawn(
-            Arc::new(RecordingAgent { seen: seen.clone() }),
+            Arc::new(RecordingAgent {
+                seen: seen.clone(),
+                received_content: received_content.clone(),
+            }),
             cancel.child_token(),
         );
         registry
@@ -638,9 +758,13 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut registry = crate::orchestrator::AgentRegistry::new();
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let received_content = Arc::new(Mutex::new(Vec::new()));
 
         let recorder = AgentHandle::spawn(
-            Arc::new(RecordingAgent { seen: seen.clone() }),
+            Arc::new(RecordingAgent {
+                seen: seen.clone(),
+                received_content: received_content.clone(),
+            }),
             cancel.child_token(),
         );
         registry
@@ -809,9 +933,13 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut registry = crate::orchestrator::AgentRegistry::new();
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let received_content = Arc::new(Mutex::new(Vec::new()));
 
         let recorder = AgentHandle::spawn(
-            Arc::new(RecordingAgent { seen: seen.clone() }),
+            Arc::new(RecordingAgent {
+                seen: seen.clone(),
+                received_content: received_content.clone(),
+            }),
             cancel.child_token(),
         );
         registry
@@ -857,5 +985,308 @@ mod tests {
             *seen.lock().await,
             vec!["step-1".to_string(), "step-2".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn test_evidence_composition_single_dependency_success() {
+        let cancel = CancellationToken::new();
+        let mut registry = crate::orchestrator::AgentRegistry::new();
+        let received_by_step = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            "step-A".to_string(),
+            AgentResponse::Success {
+                content: "found: foo.rs".to_string(),
+                metadata: HashMap::new(),
+            },
+        );
+        responses.insert(
+            "step-B".to_string(),
+            AgentResponse::Success {
+                content: "processed".to_string(),
+                metadata: HashMap::new(),
+            },
+        );
+
+        let recorder = AgentHandle::spawn(
+            Arc::new(ContentCapturingAgent {
+                responses,
+                received_by_step: received_by_step.clone(),
+            }),
+            cancel.child_token(),
+        );
+        registry
+            .register(
+                "analyzer-evidence".to_string(),
+                recorder,
+                vec![Capability("analyze".to_string())],
+            )
+            .expect("register capturing agent");
+
+        let orchestrator = crate::orchestrator::OrchestratorHandle::spawn_with_routing(
+            registry,
+            Box::new(crate::orchestrator::NameRouting),
+            cancel.child_token(),
+        );
+
+        let mut plan = make_plan("plan-evidence-success", &uuid::Uuid::new_v4().to_string());
+        plan.add_step(PlanStep::new(
+            "step-A".to_string(),
+            "collect evidence".to_string(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+        ))
+        .expect("add step A");
+        plan.add_step(PlanStep::new_with_metadata(
+            "step-B".to_string(),
+            "use evidence".to_string(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+            HashMap::new(),
+            vec!["step-A".to_string()],
+        ))
+        .expect("add step B");
+
+        let executor = PlanExecutor::new(&orchestrator);
+        let result = executor
+            .execute(&mut plan, cancel.child_token())
+            .await
+            .expect("plan executes");
+
+        assert_eq!(result.overall_outcome, PlanOutcome::Success);
+        let received = received_by_step.lock().await;
+        let step_b_content = received.get("step-B").expect("step-B content captured");
+        assert!(step_b_content.contains("<gathered_evidence>"));
+        assert!(step_b_content.contains("found: foo.rs"));
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_evidence_composition_no_dependencies() {
+        let cancel = CancellationToken::new();
+        let mut registry = crate::orchestrator::AgentRegistry::new();
+        let received_by_step = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            "step-A".to_string(),
+            AgentResponse::Success {
+                content: "done".to_string(),
+                metadata: HashMap::new(),
+            },
+        );
+
+        let recorder = AgentHandle::spawn(
+            Arc::new(ContentCapturingAgent {
+                responses,
+                received_by_step: received_by_step.clone(),
+            }),
+            cancel.child_token(),
+        );
+        registry
+            .register(
+                "analyzer-nodeps".to_string(),
+                recorder,
+                vec![Capability("analyze".to_string())],
+            )
+            .expect("register capturing agent");
+
+        let orchestrator = crate::orchestrator::OrchestratorHandle::spawn_with_routing(
+            registry,
+            Box::new(crate::orchestrator::NameRouting),
+            cancel.child_token(),
+        );
+
+        let mut plan = make_plan("plan-evidence-nodeps", &uuid::Uuid::new_v4().to_string());
+        let original_action = "run standalone".to_string();
+        plan.add_step(PlanStep::new(
+            "step-A".to_string(),
+            original_action.clone(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+        ))
+        .expect("add step A");
+
+        let executor = PlanExecutor::new(&orchestrator);
+        let result = executor
+            .execute(&mut plan, cancel.child_token())
+            .await
+            .expect("plan executes");
+
+        assert_eq!(result.overall_outcome, PlanOutcome::Success);
+        let received = received_by_step.lock().await;
+        assert_eq!(
+            received.get("step-A").expect("step-A content captured"),
+            &original_action
+        );
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_evidence_composition_failed_dependency_skipped() {
+        let cancel = CancellationToken::new();
+        let mut registry = crate::orchestrator::AgentRegistry::new();
+        let received_by_step = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            "step-A".to_string(),
+            AgentResponse::Error {
+                code: "failed".to_string(),
+                message: "dependency failed".to_string(),
+            },
+        );
+        responses.insert(
+            "step-B".to_string(),
+            AgentResponse::Success {
+                content: "done".to_string(),
+                metadata: HashMap::new(),
+            },
+        );
+
+        let recorder = AgentHandle::spawn(
+            Arc::new(ContentCapturingAgent {
+                responses,
+                received_by_step: received_by_step.clone(),
+            }),
+            cancel.child_token(),
+        );
+        registry
+            .register(
+                "analyzer-failed-dep".to_string(),
+                recorder,
+                vec![Capability("analyze".to_string())],
+            )
+            .expect("register capturing agent");
+
+        let orchestrator = crate::orchestrator::OrchestratorHandle::spawn_with_routing(
+            registry,
+            Box::new(crate::orchestrator::NameRouting),
+            cancel.child_token(),
+        );
+
+        let mut plan = make_plan("plan-evidence-failed", &uuid::Uuid::new_v4().to_string());
+        plan.policy.max_retries = 0;
+        plan.add_step(PlanStep::new(
+            "step-A".to_string(),
+            "collect evidence".to_string(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+        ))
+        .expect("add step A");
+        let original_step_b_action = "use evidence".to_string();
+        plan.add_step(PlanStep::new_with_metadata(
+            "step-B".to_string(),
+            original_step_b_action.clone(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+            HashMap::new(),
+            vec!["step-A".to_string()],
+        ))
+        .expect("add step B");
+
+        let executor = PlanExecutor::new(&orchestrator);
+        let result = executor
+            .execute(&mut plan, cancel.child_token())
+            .await
+            .expect("plan executes with failure");
+
+        assert_eq!(result.overall_outcome, PlanOutcome::Failed);
+        assert_eq!(plan.steps[0].state, StepState::Failed);
+        assert_eq!(plan.steps[1].state, StepState::Skipped);
+
+        let composed =
+            compose_evidence_action(&original_step_b_action, &plan, &plan.steps[1].depends_on);
+        assert_eq!(composed, original_step_b_action);
+        assert!(!composed.contains("<gathered_evidence>"));
+
+        let received = received_by_step.lock().await;
+        assert!(received.get("step-B").is_none());
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_evidence_composition_truncation() {
+        let cancel = CancellationToken::new();
+        let mut registry = crate::orchestrator::AgentRegistry::new();
+        let received_by_step = Arc::new(Mutex::new(HashMap::new()));
+
+        let large_content = "x".repeat(40 * 1024);
+        let mut responses = HashMap::new();
+        responses.insert(
+            "step-A".to_string(),
+            AgentResponse::Success {
+                content: large_content,
+                metadata: HashMap::new(),
+            },
+        );
+        responses.insert(
+            "step-B".to_string(),
+            AgentResponse::Success {
+                content: "done".to_string(),
+                metadata: HashMap::new(),
+            },
+        );
+
+        let recorder = AgentHandle::spawn(
+            Arc::new(ContentCapturingAgent {
+                responses,
+                received_by_step: received_by_step.clone(),
+            }),
+            cancel.child_token(),
+        );
+        registry
+            .register(
+                "analyzer-truncation".to_string(),
+                recorder,
+                vec![Capability("analyze".to_string())],
+            )
+            .expect("register capturing agent");
+
+        let orchestrator = crate::orchestrator::OrchestratorHandle::spawn_with_routing(
+            registry,
+            Box::new(crate::orchestrator::NameRouting),
+            cancel.child_token(),
+        );
+
+        let mut plan = make_plan(
+            "plan-evidence-truncation",
+            &uuid::Uuid::new_v4().to_string(),
+        );
+        plan.add_step(PlanStep::new(
+            "step-A".to_string(),
+            "collect huge evidence".to_string(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+        ))
+        .expect("add step A");
+        let original_action = "use huge evidence".to_string();
+        plan.add_step(PlanStep::new_with_metadata(
+            "step-B".to_string(),
+            original_action.clone(),
+            Some(Capability("analyze".to_string())),
+            5_000,
+            HashMap::new(),
+            vec!["step-A".to_string()],
+        ))
+        .expect("add step B");
+
+        let executor = PlanExecutor::new(&orchestrator);
+        let result = executor
+            .execute(&mut plan, cancel.child_token())
+            .await
+            .expect("plan executes");
+
+        assert_eq!(result.overall_outcome, PlanOutcome::Success);
+        let received = received_by_step.lock().await;
+        let step_b_content = received.get("step-B").expect("step-B content captured");
+        assert!(step_b_content.len() <= 32768 + original_action.len());
+        assert!(step_b_content.contains("[TRUNCATED"));
+
+        cancel.cancel();
     }
 }
