@@ -94,7 +94,16 @@ fn load_from_file(path: &Path) -> Result<AnthropicCredentials, LlmError> {
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    let expires_at = oauth.get("expiresAt").and_then(|v| v.as_u64());
+    // The Claude credentials file stores `expiresAt` in milliseconds.
+    // Values > 10^10 are ms timestamps; normalize to seconds so that
+    // `is_expired()` can compare against `SystemTime::now().as_secs()`.
+    let expires_at = oauth.get("expiresAt").and_then(|v| v.as_u64()).map(|ts| {
+        if ts > 10_000_000_000 {
+            ts / 1000
+        } else {
+            ts
+        }
+    });
 
     Ok(AnthropicCredentials {
         access_token,
@@ -239,6 +248,30 @@ mod tests {
         assert_eq!(creds.access_token, "tok-123");
         assert_eq!(creds.refresh_token, Some("ref-456".to_string()));
         assert_eq!(creds.expires_at, Some(9_999_999_999));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_from_file_normalizes_millisecond_expires_at() {
+        // Claude's credentials file stores expiresAt in milliseconds.
+        // Verify load_from_file converts to seconds so is_expired() works correctly.
+        let path = temp_file_path("anthropic_credentials_ms");
+        // Use a real-looking ms timestamp (current era, clearly expired).
+        let expired_ms: u64 = 1_000_000_000_001; // just over the threshold, in seconds ~year 2001
+        let payload = format!(
+            r#"{{"claudeAiOauth": {{"accessToken": "tok-ms", "expiresAt": {expired_ms}}}}}"#
+        );
+        std::fs::write(&path, &payload).expect("write test credentials");
+
+        let creds = load_from_file(&path).expect("load credentials");
+        // Must be stored as seconds (divided by 1000)
+        assert_eq!(creds.expires_at, Some(expired_ms / 1000));
+        // And that value (1_000_000_001 sec ≈ 2001) must be detected as expired
+        assert!(
+            creds.is_expired(),
+            "ms-normalized timestamp must be seen as expired"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
