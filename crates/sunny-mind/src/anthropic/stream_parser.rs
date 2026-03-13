@@ -169,10 +169,17 @@ impl StreamParser {
         self.block_types.remove(&index);
 
         if let Some(acc) = self.tool_calls.remove(&index) {
+            // If the model called a no-argument tool, the Anthropic API sends no
+            // input_json_delta events, leaving the buffer empty. Default to "{}".
+            let arguments = if acc.arguments_buf.is_empty() {
+                "{}".to_string()
+            } else {
+                acc.arguments_buf
+            };
             vec![Ok(StreamEvent::ToolCallComplete {
                 id: acc.id,
                 name: acc.name,
-                arguments: acc.arguments_buf,
+                arguments,
             })]
         } else {
             vec![]

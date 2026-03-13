@@ -186,6 +186,7 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
 pub fn build_tool_executor(root: PathBuf) -> Arc<ToolExecutor> {
     Arc::new(
         move |_id: &str, name: &str, args: &str, _depth: usize| -> Result<String, ToolError> {
+            let args = if args.trim().is_empty() { "{}" } else { args };
             let parsed: serde_json::Value =
                 serde_json::from_str(args).map_err(|e| ToolError::ExecutionFailed {
                     source: Box::new(e),
