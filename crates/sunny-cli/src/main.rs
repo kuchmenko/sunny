@@ -1,17 +1,13 @@
 use clap::Parser;
+use sunny_cli::commands::ChatArgs;
 
 #[derive(Parser, Debug)]
 #[command(name = "sunny")]
-#[command(about = "Sunny - AI Agent Runtime")]
-enum Cli {
-    /// Analyze a codebase
-    Analyze(crate::commands::AnalyzeArgs),
-    /// Ask the agent a question
-    Ask(crate::commands::AskArgs),
+#[command(about = "Sunny — AI coding assistant")]
+struct Cli {
+    #[command(flatten)]
+    chat: ChatArgs,
 }
-
-mod commands;
-mod output;
 
 #[tokio::main]
 async fn main() {
@@ -20,19 +16,9 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    match cli {
-        Cli::Analyze(args) => {
-            if let Err(e) = commands::analyze::run_analyze(args).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Cli::Ask(args) => {
-            if let Err(e) = commands::ask::run_ask(args).await {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
+    if let Err(e) = sunny_cli::commands::chat::run(cli.chat).await {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
     }
 }
 
@@ -41,20 +27,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cli_parse_analyze_subcommand() {
-        let cli = Cli::try_parse_from(["sunny", "analyze", "."]);
-        assert!(cli.is_ok(), "analyze subcommand should parse");
+    fn test_cli_parse_default_no_args() {
+        let cli = Cli::try_parse_from(["sunny"]);
+        assert!(cli.is_ok(), "bare sunny should parse without subcommand");
     }
 
     #[test]
-    fn test_cli_parse_ask_subcommand() {
-        let cli = Cli::try_parse_from(["sunny", "ask", "hello"]);
-        assert!(cli.is_ok(), "ask subcommand should parse");
+    fn test_cli_parse_with_model_flag() {
+        let cli = Cli::try_parse_from(["sunny", "--model", "claude-3-5-sonnet"]);
+        assert!(cli.is_ok(), "sunny --model should parse");
     }
 
     #[test]
-    fn test_cli_parse_ask_with_flags() {
-        let cli = Cli::try_parse_from(["sunny", "ask", "hello", "--format", "json", "--dry-run"]);
-        assert!(cli.is_ok(), "ask with flags should parse");
+    fn test_cli_parse_with_api_key_flag() {
+        let cli = Cli::try_parse_from(["sunny", "--api-key", "test-key"]);
+        assert!(cli.is_ok(), "sunny --api-key should parse");
     }
 }

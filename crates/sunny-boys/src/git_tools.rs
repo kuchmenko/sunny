@@ -118,6 +118,45 @@ impl GitStatus {
     }
 }
 
+/// Split `input` into tokens, respecting single- and double-quoted spans.
+///
+/// Quoted spans are stripped of their outer delimiters and may contain spaces.
+/// `\"` inside a double-quoted span yields a literal `"`.
+fn split_args(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '\\' if in_double => {
+                if let Some(&next) = chars.peek() {
+                    if next == '"' {
+                        chars.next();
+                        current.push('"');
+                    } else {
+                        current.push('\\');
+                    }
+                }
+            }
+            ' ' | '\t' if !in_single && !in_double => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// Validate that all flags in `args` are in the allowlist.
 ///
 /// Non-flag tokens (values for preceding flags) pass through.
@@ -127,11 +166,11 @@ fn validate_flags(args: &str, allowed: &[&str]) -> Result<Vec<String>, ToolError
         return Ok(Vec::new());
     }
 
-    let tokens: Vec<&str> = args.split_whitespace().collect();
+    let tokens: Vec<String> = split_args(args);
     for token in &tokens {
         if token.starts_with('-') {
             // Handle --flag=value by checking only the flag portion
-            let flag = token.split('=').next().unwrap_or(token);
+            let flag = token.split('=').next().unwrap_or(token.as_str());
             if !allowed.contains(&flag) {
                 return Err(ToolError::PermissionDenied {
                     path: format!("disallowed git flag: {token}"),
@@ -140,11 +179,12 @@ fn validate_flags(args: &str, allowed: &[&str]) -> Result<Vec<String>, ToolError
         }
     }
 
-    Ok(tokens.into_iter().map(String::from).collect())
+    Ok(tokens)
 }
 
 fn normalize_git_log_args(args: &str) -> String {
-    args.split_whitespace()
+    split_args(args)
+        .into_iter()
         .map(|token| {
             if token.starts_with('-')
                 && token.len() > 1
@@ -152,7 +192,7 @@ fn normalize_git_log_args(args: &str) -> String {
             {
                 format!("-n {}", &token[1..])
             } else {
-                token.to_string()
+                token
             }
         })
         .collect::<Vec<_>>()
@@ -426,5 +466,35 @@ mod tests {
             result.contains("[output truncated at 100KB]"),
             "should contain truncation marker"
         );
+    }
+
+    #[test]
+    fn test_split_args_simple() {
+        assert_eq!(split_args("--oneline -n 5"), vec!["--oneline", "-n", "5"]);
+    }
+
+    #[test]
+    fn test_split_args_quoted() {
+        assert_eq!(
+            split_args(r#"--format="%h %s %b" -n 5"#),
+            vec!["--format=%h %s %b", "-n", "5"]
+        );
+    }
+
+    #[test]
+    fn test_split_args_single_quotes() {
+        assert_eq!(split_args("--format='%h %s'"), vec!["--format=%h %s"]);
+    }
+
+    #[test]
+    fn test_split_args_empty() {
+        let result: Vec<String> = split_args("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_validate_flags_quoted_format() {
+        let result = validate_flags(r#"--format="%h %s" --oneline"#, GIT_LOG_ALLOWED);
+        assert!(result.is_ok(), "expected Ok but got: {:?}", result);
     }
 }

@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-sunny-core = { path = "../sunny-core" } # dep: agent system and orchestrator for CLI commands
+sunny-core = { path = "../sunny-core" } # dep: tool infrastructure for chat
 sunny-mind = { path = "../sunny-mind" } # dep: LLM provider for analysis enrichment
-sunny-boys = { path = "../sunny-boys" } # dep: reusable agents like AnalyzeAgent
+sunny-boys = { path = "../sunny-boys" } # dep: streaming tool loop and git tools for chat
 clap = { version = "4", features = ["derive"] } # dep: CLI argument parsing
 tokio = { version = "1", features = ["full"] } # dep: async runtime for CLI
 tokio-util = { version = "0.7", features = ["full"] } # dep: CancellationToken for graceful shutdown
@@ -16,8 +16,13 @@ tracing = "0.1" # dep: structured logging
 tracing-subscriber = "0.3" # dep: logging output for CLI
 dotenvy = "0.15" # dep: load .env variables for provider configuration
 thiserror = "1" # dep: error handling for CLI commands
-async-trait = "0.1" # dep: IntakeAdvisor trait impl
+anyhow = "1" # dep: error propagation in CLI command handlers
+async-trait = "0.1" # dep: async methods in LlmProvider test mocks (session.rs)
+rustyline = { version = "14", features = [] } # dep: REPL input with history and line editing
+crossterm = "0.27" # dep: terminal color output for tool indicators
+dirs = "5" # dep: locate home directory for OAuth credential file path
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] } # dep: async test runtime
+tokio-stream = "0.1" # dep: stream utilities for mock providers in tests
 tempfile = "3" # dep: isolated fixture directories for integration tests

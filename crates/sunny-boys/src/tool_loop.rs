@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +23,8 @@ pub struct ToolCallLoop<P: LlmProvider + ?Sized> {
     cancel: CancellationToken,
     tool_timeout: Duration,
     provider_timeout: Duration,
+    /// Tool names eligible for dedup caching within a single `run()` invocation.
+    dedup_tools: HashSet<String>,
 }
 
 /// Errors that can terminate a [`ToolCallLoop`] run.
@@ -123,7 +125,14 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
             cancel,
             tool_timeout: tool_call_timeout(),
             provider_timeout: tool_provider_timeout(),
+            dedup_tools: HashSet::new(),
         }
+    }
+
+    /// Configure which tool names are eligible for dedup caching within a single `run()` invocation.
+    pub fn with_dedup_tools(mut self, tools: HashSet<String>) -> Self {
+        self.dedup_tools = tools;
+        self
     }
 
     #[cfg(test)]
@@ -152,6 +161,7 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
         let mut depth = initial_depth;
         let mut last_recoverable_error: Option<String> = None;
         let mut recoverable_error_streak = 0usize;
+        let mut dedup_cache: HashMap<(String, String), String> = HashMap::new();
 
         loop {
             if self.cancel.is_cancelled() {
@@ -210,9 +220,25 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
                     let call_id = tool_call.id.clone();
                     let call_name = tool_call.name.clone();
                     let call_arguments = tool_call.arguments.clone();
+                    // Clone for the async move closure; originals used for dedup cache.
+                    let call_name_for_closure = call_name.clone();
+                    let call_arguments_for_closure = call_arguments.clone();
+                    // Dedup: return cached result for eligible read-only tools.
+                    let dedup_key = (call_name.clone(), call_arguments.clone());
+                    if self.dedup_tools.contains(&call_name) {
+                        if let Some(cached) = dedup_cache.get(&dedup_key) {
+                            tracing::debug!(
+                                event = "tool.dedup.cache_hit",
+                                tool_name = %call_name,
+                                "returning cached result"
+                            );
+                            tool_results.push((tool_call, cached.clone()));
+                            continue;
+                        }
+                    }
                     let tool_result = timeout(self.tool_timeout, async move {
                         tokio::task::spawn_blocking(move || {
-                            executor(&call_id, &call_name, &call_arguments, depth)
+                            executor(&call_id, &call_name_for_closure, &call_arguments_for_closure, depth)
                         })
                         .await
                         .map_err(|join_err| {
@@ -231,6 +257,10 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
                         Ok(Ok(content)) => {
                             last_recoverable_error = None;
                             recoverable_error_streak = 0;
+                            // Cache successful results for dedup-eligible tools.
+                            if self.dedup_tools.contains(&call_name) {
+                                dedup_cache.insert(dedup_key, content.clone());
+                            }
                             tool_results.push((tool_call, content));
                         }
                         Ok(Err(source)) => {
@@ -272,7 +302,7 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
                 "tool_call_iteration",
                 iteration,
                 depth,
-                event = sunny_core::orchestrator::events::EVENT_TOOL_EXEC_DEPTH,
+                event = sunny_core::events::EVENT_TOOL_EXEC_DEPTH,
             ))
             .await?;
 
@@ -305,7 +335,7 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -951,5 +981,99 @@ mod tests {
         assert_eq!(result.response.content, "done");
         assert_eq!(result.metrics.iterations, 4);
         assert_eq!(result.metrics.total_tool_calls, 3);
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_loop_dedup_cache_hit() {
+        // First call executes, second call with same tool+args returns cached result.
+        let provider = Arc::new(MockProvider::new(vec![
+            mk_response(
+                "first",
+                Some(vec![mk_tool_call(
+                    "call-1",
+                    "fs_read",
+                    "{\"path\":\"a.rs\"}",
+                )]),
+            ),
+            mk_response(
+                "second",
+                Some(vec![mk_tool_call(
+                    "call-2",
+                    "fs_read",
+                    "{\"path\":\"a.rs\"}",
+                )]),
+            ),
+            mk_response("done", None),
+        ]));
+
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            5,
+            mk_cancel_token(),
+        )
+        .with_dedup_tools(HashSet::from(["fs_read".to_string()]));
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                Arc::new(move |_, _, _, _| {
+                    call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok("file content".to_string())
+                }),
+                0,
+            )
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result.response.content, "done");
+        // Executor called only once — second call was a cache hit.
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Both tool calls appear in the conversation (one real, one from cache).
+        assert_eq!(result.metrics.total_tool_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_loop_no_dedup_non_eligible() {
+        // Non-eligible tool (fs_scan) is always executed, never cached.
+        let provider = Arc::new(MockProvider::new(vec![
+            mk_response("first", Some(vec![mk_tool_call("call-1", "fs_scan", "{}")])),
+            mk_response(
+                "second",
+                Some(vec![mk_tool_call("call-2", "fs_scan", "{}")]),
+            ),
+            mk_response("done", None),
+        ]));
+
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        // Only fs_read is dedup-eligible; fs_scan is not in this dedup set.
+        let loop_runner = ToolCallLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            5,
+            mk_cancel_token(),
+        )
+        .with_dedup_tools(HashSet::from(["fs_read".to_string()]));
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                Arc::new(move |_, _, _, _| {
+                    call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok("log output".to_string())
+                }),
+                0,
+            )
+            .await
+            .expect("should succeed");
+
+        assert_eq!(result.response.content, "done");
+        // Executor called twice — fs_scan is not dedup-eligible in this test.
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

@@ -7,23 +7,23 @@
 //! swapping providers without touching agent or CLI code.
 //!
 //! **Decision**: Created sunny-mind with LlmProvider trait + typed errors.
-//! Kimi is first implementation. No dependency on sunny-core.
+//! Anthropic is the implementation. No dependency on sunny-core.
 //!
 //! **Consequences**: Adding new providers (Anthropic, OpenAI) only requires
 //! new struct implementing LlmProvider. No changes to agents or CLI.
 
+pub mod anthropic;
 pub mod error;
-pub mod kimi;
 #[cfg(test)]
 pub(crate) mod mock_provider;
-pub mod ollama;
 pub mod provider;
+pub mod stream;
 pub mod types;
 
+pub use anthropic::AnthropicProvider;
 pub use error::LlmError;
-pub use kimi::KimiProvider;
-pub use ollama::OllamaProvider;
 pub use provider::LlmProvider;
+pub use stream::{StreamEvent, StreamResult};
 pub use types::{
     ChatMessage, ChatRole, LlmRequest, LlmResponse, ModelId, ProviderEconomics, ProviderId,
     ProviderRoutingPolicy, TokenUsage, ToolCall, ToolCallResult, ToolChoice, ToolDefinition,

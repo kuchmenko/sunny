@@ -1,6 +1,7 @@
+use regex::RegexBuilder;
 use tracing::info;
 
-use crate::orchestrator::events::{EVENT_TOOL_EXEC_END, EVENT_TOOL_EXEC_START, OUTCOME_SUCCESS};
+use crate::events::{EVENT_TOOL_EXEC_END, EVENT_TOOL_EXEC_START, OUTCOME_SUCCESS};
 
 /// In-memory text search with pattern matching.
 ///
@@ -11,7 +12,7 @@ pub struct TextGrep {
     pub case_sensitive: bool,
 }
 
-/// A single matching line from a grep search.
+#[derive(Debug)]
 pub struct GrepMatch {
     /// 1-based line number.
     pub line_number: usize,
@@ -59,14 +60,23 @@ impl TextGrep {
         }
 
         let pattern_lower = pattern.to_lowercase();
+        let compiled_regex = RegexBuilder::new(pattern)
+            .case_insensitive(!self.case_sensitive)
+            .size_limit(1 << 20)
+            .build();
 
         for (idx, line) in content.lines().enumerate() {
             total_lines_searched += 1;
 
-            let match_pos = if self.case_sensitive {
-                line.find(pattern)
-            } else {
-                line.to_lowercase().find(&pattern_lower)
+            let match_pos = match &compiled_regex {
+                Ok(re) => re.find(line).map(|m| m.start()),
+                Err(_) => {
+                    if self.case_sensitive {
+                        line.find(pattern)
+                    } else {
+                        line.to_lowercase().find(&pattern_lower)
+                    }
+                }
             };
 
             if let Some(pos) = match_pos {
@@ -169,6 +179,47 @@ mod tests {
         assert_eq!(result.matches[0].match_start, 0);
         assert_eq!(result.matches[1].line_number, 5);
         assert_eq!(result.matches[1].match_start, 0);
+    }
+
+    #[test]
+    fn test_grep_regex_or_pattern() {
+        let grep = TextGrep::default();
+        let content = "fn foo\nstruct Bar\nimpl Baz\nlet x = 1";
+        let result = grep.search(content, "fn|struct|impl");
+
+        assert_eq!(result.matches.len(), 3);
+    }
+
+    #[test]
+    fn test_grep_invalid_regex_fallback() {
+        let grep = TextGrep::default();
+        let content = "[unclosed bracket here\nother line";
+        let result = grep.search(content, "[unclosed");
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].match_start, 0);
+    }
+
+    #[test]
+    fn test_grep_regex_case_insensitive() {
+        let grep = TextGrep {
+            max_matches: 100,
+            case_sensitive: false,
+        };
+        let content = "todo fix\nFIXME now\nTodo later\nnothing";
+        let result = grep.search(content, "TODO|FIXME");
+
+        assert_eq!(result.matches.len(), 3);
+    }
+
+    #[test]
+    fn test_grep_regex_match_start() {
+        let grep = TextGrep::default();
+        let content = "hello world\nfoo bar_baz";
+        let result = grep.search(content, "world");
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].match_start, 6);
     }
 
     #[test]

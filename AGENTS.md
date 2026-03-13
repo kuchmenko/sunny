@@ -1,6 +1,6 @@
 # Sunny Agent Engineering Standard
 
-Agent-focused operating standard for the Sunny Rust multi-agent runtime.
+Agent-focused operating standard for the Sunny Rust AI coding assistant CLI.
 This document is written for autonomous coding agents. Optimize for correctness,
 traceability, and safe parallel execution.
 
@@ -26,7 +26,7 @@ Definitions used in this policy:
 - Before starting work, verify `git branch --show-current` returns `master`.
 
 
-## 1) Multi-Agent Workflow (Mandatory)
+## 1) Agent Workflow (Mandatory)
 
 Every non-trivial task follows this lifecycle:
 1. **Discover**: inspect code paths, constraints, and existing patterns before edits.
@@ -175,10 +175,12 @@ pub enum AgentError {
 - Unit tests inline or adjacent; integration tests in `tests/`.
 
 Current workspace paths:
-- Agent traits: `crates/sunny-core/src/agent/`
-- Tool traits: `crates/sunny-core/src/tool/`
+- Tool traits and implementations: `crates/sunny-core/src/tool/`
+- Event constants: `crates/sunny-core/src/events.rs`
 - LLM abstractions: `crates/sunny-mind/src/`
-- CLI commands: `crates/sunny-cli/src/commands/`
+- Tool loops and git tools: `crates/sunny-boys/src/`
+- CLI chat command: `crates/sunny-cli/src/commands/`
+- Chat session: `crates/sunny-cli/src/chat/`
 
 ## 9) Testing Strategy
 

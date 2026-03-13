@@ -27,4 +27,17 @@ pub enum ToolError {
     ExecutionFailed {
         source: Box<dyn Error + Send + Sync>,
     },
+
+    #[error("content too large: {path} ({size} bytes, limit {limit} bytes)")]
+    ContentTooLarge {
+        path: String,
+        size: usize,
+        limit: usize,
+    },
+
+    #[error("command denied: {command} ({reason})")]
+    CommandDenied { command: String, reason: String },
+
+    #[error("command timed out: {command} ({timeout_secs}s)")]
+    CommandTimeout { command: String, timeout_secs: u64 },
 }
