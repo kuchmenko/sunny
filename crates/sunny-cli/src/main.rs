@@ -1,17 +1,17 @@
 use clap::Parser;
+use sunny_cli::commands;
 
 #[derive(Parser, Debug)]
 #[command(name = "sunny")]
 #[command(about = "Sunny - AI Agent Runtime")]
 enum Cli {
     /// Analyze a codebase
-    Analyze(crate::commands::AnalyzeArgs),
+    Analyze(commands::AnalyzeArgs),
     /// Ask the agent a question
-    Ask(crate::commands::AskArgs),
+    Ask(commands::AskArgs),
+    /// Interactive chat REPL with streaming tools
+    Chat(commands::ChatArgs),
 }
-
-mod commands;
-mod output;
 
 #[tokio::main]
 async fn main() {
@@ -29,6 +29,12 @@ async fn main() {
         }
         Cli::Ask(args) => {
             if let Err(e) = commands::ask::run_ask(args).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Cli::Chat(args) => {
+            if let Err(e) = commands::chat::run(args).await {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }

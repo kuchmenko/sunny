@@ -12,7 +12,7 @@ pub struct TextGrep {
     pub case_sensitive: bool,
 }
 
-/// A single matching line from a grep search.
+#[derive(Debug)]
 pub struct GrepMatch {
     /// 1-based line number.
     pub line_number: usize,

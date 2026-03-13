@@ -1,13 +1,23 @@
 pub mod error;
+pub mod fs_edit;
 pub mod fs_read;
 pub mod fs_scan;
+pub mod fs_write;
+pub mod grep_files;
+pub mod path_guard;
 mod policy;
+pub mod shell_exec;
 pub mod text_grep;
 
 pub use error::ToolError;
+pub use fs_edit::{EditResult, FileEditor};
 pub use fs_read::{FileContent, FileReader};
 pub use fs_scan::FileScanner;
+pub use fs_write::{FileWriter, WriteResult};
+pub use grep_files::{GrepFileMatch, GrepFiles};
+pub use path_guard::PathGuard;
 pub use policy::ToolPolicy;
+pub use shell_exec::{ExecResult, ShellExecutor};
 pub use text_grep::{GrepMatch, GrepResult, TextGrep};
 
 #[cfg(test)]
@@ -71,6 +81,34 @@ mod tests {
         let source_err: Box<dyn Error + Send + Sync> = Box::new(std::io::Error::other("io error"));
         let err = ToolError::ExecutionFailed { source: source_err };
         assert_eq!(err.to_string(), "tool execution failed: io error");
+
+        // Test ContentTooLarge
+        let err = ToolError::ContentTooLarge {
+            path: "/big_file.txt".to_string(),
+            size: 2_000_000,
+            limit: 1_048_576,
+        };
+        assert_eq!(
+            err.to_string(),
+            "content too large: /big_file.txt (2000000 bytes, limit 1048576 bytes)"
+        );
+
+        // Test CommandDenied
+        let err = ToolError::CommandDenied {
+            command: "sudo rm -rf /".to_string(),
+            reason: "matches denylist".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "command denied: sudo rm -rf / (matches denylist)"
+        );
+
+        // Test CommandTimeout
+        let err = ToolError::CommandTimeout {
+            command: "sleep 60".to_string(),
+            timeout_secs: 30,
+        };
+        assert_eq!(err.to_string(), "command timed out: sleep 60 (30s)");
     }
 
     #[test]

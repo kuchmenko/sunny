@@ -25,6 +25,7 @@ pub mod git_tools;
 pub mod oracle;
 pub mod registry;
 pub mod review;
+pub mod streaming_tool_loop;
 pub mod tavily;
 pub(crate) mod timeouts;
 pub mod tool_loop;
@@ -39,6 +40,7 @@ pub use git_tools::{GitDiff, GitLog, GitStatus};
 pub use oracle::OracleAgent;
 pub use registry::build_boys_registry;
 pub use review::ReviewAgent;
+pub use streaming_tool_loop::{StreamingToolLoop, StreamingToolMetrics, StreamingToolResult};
 pub use tavily::TavilySearch;
 pub use tool_loop::{ToolCallError, ToolCallLoop, ToolCallMetrics, ToolCallResult};
 

@@ -7,9 +7,16 @@ edition.workspace = true
 serde = { version = "1", features = ["derive"] } # dep: serialization for LLM types exchanged across boundaries
 async-trait = "0.1" # dep: async methods in LlmProvider trait per AGENTS.md
 thiserror = "1" # dep: typed error enums per AGENTS.md
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] } # dep: HTTP client for Kimi API
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] } # dep: HTTP client + streaming support for Kimi/Anthropic APIs
 serde_json = "1" # dep: JSON schema/value support for tool definitions and serde tests
 tokio = { version = "1", features = ["sync"] } # dep: tokio::sync::Mutex for MockToolCallProvider (async-safe test mock)
+tokio-stream = "0.1" # dep: Stream adapter for wrapping iterators in default chat_stream() impl
+futures-core = "0.3" # dep: Stream trait for StreamResult type alias
+pin-project-lite = "0.2" # dep: pin projection for custom Stream implementations
+eventsource-stream = "0.2" # dep: SSE event parsing for Anthropic streaming response
+async-stream = "0.3" # dep: async_stream! macro for building async Stream from SSE events
+base64 = "0.22" # dep: decode Anthropic OAuth client id for refresh flow
+tracing = "0.1" # dep: structured provider logs for auth/request lifecycle
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] } # dep: async test runtime
