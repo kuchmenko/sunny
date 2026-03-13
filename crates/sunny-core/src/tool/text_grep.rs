@@ -1,7 +1,7 @@
 use regex::RegexBuilder;
 use tracing::info;
 
-use crate::orchestrator::events::{EVENT_TOOL_EXEC_END, EVENT_TOOL_EXEC_START, OUTCOME_SUCCESS};
+use crate::events::{EVENT_TOOL_EXEC_END, EVENT_TOOL_EXEC_START, OUTCOME_SUCCESS};
 
 /// In-memory text search with pattern matching.
 ///

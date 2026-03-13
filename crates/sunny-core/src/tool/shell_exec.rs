@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tracing::info;
 
-use crate::orchestrator::events::{
+use crate::events::{
     EVENT_TOOL_EXEC_END, EVENT_TOOL_EXEC_ERROR, EVENT_TOOL_EXEC_START, OUTCOME_ERROR,
     OUTCOME_SUCCESS,
 };

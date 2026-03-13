@@ -10,7 +10,7 @@ use crate::types::{LlmRequest, LlmResponse};
 //
 // Decision: Added chat_stream() to LlmProvider with a default impl that calls chat()
 // and wraps the result into a single-item stream. This preserves backward compatibility:
-// existing providers (KimiProvider, OllamaProvider) work unchanged until they override
+// existing providers work unchanged until they override
 // chat_stream() with native streaming.
 //
 // Consequences: Breaking change — implementors of LlmProvider must recompile.

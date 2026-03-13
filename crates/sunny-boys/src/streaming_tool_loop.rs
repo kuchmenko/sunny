@@ -169,7 +169,7 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                 "streaming_tool_call_iteration",
                 iteration,
                 depth,
-                event = sunny_core::orchestrator::events::EVENT_TOOL_EXEC_DEPTH,
+                event = sunny_core::events::EVENT_TOOL_EXEC_DEPTH,
             ))
             .await?;
 

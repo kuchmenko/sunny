@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use ignore::WalkBuilder;
 use tracing::info;
 
-use crate::orchestrator::events::{EVENT_TOOL_EXEC_END, EVENT_TOOL_EXEC_START, OUTCOME_SUCCESS};
+use crate::events::{EVENT_TOOL_EXEC_END, EVENT_TOOL_EXEC_START, OUTCOME_SUCCESS};
 use crate::tool::error::ToolError;
 use crate::tool::path_guard::PathGuard;
 use crate::tool::text_grep::{GrepMatch, TextGrep};
