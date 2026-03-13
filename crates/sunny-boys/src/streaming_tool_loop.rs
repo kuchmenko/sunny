@@ -244,7 +244,7 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
             current_request
                 .messages
                 .extend(tool_results.iter().map(|(tc, result)| ChatMessage {
-                    role: ChatRole::User,
+                    role: ChatRole::Tool,
                     content: result.clone(),
                     tool_call_id: Some(tc.id.clone()),
                     tool_calls: None,
@@ -482,7 +482,7 @@ mod tests {
             .messages
             .last()
             .expect("second request should include tool result message");
-        assert_eq!(tool_result_msg.role, ChatRole::User);
+        assert_eq!(tool_result_msg.role, ChatRole::Tool);
         assert_eq!(tool_result_msg.tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(tool_result_msg.content, "file content");
     }

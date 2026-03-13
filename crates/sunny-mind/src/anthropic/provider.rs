@@ -103,30 +103,45 @@ impl AnthropicProvider {
 
     fn prepare_messages(&self, req: &LlmRequest) -> Result<Vec<serde_json::Value>, LlmError> {
         let mut messages_json = Vec::new();
+        let msgs = &req.messages;
+        let mut i = 0;
 
-        for msg in &req.messages {
+        while i < msgs.len() {
+            let msg = &msgs[i];
             match msg.role {
-                ChatRole::System => {}
+                ChatRole::System => {
+                    i += 1;
+                }
                 ChatRole::User => {
                     messages_json.push(serde_json::json!({
                         "role": "user",
                         "content": msg.content,
                     }));
+                    i += 1;
                 }
                 ChatRole::Tool => {
-                    let tool_use_id =
-                        msg.tool_call_id
-                            .clone()
-                            .ok_or_else(|| LlmError::InvalidResponse {
-                                message: "tool result message missing tool_call_id".to_string(),
-                            })?;
-                    messages_json.push(serde_json::json!({
-                        "role": "user",
-                        "content": [{
+                    // Collect ALL consecutive Tool messages into a single user message.
+                    // Anthropic requires every tool_use block be answered in one user
+                    // message that contains all corresponding tool_result blocks.
+                    let mut tool_results = Vec::new();
+                    while i < msgs.len() && msgs[i].role == ChatRole::Tool {
+                        let m = &msgs[i];
+                        let tool_use_id =
+                            m.tool_call_id
+                                .clone()
+                                .ok_or_else(|| LlmError::InvalidResponse {
+                                    message: "tool result message missing tool_call_id".to_string(),
+                                })?;
+                        tool_results.push(serde_json::json!({
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
-                            "content": msg.content,
-                        }]
+                            "content": m.content,
+                        }));
+                        i += 1;
+                    }
+                    messages_json.push(serde_json::json!({
+                        "role": "user",
+                        "content": tool_results,
                     }));
                 }
                 ChatRole::Assistant => {
@@ -168,6 +183,7 @@ impl AnthropicProvider {
                             "content": msg.content,
                         }));
                     }
+                    i += 1;
                 }
             }
         }
@@ -532,6 +548,90 @@ mod tests {
         assert_eq!(mapped[0]["role"], "user");
         assert_eq!(mapped[0]["content"][0]["type"], "tool_result");
         assert_eq!(mapped[0]["content"][0]["tool_use_id"], "tc_1");
+    }
+
+    #[test]
+    fn test_prepare_messages_merges_multiple_tool_results_into_one_user_message() {
+        let provider = AnthropicProvider {
+            credentials: Arc::new(RwLock::new(make_test_credentials("test-token"))),
+            client: reqwest::Client::new(),
+            model: "claude-sonnet-4-6".to_string(),
+        };
+
+        let req = LlmRequest {
+            messages: vec![
+                crate::types::ChatMessage {
+                    role: ChatRole::User,
+                    content: "call two tools".to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                crate::types::ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: String::new(),
+                    tool_calls: Some(vec![
+                        crate::types::ToolCall {
+                            id: "tc_1".to_string(),
+                            name: "fs_read".to_string(),
+                            arguments: "{}".to_string(),
+                            execution_depth: 0,
+                        },
+                        crate::types::ToolCall {
+                            id: "tc_2".to_string(),
+                            name: "git_status".to_string(),
+                            arguments: "{}".to_string(),
+                            execution_depth: 0,
+                        },
+                    ]),
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                crate::types::ChatMessage {
+                    role: ChatRole::Tool,
+                    content: "file-content".to_string(),
+                    tool_calls: None,
+                    tool_call_id: Some("tc_1".to_string()),
+                    reasoning_content: None,
+                },
+                crate::types::ChatMessage {
+                    role: ChatRole::Tool,
+                    content: "git status output".to_string(),
+                    tool_calls: None,
+                    tool_call_id: Some("tc_2".to_string()),
+                    reasoning_content: None,
+                },
+            ],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let mapped = provider
+            .prepare_messages(&req)
+            .expect("prepare_messages should merge tool results");
+
+        // user + assistant + ONE merged tool_result user message = 3
+        assert_eq!(
+            mapped.len(),
+            3,
+            "multiple tool results must be one user message"
+        );
+        let tool_msg = &mapped[2];
+        assert_eq!(tool_msg["role"], "user");
+        let content = tool_msg["content"]
+            .as_array()
+            .expect("content must be array");
+        assert_eq!(
+            content.len(),
+            2,
+            "both tool_result blocks must be in one message"
+        );
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[0]["tool_use_id"], "tc_1");
+        assert_eq!(content[1]["type"], "tool_result");
+        assert_eq!(content[1]["tool_use_id"], "tc_2");
     }
 
     #[test]
