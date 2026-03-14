@@ -273,7 +273,13 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                                 eprintln!("Usage: /switch <id>");
                             }
                         }
-                        "/compact" => println!("Compaction not yet implemented"),
+                        "/compact" | "/compact " => {
+                            println!("Compacting conversation...");
+                            match session.compact_with_llm().await {
+                                Ok(msg) => println!("{msg}"),
+                                Err(e) => eprintln!("Compaction failed: {e}"),
+                            }
+                        }
                         "/help" => {
                             println!("Available commands:");
                             println!(

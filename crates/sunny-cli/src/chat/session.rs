@@ -278,6 +278,106 @@ impl ChatSession {
         Ok(content)
     }
 
+    /// LLM-based conversation summarization compaction.
+    ///
+    /// Summarizes messages older than the last 5 turns and replaces them
+    /// with a single `[Context Summary]` user message.
+    pub async fn compact_with_llm(&mut self) -> Result<String, ChatError> {
+        let user_msgs: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == ChatRole::User)
+            .map(|(i, _)| i)
+            .collect();
+
+        if user_msgs.len() <= 5 {
+            return Ok("Not enough messages to compact (need more than 5 turns).".to_string());
+        }
+
+        let keep_from = user_msgs[user_msgs.len() - 5];
+        if keep_from <= 1 {
+            return Ok("Nothing to compact.".to_string());
+        }
+
+        let to_summarize = &self.messages[1..keep_from];
+        if to_summarize.is_empty() {
+            return Ok("Nothing to compact.".to_string());
+        }
+
+        let conversation_text: String = to_summarize
+            .iter()
+            .map(|m| {
+                let role = match m.role {
+                    ChatRole::User => "User",
+                    ChatRole::Assistant => "Assistant",
+                    ChatRole::Tool => "Tool",
+                    ChatRole::System => "System",
+                };
+                let content: String = m.content.chars().take(500).collect();
+                format!("{role}: {content}\n")
+            })
+            .collect();
+
+        let before_count = self.messages.len();
+        let before_chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
+
+        let summary_request = LlmRequest {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: format!(
+                    "Summarize the following coding conversation. Preserve: key decisions made, \
+                     files created/modified, code patterns discussed, and any outstanding tasks. \
+                     Be concise.\n\n{conversation_text}"
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            max_tokens: Some(1000),
+            temperature: Some(0.3),
+            tools: None,
+            tool_choice: None,
+        };
+
+        let summary = match self.provider.chat(summary_request).await {
+            Ok(response) => response.content,
+            Err(e) => {
+                warn!(error = %e, "summarization failed, skipping llm compaction");
+                return Ok(format!("Compaction failed: {e}"));
+            }
+        };
+
+        let summary_message = ChatMessage {
+            role: ChatRole::User,
+            content: format!("[Context Summary]\n{summary}"),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+
+        let mut new_messages = Vec::with_capacity(self.messages.len() - to_summarize.len() + 1);
+        if let Some(system_prompt) = self.messages.first().cloned() {
+            new_messages.push(system_prompt);
+        }
+        new_messages.push(summary_message);
+        new_messages.extend_from_slice(&self.messages[keep_from..]);
+
+        self.messages = new_messages;
+        self.budget.reset();
+
+        let after_count = self.messages.len();
+        let after_chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
+
+        self.auto_save().await;
+
+        Ok(format!(
+            "Compacted: {before_count} -> {after_count} messages, ~{} -> ~{} tokens",
+            before_chars / 4,
+            after_chars / 4
+        ))
+    }
+
     async fn auto_save(&mut self) {
         if self.is_new_session {
             let working_dir = self.root.to_string_lossy().to_string();
@@ -891,5 +991,80 @@ mod tests {
             15,
             "budget should accumulate usage from send()"
         );
+    }
+
+    #[tokio::test]
+    async fn test_compact_with_llm_reduces_messages() {
+        let dir = tempdir().expect("should create temp dir");
+        let mut session = make_session_in(&dir);
+
+        for turn in 1..=6 {
+            session
+                .messages
+                .push(user_message(&format!("user-turn-{turn}")));
+            session
+                .messages
+                .push(assistant_text_message(&format!("assistant-turn-{turn}")));
+        }
+
+        let before_count = session.messages.len();
+        let result = session
+            .compact_with_llm()
+            .await
+            .expect("compaction should succeed");
+
+        assert!(result.starts_with("Compacted:"));
+        assert!(session.messages.len() < before_count);
+        assert_eq!(session.messages[0].role, ChatRole::System);
+        assert_eq!(session.messages[1].role, ChatRole::User);
+        assert!(session.messages[1]
+            .content
+            .starts_with("[Context Summary]\n"));
+
+        let preserved_users: Vec<&str> = session
+            .messages
+            .iter()
+            .filter(|m| m.role == ChatRole::User)
+            .skip(1)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            preserved_users,
+            vec![
+                "user-turn-2",
+                "user-turn-3",
+                "user-turn-4",
+                "user-turn-5",
+                "user-turn-6"
+            ],
+            "last 5 user turns should be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_skips_small_sessions() {
+        let dir = tempdir().expect("should create temp dir");
+        let mut session = make_session_in(&dir);
+
+        for turn in 1..=5 {
+            session
+                .messages
+                .push(user_message(&format!("user-turn-{turn}")));
+            session
+                .messages
+                .push(assistant_text_message(&format!("assistant-turn-{turn}")));
+        }
+
+        let before = session.messages.clone();
+        let message = session
+            .compact_with_llm()
+            .await
+            .expect("compaction should return skip message");
+
+        assert_eq!(
+            message,
+            "Not enough messages to compact (need more than 5 turns)."
+        );
+        assert_eq!(session.messages, before);
     }
 }
