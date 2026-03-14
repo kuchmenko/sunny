@@ -93,7 +93,7 @@ impl ChatSession {
 
         Self {
             messages,
-            budget: TokenBudget::new(200_000, Arc::new(sunny_mind::CharHeuristicCounter)),
+            budget: TokenBudget::new(200_000, provider.token_counter()),
             provider,
             root,
             cancel: CancellationToken::new(),
@@ -123,7 +123,7 @@ impl ChatSession {
         }
         Self {
             messages,
-            budget: TokenBudget::new(200_000, Arc::new(sunny_mind::CharHeuristicCounter)),
+            budget: TokenBudget::new(200_000, provider.token_counter()),
             provider,
             root,
             cancel,

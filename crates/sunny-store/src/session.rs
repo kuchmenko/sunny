@@ -133,7 +133,7 @@ impl SessionStore {
         let mut messages = Vec::new();
         for row in rows {
             let (role_str, content, tool_calls_json, tool_call_id, reasoning_content) = row?;
-            let role = str_to_role(&role_str).map_err(StoreError::Migration)?;
+            let role = str_to_role(&role_str).map_err(StoreError::InvalidData)?;
             let tool_calls = tool_calls_json
                 .map(|json| serde_json::from_str::<Vec<ToolCall>>(&json))
                 .transpose()?;
@@ -169,6 +169,17 @@ impl SessionStore {
             let rows = stmt.query_map([], row_to_session)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::Db)
         }
+    }
+
+    pub fn search_sessions(&self, query: &str) -> Result<Vec<SavedSession>, StoreError> {
+        let conn = self.db.connection();
+        let pattern = format!("%{query}%");
+        let mut stmt = conn.prepare(
+            "SELECT id, title, model, working_dir, token_count, created_at, updated_at \
+             FROM sessions WHERE id LIKE ?1 OR title LIKE ?1 ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern], row_to_session)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::Db)
     }
 
     /// Return the most recently updated session for the given working directory.
@@ -222,10 +233,22 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedSession> {
     let updated_at_str: String = row.get(6)?;
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
+        .map_err(|e| {
+            rusqlite::Error::InvalidColumnType(
+                5,
+                format!("invalid created_at timestamp: {e}"),
+                rusqlite::types::Type::Text,
+            )
+        })?;
     let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now());
+        .map_err(|e| {
+            rusqlite::Error::InvalidColumnType(
+                6,
+                format!("invalid updated_at timestamp: {e}"),
+                rusqlite::types::Type::Text,
+            )
+        })?;
     Ok(SavedSession {
         id: row.get(0)?,
         title: row.get(1)?,

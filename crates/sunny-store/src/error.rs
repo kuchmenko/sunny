@@ -12,4 +12,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("migration error: {0}")]
     Migration(String),
+    #[error("grammar error: {0}")]
+    Grammar(String),
+    #[error("invalid data: {0}")]
+    InvalidData(String),
 }
