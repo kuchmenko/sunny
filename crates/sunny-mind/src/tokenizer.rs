@@ -3,8 +3,6 @@
 //! Provides a trait-based interface for counting tokens across different LLM providers,
 //! with fallback heuristic and exact tiktoken-based implementations.
 
-
-
 /// Abstracts token counting across different LLM providers.
 ///
 /// Implementations must be `Send + Sync` for use in `Arc<dyn TokenCounter>`.

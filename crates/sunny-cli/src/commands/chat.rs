@@ -9,6 +9,7 @@ use crossterm::style::Stylize;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use sunny_mind::{AnthropicProvider, LlmProvider, StreamEvent};
+use sunny_store::{Database, SessionStore};
 
 use crate::chat::ChatSession;
 
@@ -61,7 +62,24 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
     );
     println!("Type /quit or /exit to leave. Ctrl+C cancels the current request.\n");
 
-    let mut session = ChatSession::new(Arc::clone(&provider), workspace_root.clone());
+    let store_db = Database::open_default()
+        .map_err(|e| anyhow::anyhow!("failed to open session store: {e}"))?;
+    #[allow(clippy::arc_with_non_send_sync)]
+    let store = Arc::new(SessionStore::new(store_db));
+    let session_id = format!(
+        "pending-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let mut session = ChatSession::new(
+        Arc::clone(&provider),
+        workspace_root.clone(),
+        session_id,
+        store,
+    );
     let mut rl = DefaultEditor::new()?;
 
     loop {

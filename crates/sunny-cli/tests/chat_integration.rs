@@ -7,6 +7,7 @@ use sunny_mind::{
     ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, StreamEvent,
     StreamResult, TokenUsage,
 };
+use sunny_store::{Database, SessionStore};
 use tempfile::tempdir;
 use tokio::sync::Mutex;
 
@@ -85,11 +86,25 @@ fn make_text_stream(text: &str) -> Vec<Result<StreamEvent, LlmError>> {
     ]
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
+fn make_store() -> (Arc<SessionStore>, tempfile::TempDir) {
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("chat_integration.db");
+    let db = Database::open(&db_path).expect("database should open");
+    (Arc::new(SessionStore::new(db)), dir)
+}
+
 #[tokio::test]
 async fn test_chat_simple_response_no_tools() {
     let provider = Arc::new(MockStreamProvider::new(vec![make_text_stream("4")]));
     let tmp = tempdir().expect("temp dir");
-    let mut session = ChatSession::new(provider, tmp.path().to_path_buf());
+    let (store, _dir) = make_store();
+    let mut session = ChatSession::new(
+        provider,
+        tmp.path().to_path_buf(),
+        "pending-session".to_string(),
+        store,
+    );
 
     let result = session.send("What is 2+2?", |_| {}).await;
 
@@ -118,7 +133,13 @@ async fn test_chat_tool_call_flow_fs_read() {
 
     let provider = Arc::new(MockStreamProvider::new(vec![first_stream, second_stream]));
     let provider_handle = Arc::clone(&provider);
-    let mut session = ChatSession::new(provider, tmp.path().to_path_buf());
+    let (store, _dir) = make_store();
+    let mut session = ChatSession::new(
+        provider,
+        tmp.path().to_path_buf(),
+        "pending-session".to_string(),
+        store,
+    );
 
     let result = session.send("read the test file", |_| {}).await;
 
@@ -136,7 +157,13 @@ async fn test_chat_multi_turn_conversation_history() {
         make_text_stream("second answer"),
     ]));
     let tmp = tempdir().expect("temp dir");
-    let mut session = ChatSession::new(provider, tmp.path().to_path_buf());
+    let (store, _dir) = make_store();
+    let mut session = ChatSession::new(
+        provider,
+        tmp.path().to_path_buf(),
+        "pending-session".to_string(),
+        store,
+    );
 
     let first = session.send("turn 1", |_| {}).await;
     let second = session.send("turn 2", |_| {}).await;
@@ -155,7 +182,13 @@ async fn test_chat_context_management_trims_old_messages() {
         make_text_stream("trimmed"),
     ]));
     let tmp = tempdir().expect("temp dir");
-    let mut session = ChatSession::new(provider, tmp.path().to_path_buf());
+    let (store, _dir) = make_store();
+    let mut session = ChatSession::new(
+        provider,
+        tmp.path().to_path_buf(),
+        "pending-session".to_string(),
+        store,
+    );
 
     let first = session.send(&"u".repeat(250_000), |_| {}).await;
     let second = session.send(&"v".repeat(250_000), |_| {}).await;
