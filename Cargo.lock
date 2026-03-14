@@ -2100,6 +2100,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "base64 0.22.1",
+ "dirs",
  "eventsource-stream",
  "futures-core",
  "pin-project-lite",

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::{future::Future, pin::Pin};
 
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -9,7 +10,8 @@ use crate::stream::StreamResult;
 use crate::types::{ChatRole, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage, ToolCall};
 
 use super::credentials::{
-    load_credentials, refresh_oauth_token, AnthropicCredentials, CredentialSource,
+    load_credentials, load_from_claude_credentials, refresh_oauth_token, save_credentials,
+    AnthropicCredentials, CredentialSource,
 };
 use super::stream_parser::StreamParser;
 
@@ -50,13 +52,81 @@ impl AnthropicProvider {
 
         if let Some(refresh_token) = creds.refresh_token.clone() {
             warn!(provider = "anthropic", "OAuth token expired, refreshing");
-            let refreshed = refresh_oauth_token(&self.client, &refresh_token).await?;
-            *creds = refreshed;
+            Self::refresh_with_recovery(
+                &self.client,
+                &mut creds,
+                refresh_token,
+                |client, token| Box::pin(refresh_oauth_token(client, token)),
+                load_from_claude_credentials,
+                save_credentials,
+            )
+            .await?;
             Ok((creds.access_token.clone(), creds.source.clone()))
         } else {
             Err(LlmError::AuthFailed {
                 message: "OAuth token expired and no refresh token available".to_string(),
             })
+        }
+    }
+
+    async fn refresh_with_recovery<RF, LF, SF>(
+        client: &reqwest::Client,
+        creds: &mut AnthropicCredentials,
+        refresh_token: String,
+        mut refresh_fn: RF,
+        load_claude_fn: LF,
+        save_fn: SF,
+    ) -> Result<(), LlmError>
+    where
+        RF: for<'a> FnMut(
+            &'a reqwest::Client,
+            &'a str,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<AnthropicCredentials, LlmError>> + Send + 'a>,
+        >,
+        LF: Fn() -> Result<AnthropicCredentials, LlmError>,
+        SF: Fn(&AnthropicCredentials) -> Result<(), LlmError>,
+    {
+        match refresh_fn(client, &refresh_token).await {
+            Ok(refreshed) => {
+                *creds = refreshed;
+                if let Err(e) = save_fn(creds) {
+                    warn!(
+                        provider = "anthropic",
+                        "Failed to persist refreshed credentials: {e}"
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if !e.to_string().contains("invalid_grant") {
+                    return Err(e);
+                }
+
+                warn!(
+                    provider = "anthropic",
+                    "Refresh token invalid, attempting to re-sync from Claude Code credentials"
+                );
+
+                if let Ok(claude_creds) = load_claude_fn() {
+                    if let Some(fresh_refresh) = claude_creds.refresh_token {
+                        if let Ok(refreshed) = refresh_fn(client, &fresh_refresh).await {
+                            *creds = refreshed;
+                            if let Err(save_err) = save_fn(creds) {
+                                warn!(
+                                    provider = "anthropic",
+                                    "Failed to persist re-synced credentials: {save_err}"
+                                );
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+
+                Err(LlmError::AuthFailed {
+                    message: "OAuth token refresh failed. Your refresh token may be invalidated. Run `claude` to re-authenticate, then restart sunny.".to_string(),
+                })
+            }
         }
     }
 
@@ -444,6 +514,8 @@ impl LlmProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     use crate::provider::LlmProvider;
 
@@ -672,5 +744,120 @@ mod tests {
         };
         assert_eq!(provider.provider_id(), "anthropic");
         assert_eq!(provider.model_id(), "claude-sonnet-4-6");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_persists_to_disk() {
+        let client = reqwest::Client::new();
+        let mut creds = AnthropicCredentials {
+            access_token: "expired-access".to_string(),
+            refresh_token: Some("expired-refresh".to_string()),
+            expires_at: Some(1),
+            source: CredentialSource::OAuthFile,
+        };
+
+        let refreshed = AnthropicCredentials {
+            access_token: "new-access".to_string(),
+            refresh_token: Some("new-refresh".to_string()),
+            expires_at: Some(9_999_999_999),
+            source: CredentialSource::OAuthFile,
+        };
+
+        let refresh_results = Arc::new(Mutex::new(VecDeque::from([Ok(refreshed.clone())])));
+        let refresh_results_clone = Arc::clone(&refresh_results);
+
+        let persisted = Arc::new(Mutex::new(Vec::new()));
+        let persisted_clone = Arc::clone(&persisted);
+
+        AnthropicProvider::refresh_with_recovery(
+            &client,
+            &mut creds,
+            "expired-refresh".to_string(),
+            move |_, _| {
+                let next = refresh_results_clone
+                    .lock()
+                    .expect("refresh queue lock")
+                    .pop_front()
+                    .expect("refresh result must exist");
+                Box::pin(async move { next })
+            },
+            || panic!("claude fallback should not be loaded on successful refresh"),
+            move |saved| {
+                persisted_clone
+                    .lock()
+                    .expect("persisted lock")
+                    .push(saved.clone());
+                Ok(())
+            },
+        )
+        .await
+        .expect("refresh should succeed");
+
+        assert_eq!(creds.access_token, "new-access");
+        let writes = persisted.lock().expect("persisted lock read");
+        assert_eq!(writes.len(), 1, "successful refresh should persist once");
+        assert_eq!(writes[0].access_token, "new-access");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_grant_retry() {
+        let client = reqwest::Client::new();
+        let mut creds = AnthropicCredentials {
+            access_token: "expired-access".to_string(),
+            refresh_token: Some("expired-refresh".to_string()),
+            expires_at: Some(1),
+            source: CredentialSource::OAuthFile,
+        };
+
+        let invalid_grant = Err(LlmError::AuthFailed {
+            message: "token refresh failed (400): {\"error\":\"invalid_grant\"}".to_string(),
+        });
+        let retry_success = Ok(AnthropicCredentials {
+            access_token: "retry-access".to_string(),
+            refresh_token: Some("retry-refresh".to_string()),
+            expires_at: Some(9_999_999_999),
+            source: CredentialSource::OAuthFile,
+        });
+
+        let refresh_results = Arc::new(Mutex::new(VecDeque::from([invalid_grant, retry_success])));
+        let refresh_results_clone = Arc::clone(&refresh_results);
+
+        let used_tokens = Arc::new(Mutex::new(Vec::new()));
+        let used_tokens_clone = Arc::clone(&used_tokens);
+
+        AnthropicProvider::refresh_with_recovery(
+            &client,
+            &mut creds,
+            "expired-refresh".to_string(),
+            move |_, token| {
+                used_tokens_clone
+                    .lock()
+                    .expect("used_tokens lock")
+                    .push(token.to_string());
+                let next = refresh_results_clone
+                    .lock()
+                    .expect("refresh queue lock")
+                    .pop_front()
+                    .expect("refresh result must exist");
+                Box::pin(async move { next })
+            },
+            || {
+                Ok(AnthropicCredentials {
+                    access_token: "claude-access".to_string(),
+                    refresh_token: Some("claude-refresh".to_string()),
+                    expires_at: Some(9_999_999_999),
+                    source: CredentialSource::OAuthFile,
+                })
+            },
+            |_| Ok(()),
+        )
+        .await
+        .expect("invalid_grant should retry once and succeed");
+
+        assert_eq!(creds.access_token, "retry-access");
+        let tokens = used_tokens.lock().expect("used_tokens read lock");
+        assert_eq!(tokens.len(), 2, "must attempt exactly one retry");
+        assert_eq!(tokens[0], "expired-refresh");
+        assert_eq!(tokens[1], "claude-refresh");
     }
 }
