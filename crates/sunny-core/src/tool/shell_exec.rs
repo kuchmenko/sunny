@@ -21,6 +21,37 @@ const TRUNCATION_MARKER: &str = "\n[OUTPUT TRUNCATED]";
 /// Commands that are never allowed to execute.
 const DENYLIST: &[&str] = &["rm -rf /", "sudo", "mkfs", "dd if=", ":(){"];
 
+/// Environment variables injected into every spawned command.
+///
+/// Prevents interactive prompts that would hang the timeout silently:
+/// - `CI=true` — suppresses interactive prompts in most tools
+/// - `GIT_TERMINAL_PROMPT=0` — prevents git credential prompts
+/// - `GIT_PAGER=cat` / `PAGER=cat` — disables pagers that block output capture
+/// - `DEBIAN_FRONTEND=noninteractive` — suppresses apt interactive dialogs
+/// - `HOMEBREW_NO_AUTO_UPDATE=1` — prevents brew from auto-updating on every run
+/// - `GIT_EDITOR=:` / `EDITOR=:` — prevents editor spawns (e.g. git commit without -m)
+/// - `GIT_MERGE_AUTOEDIT=no` — skips merge commit message editor
+/// - `VISUAL=` — clears visual editor to prevent TUI spawns
+/// - `NPM_CONFIG_YES=true` — auto-confirms npm prompts
+/// - `PIP_NO_INPUT=1` — suppresses pip interactive prompts
+/// - `YARN_ENABLE_IMMUTABLE_INSTALLS=false` — allows yarn install in CI-like envs
+const NON_INTERACTIVE_ENV: &[(&str, &str)] = &[
+    ("CI", "true"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_PAGER", "cat"),
+    ("PAGER", "cat"),
+    ("DEBIAN_FRONTEND", "noninteractive"),
+    ("HOMEBREW_NO_AUTO_UPDATE", "1"),
+    ("GIT_EDITOR", ":"),
+    ("EDITOR", ":"),
+    ("VISUAL", ""),
+    ("GIT_SEQUENCE_EDITOR", ":"),
+    ("GIT_MERGE_AUTOEDIT", "no"),
+    ("NPM_CONFIG_YES", "true"),
+    ("PIP_NO_INPUT", "1"),
+    ("YARN_ENABLE_IMMUTABLE_INSTALLS", "false"),
+];
+
 /// Result of a shell command execution.
 #[derive(Debug)]
 pub struct ExecResult {
@@ -71,6 +102,7 @@ impl ShellExecutor {
             .arg("-c")
             .arg(command)
             .current_dir(&self.root)
+            .envs(NON_INTERACTIVE_ENV.iter().copied())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -181,5 +213,21 @@ mod tests {
             .await
             .expect("should not error");
         assert_eq!(result.exit_code, 1);
+    }
+
+    #[tokio::test]
+    async fn test_shell_executor_non_interactive_env_injected() {
+        let (_dir, exec) = setup();
+        // Verify CI and GIT_TERMINAL_PROMPT are set in the child environment.
+        let result = exec
+            .execute("echo CI=$CI GIT_TERMINAL_PROMPT=$GIT_TERMINAL_PROMPT PAGER=$PAGER", None)
+            .await
+            .expect("should execute");
+        assert!(result.stdout.contains("CI=true"), "CI should be set");
+        assert!(
+            result.stdout.contains("GIT_TERMINAL_PROMPT=0"),
+            "GIT_TERMINAL_PROMPT should be 0"
+        );
+        assert!(result.stdout.contains("PAGER=cat"), "PAGER should be cat");
     }
 }
