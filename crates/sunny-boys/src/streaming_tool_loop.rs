@@ -14,6 +14,15 @@ use tracing::{info_span, Instrument};
 use crate::timeouts::{tool_call_timeout, tool_provider_timeout};
 use crate::tool_loop::{ToolCallError, ToolExecutor};
 
+// ADR: StreamingToolResult.messages addition (class L - public API change)
+//
+// Context: Session persistence requires the full message history including intermediate
+// tool call/result messages, not just the final text content.
+// Decision: StreamingToolResult now includes `messages: Vec<ChatMessage>` containing
+// all messages generated during the tool loop (assistant+tool_calls + tool results + final assistant).
+// Consequences: Callers receive the complete history; session.rs uses this to extend
+// self.messages instead of manually constructing the final assistant message.
+
 #[derive(Debug, Clone, Default)]
 pub struct StreamingToolMetrics {
     pub iterations: u32,
@@ -26,6 +35,7 @@ pub struct StreamingToolResult {
     pub content: String,
     pub metrics: StreamingToolMetrics,
     pub usage: TokenUsage,
+    pub messages: Vec<ChatMessage>,
 }
 
 pub struct StreamingToolLoop<P: LlmProvider + ?Sized> {
@@ -83,6 +93,7 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
             total_tokens: 0,
         };
         let mut content = String::new();
+        let mut result_messages: Vec<ChatMessage> = Vec::new();
         let mut depth = 0usize;
 
         loop {
@@ -176,10 +187,20 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
             let (iteration_content, pending_tool_calls) = iteration_result;
 
             if pending_tool_calls.is_empty() {
+                let final_assistant_message = ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: content.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                };
+                result_messages.push(final_assistant_message);
+
                 return Ok(StreamingToolResult {
                     content,
                     metrics,
                     usage,
+                    messages: result_messages,
                 });
             }
 
@@ -234,22 +255,32 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                 }
             }
 
-            current_request.messages.push(ChatMessage {
+            let assistant_with_tool_calls = ChatMessage {
                 role: ChatRole::Assistant,
                 content: iteration_content,
                 tool_calls: Some(pending_tool_calls),
                 tool_call_id: None,
                 reasoning_content: None,
-            });
+            };
             current_request
                 .messages
-                .extend(tool_results.iter().map(|(tc, result)| ChatMessage {
+                .push(assistant_with_tool_calls.clone());
+            result_messages.push(assistant_with_tool_calls);
+
+            let tool_result_messages: Vec<ChatMessage> = tool_results
+                .iter()
+                .map(|(tc, result)| ChatMessage {
                     role: ChatRole::Tool,
                     content: result.clone(),
                     tool_call_id: Some(tc.id.clone()),
                     tool_calls: None,
                     reasoning_content: None,
-                }));
+                })
+                .collect();
+            current_request
+                .messages
+                .extend(tool_result_messages.clone());
+            result_messages.extend(tool_result_messages);
 
             depth += 1;
         }
@@ -485,6 +516,55 @@ mod tests {
         assert_eq!(tool_result_msg.role, ChatRole::Tool);
         assert_eq!(tool_result_msg.tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(tool_result_msg.content, "file content");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_tool_loop_returns_full_message_chain() {
+        let provider = Arc::new(MockStreamProvider::new(vec![
+            vec![
+                Ok(mk_content("planning tools ")),
+                Ok(mk_tool_start("call-1", "fs_read")),
+                Ok(mk_tool_complete("call-1", "fs_read", "{\"path\":\"a.rs\"}")),
+                Ok(mk_tool_start("call-2", "fs_scan")),
+                Ok(mk_tool_complete("call-2", "fs_scan", "{\"root\":\"src\"}")),
+                Ok(mk_done()),
+            ],
+            vec![Ok(mk_content("done")), Ok(mk_done())],
+        ]));
+        let loop_runner =
+            StreamingToolLoop::new(provider, ToolPolicy::default_ask(), 4, mk_cancel_token());
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                Arc::new(|id, name, args, _| Ok(format!("result:{id}:{name}:{args}"))),
+                |_| {},
+            )
+            .await
+            .expect("streaming loop should return complete message chain");
+
+        assert_eq!(result.messages.len(), 4);
+
+        let first = &result.messages[0];
+        assert_eq!(first.role, ChatRole::Assistant);
+        assert_eq!(first.content, "planning tools ");
+        assert_eq!(first.tool_calls.as_ref().map(Vec::len), Some(2));
+
+        let second = &result.messages[1];
+        assert_eq!(second.role, ChatRole::Tool);
+        assert_eq!(second.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(second.content, "result:call-1:fs_read:{\"path\":\"a.rs\"}");
+
+        let third = &result.messages[2];
+        assert_eq!(third.role, ChatRole::Tool);
+        assert_eq!(third.tool_call_id.as_deref(), Some("call-2"));
+        assert_eq!(third.content, "result:call-2:fs_scan:{\"root\":\"src\"}");
+
+        let fourth = &result.messages[3];
+        assert_eq!(fourth.role, ChatRole::Assistant);
+        assert_eq!(fourth.tool_calls, None);
+        assert_eq!(fourth.tool_call_id, None);
+        assert_eq!(fourth.content, "planning tools done");
     }
 
     #[tokio::test]

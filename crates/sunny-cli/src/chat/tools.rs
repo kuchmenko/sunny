@@ -9,7 +9,7 @@ use sunny_core::tool::{
 };
 use sunny_mind::ToolDefinition;
 
-/// Build tool definitions for all 10 coding tools exposed to the model.
+/// Build tool definitions for all 11 coding tools exposed to the model.
 pub fn build_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -177,6 +177,27 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        ToolDefinition {
+            name: "codebase_search".to_string(),
+            description: "Search the codebase symbol index for Rust functions, structs, enums, traits, \
+                          and other symbols by name. Returns matching symbols with file paths and line numbers. \
+                          Use this to find where things are defined. Run /reindex first to build the index.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Symbol name to search for (case-insensitive substring match)"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Optional: filter by symbol kind",
+                        "enum": ["function", "struct", "enum", "trait", "impl", "const", "static", "type_alias", "macro", "module"]
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
     ]
 }
 
@@ -329,6 +350,60 @@ pub fn build_tool_executor(root: PathBuf) -> Arc<ToolExecutor> {
                     let git_args = parsed["args"].as_str().unwrap_or_default();
                     GitStatus.execute(git_args, &root)
                 }
+                "codebase_search" => {
+                    let query = extract_str(&parsed, "query").unwrap_or("");
+                    let kind_str = parsed["kind"].as_str();
+                    // Open a fresh DB connection for the symbol index
+                    let db =
+                        match sunny_store::Database::open_default() {
+                            Ok(db) => db,
+                            Err(_) => return Ok(
+                                "Codebase index not available. Run /reindex to build the index."
+                                    .to_string(),
+                            ),
+                        };
+                    let idx = sunny_store::SymbolIndex::new(db);
+                    let results = if let Some(ks) = kind_str {
+                        if let Some(kind) = sunny_store::SymbolKind::from_kind_str(ks) {
+                            idx.search_by_kind(query, kind)
+                        } else {
+                            idx.search(query)
+                        }
+                    } else {
+                        idx.search(query)
+                    };
+                    match results {
+                        Ok(symbols) if symbols.is_empty() => Ok(
+                            "No symbols found. Run /reindex to build or refresh the index."
+                                .to_string(),
+                        ),
+                        Ok(symbols) => {
+                            let lines: Vec<String> = symbols
+                                .iter()
+                                .take(20)
+                                .map(|s| {
+                                    format!(
+                                        "{} {} — {}:{}-{}{}",
+                                        s.kind.as_str(),
+                                        s.name,
+                                        s.file_path,
+                                        s.line,
+                                        s.end_line,
+                                        s.parent
+                                            .as_ref()
+                                            .map(|p| format!(" (in {p})"))
+                                            .unwrap_or_default()
+                                    )
+                                })
+                                .collect();
+                            Ok(lines.join("\n"))
+                        }
+                        Err(_) => Ok(
+                            "Codebase index not available. Run /reindex to build the index."
+                                .to_string(),
+                        ),
+                    }
+                }
                 _ => Err(ToolError::ExecutionFailed {
                     source: Box::new(std::io::Error::other(format!("unknown tool: {name}"))),
                 }),
@@ -359,7 +434,7 @@ mod tests {
     #[test]
     fn test_build_tool_definitions_count() {
         let defs = build_tool_definitions();
-        assert_eq!(defs.len(), 10, "expected 10 tool definitions");
+        assert_eq!(defs.len(), 11, "expected 11 tool definitions");
     }
 
     #[test]
@@ -377,6 +452,7 @@ mod tests {
             "git_log",
             "git_diff",
             "git_status",
+            "codebase_search",
         ];
         for name in &expected {
             assert!(names.contains(name), "missing tool: {name}");
@@ -410,6 +486,7 @@ mod tests {
             "git_log",
             "git_diff",
             "git_status",
+            "codebase_search",
         ];
         for name in &allowed {
             assert!(policy.is_allowed(name), "policy should allow {name}");

@@ -17,6 +17,7 @@ eventsource-stream = "0.2" # dep: SSE event parsing for Anthropic streaming resp
 async-stream = "0.3" # dep: async_stream! macro for building async Stream from SSE events
 base64 = "0.22" # dep: decode Anthropic OAuth client id for refresh flow
 tracing = "0.1" # dep: structured provider logs for auth/request lifecycle
+tiktoken-rs = "0.5" # dep: exact token counting for OpenAI-compatible models
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] } # dep: async test runtime

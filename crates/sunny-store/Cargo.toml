@@ -1,0 +1,21 @@
+[package]
+name = "sunny-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sunny-mind = { path = "../sunny-mind" } # dep: TokenUsage and ChatMessage types for persistence
+rusqlite = { version = "0.31", features = ["bundled"] } # dep: SQLite session store with bundled SQLite binary
+uuid = { version = "1", features = ["v4"] } # dep: UUID v4 session IDs
+chrono = { version = "0.4", features = ["serde"] } # dep: timestamps with RFC3339 serialization
+thiserror = "1" # dep: typed error enums per AGENTS.md
+tracing = "0.1" # dep: structured logging, no println per AGENTS.md
+serde = { version = "1", features = ["derive"] } # dep: serialization for SavedSession
+serde_json = "1" # dep: JSON blob serialization for tool_calls field
+dirs = "5" # dep: home directory resolution for ~/.sunny/
+tree-sitter = "0.24" # dep: AST parsing for codebase symbol index
+tree-sitter-rust = "0.23" # dep: Rust language grammar for tree-sitter symbol extraction
+ignore = "0.4" # dep: directory walking respecting .gitignore for symbol indexing
+
+[dev-dependencies]
+tempfile = "3" # dep: temporary directories for database tests

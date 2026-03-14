@@ -18,12 +18,14 @@ pub mod error;
 pub(crate) mod mock_provider;
 pub mod provider;
 pub mod stream;
+pub mod tokenizer;
 pub mod types;
 
 pub use anthropic::AnthropicProvider;
 pub use error::LlmError;
 pub use provider::LlmProvider;
 pub use stream::{StreamEvent, StreamResult};
+pub use tokenizer::{CharHeuristicCounter, TiktokenCounter, TokenCounter};
 pub use types::{
     ChatMessage, ChatRole, LlmRequest, LlmResponse, ModelId, ProviderEconomics, ProviderId,
     ProviderRoutingPolicy, TokenUsage, ToolCall, ToolCallResult, ToolChoice, ToolDefinition,

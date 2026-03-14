@@ -1,5 +1,6 @@
 use crate::error::LlmError;
 use crate::stream::{StreamEvent, StreamResult};
+use crate::tokenizer::{CharHeuristicCounter, TokenCounter};
 use crate::types::{LlmRequest, LlmResponse};
 
 // ADR: chat_stream() addition (class L — public API change)
@@ -45,6 +46,14 @@ pub trait LlmProvider: Send + Sync {
 
         let stream = tokio_stream::iter(events);
         Ok(Box::pin(stream))
+    }
+
+    /// Get a token counter for this provider.
+    ///
+    /// Default implementation returns a character-based heuristic counter.
+    /// Providers with exact tokenizers (e.g., OpenAI models) should override this method.
+    fn token_counter(&self) -> std::sync::Arc<dyn TokenCounter> {
+        std::sync::Arc::new(CharHeuristicCounter)
     }
 }
 
