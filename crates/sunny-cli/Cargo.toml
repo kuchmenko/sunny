@@ -7,6 +7,7 @@ edition.workspace = true
 sunny-core = { path = "../sunny-core" } # dep: tool infrastructure for chat
 sunny-mind = { path = "../sunny-mind" } # dep: LLM provider for analysis enrichment
 sunny-boys = { path = "../sunny-boys" } # dep: streaming tool loop and git tools for chat
+sunny-store = { path = "../sunny-store" } # dep: session and symbol persistence
 clap = { version = "4", features = ["derive"] } # dep: CLI argument parsing
 tokio = { version = "1", features = ["full"] } # dep: async runtime for CLI
 tokio-util = { version = "0.7", features = ["full"] } # dep: CancellationToken for graceful shutdown

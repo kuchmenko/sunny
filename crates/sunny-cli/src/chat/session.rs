@@ -98,7 +98,7 @@ impl ChatSession {
     /// Send a user message and stream the response.
     ///
     /// Appends the user message to history, runs the streaming tool loop,
-    /// appends the assistant response, and returns the final text content.
+    /// appends loop-produced messages, and returns the final text content.
     pub async fn send<F>(&mut self, user_input: &str, on_event: F) -> Result<String, ChatError>
     where
         F: Fn(StreamEvent) + Send + Sync,
@@ -130,16 +130,10 @@ impl ChatSession {
         );
 
         let result = loop_runner.run(request, tool_executor, on_event).await?;
+        let content = result.content.clone();
+        self.messages.extend(result.messages);
 
-        self.messages.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: result.content.clone(),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        });
-
-        Ok(result.content)
+        Ok(content)
     }
 
     /// Trim oldest non-system messages when the conversation exceeds the
