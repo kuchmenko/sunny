@@ -83,6 +83,14 @@ impl ChatSession {
             }
         }
 
+        // Generate and inject repository map for structural awareness.
+        if let Ok(repo_map) = sunny_store::generate_repo_map(&root, 20_000) {
+            if !repo_map.is_empty() {
+                system_prompt.push_str("\n\n# Repository Map\n\n");
+                system_prompt.push_str(&repo_map);
+            }
+        }
+
         let messages = vec![ChatMessage {
             role: ChatRole::System,
             content: system_prompt,
@@ -839,6 +847,32 @@ mod tests {
                 .content
                 .contains("Use async/await everywhere"),
             "system prompt should contain SUNNY.md content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repo_map_injected_into_system_prompt() {
+        let dir = tempdir().expect("should create temp dir");
+        // Write a Rust file with a pub fn to the tempdir
+        std::fs::write(dir.path().join("hello.rs"), "pub fn hello() {}").expect("write hello.rs");
+
+        let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
+        let store = Arc::new(SessionStore::new(db));
+        let provider = Arc::new(MockStreamProvider::new(vec![]));
+        let session = ChatSession::new(
+            provider,
+            dir.path().to_path_buf(),
+            "pending-session".to_string(),
+            store,
+        );
+
+        assert!(
+            session.messages[0].content.contains("# Repository Map"),
+            "system prompt should contain repo map header"
+        );
+        assert!(
+            session.messages[0].content.contains("hello"),
+            "system prompt should contain pub fn name"
         );
     }
 
