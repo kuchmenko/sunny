@@ -2,13 +2,14 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{collections::HashMap, collections::HashSet};
 
 use sunny_boys::streaming_tool_loop::StreamingToolLoop;
 use sunny_boys::tool_loop::{ToolCallError, ToolExecutor};
 use sunny_mind::{
     ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, StreamEvent, ToolChoice,
 };
-use sunny_store::{SavedSession, SessionStore};
+use sunny_store::{SavedSession, SessionStore, TokenBudget};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -38,6 +39,7 @@ pub enum ChatError {
 /// to [`StreamingToolLoop`].
 pub struct ChatSession {
     messages: Vec<ChatMessage>,
+    budget: sunny_store::TokenBudget,
     provider: Arc<dyn LlmProvider>,
     root: PathBuf,
     cancel: CancellationToken,
@@ -91,6 +93,7 @@ impl ChatSession {
 
         Self {
             messages,
+            budget: TokenBudget::new(200_000, Arc::new(sunny_mind::CharHeuristicCounter)),
             provider,
             root,
             cancel: CancellationToken::new(),
@@ -120,6 +123,7 @@ impl ChatSession {
         }
         Self {
             messages,
+            budget: TokenBudget::new(200_000, Arc::new(sunny_mind::CharHeuristicCounter)),
             provider,
             root,
             cancel,
@@ -203,6 +207,12 @@ impl ChatSession {
 
         // Extend message history with full tool chain from this exchange.
         self.messages.extend(result.messages);
+
+        self.budget.record_usage(&result.usage);
+
+        if self.budget.should_compact() {
+            self.compact_tool_outputs();
+        }
 
         // Persist to SQLite in background (don't block conversation).
         self.auto_save().await;
@@ -342,6 +352,83 @@ impl ChatSession {
             self.messages.remove(1);
         }
     }
+
+    fn compact_tool_outputs(&mut self) {
+        const READ_ONLY_TOOLS: &[&str] = &[
+            "fs_read",
+            "fs_scan",
+            "text_grep",
+            "grep_files",
+            "git_log",
+            "git_diff",
+            "git_status",
+        ];
+        const WRITE_TOOLS: &[&str] = &["fs_write", "fs_edit", "shell_exec"];
+
+        let read_only_tools: HashSet<&str> = READ_ONLY_TOOLS.iter().copied().collect();
+        let write_tools: HashSet<&str> = WRITE_TOOLS.iter().copied().collect();
+
+        let user_msg_indices: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, msg)| msg.role == ChatRole::User)
+            .map(|(index, _)| index)
+            .collect();
+
+        let recent_cutoff = if user_msg_indices.len() > 3 {
+            user_msg_indices[user_msg_indices.len() - 3]
+        } else {
+            0
+        };
+
+        let mut tool_name_by_call_id: HashMap<String, String> = HashMap::new();
+        for msg in &self.messages {
+            if msg.role != ChatRole::Assistant {
+                continue;
+            }
+
+            if let Some(tool_calls) = &msg.tool_calls {
+                for tool_call in tool_calls {
+                    tool_name_by_call_id.insert(tool_call.id.clone(), tool_call.name.clone());
+                }
+            }
+        }
+
+        let mut compacted_count = 0usize;
+        for (index, msg) in self.messages.iter_mut().enumerate() {
+            if msg.role != ChatRole::Tool || index >= recent_cutoff || msg.content.len() <= 200 {
+                continue;
+            }
+
+            let Some(call_id) = msg.tool_call_id.as_ref() else {
+                continue;
+            };
+            let Some(tool_name) = tool_name_by_call_id.get(call_id) else {
+                continue;
+            };
+
+            if write_tools.contains(tool_name.as_str())
+                || !read_only_tools.contains(tool_name.as_str())
+            {
+                continue;
+            }
+
+            let original_len = msg.content.len();
+            msg.content = format!("[Compacted: {tool_name} result, {original_len} chars]");
+            compacted_count += 1;
+        }
+
+        if compacted_count > 0 {
+            info!(
+                operation = "compact_tool_outputs",
+                compacted_count, "compacted old tool output messages"
+            );
+            self.budget.reset();
+        }
+
+        self.trim_context();
+    }
 }
 
 #[cfg(test)]
@@ -353,7 +440,7 @@ mod tests {
     use async_trait::async_trait;
     use sunny_mind::{
         LlmError, LlmRequest, LlmResponse, ModelId, ProviderId, StreamEvent, StreamResult,
-        TokenUsage,
+        TokenUsage, ToolCall,
     };
     use sunny_store::Database;
     use tempfile::tempdir;
@@ -648,6 +735,161 @@ mod tests {
                 .content
                 .contains("Use async/await everywhere"),
             "system prompt should contain SUNNY.md content"
+        );
+    }
+
+    fn user_message(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::User,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn assistant_tool_call_message(call_id: &str, tool_name: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: call_id.to_string(),
+                name: tool_name.to_string(),
+                arguments: "{}".to_string(),
+                execution_depth: 0,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn tool_result_message(call_id: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Tool,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: Some(call_id.to_string()),
+            reasoning_content: None,
+        }
+    }
+
+    fn assistant_text_message(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn push_tool_turn(
+        messages: &mut Vec<ChatMessage>,
+        user: &str,
+        call_id: &str,
+        tool_name: &str,
+        tool_output: &str,
+    ) {
+        messages.push(user_message(user));
+        messages.push(assistant_tool_call_message(call_id, tool_name));
+        messages.push(tool_result_message(call_id, tool_output));
+        messages.push(assistant_text_message("done"));
+    }
+
+    fn tool_content_for_call(messages: &[ChatMessage], call_id: &str) -> Option<String> {
+        messages
+            .iter()
+            .find(|m| m.role == ChatRole::Tool && m.tool_call_id.as_deref() == Some(call_id))
+            .map(|m| m.content.clone())
+    }
+
+    #[tokio::test]
+    async fn test_compact_tool_outputs_replaces_old_results() {
+        let dir = tempdir().expect("should create temp dir");
+        let mut session = make_session_in(&dir);
+        let long_output = "r".repeat(240);
+
+        push_tool_turn(
+            &mut session.messages,
+            "turn-1",
+            "call-old-read",
+            "fs_read",
+            &long_output,
+        );
+        push_tool_turn(
+            &mut session.messages,
+            "turn-2",
+            "call-old-write",
+            "fs_write",
+            &long_output,
+        );
+        push_tool_turn(
+            &mut session.messages,
+            "turn-3",
+            "call-recent-read-1",
+            "git_diff",
+            &long_output,
+        );
+        push_tool_turn(
+            &mut session.messages,
+            "turn-4",
+            "call-recent-read-2",
+            "fs_scan",
+            &long_output,
+        );
+        push_tool_turn(
+            &mut session.messages,
+            "turn-5",
+            "call-recent-read-3",
+            "text_grep",
+            &long_output,
+        );
+
+        session.compact_tool_outputs();
+
+        let old_read = tool_content_for_call(&session.messages, "call-old-read")
+            .expect("old read tool result");
+        let old_write = tool_content_for_call(&session.messages, "call-old-write")
+            .expect("old write tool result");
+        let recent_read = tool_content_for_call(&session.messages, "call-recent-read-1")
+            .expect("recent read tool result");
+
+        assert!(
+            old_read.starts_with("[Compacted: fs_read result, 240 chars]"),
+            "old read-only tool results should be compacted"
+        );
+        assert_eq!(
+            old_write, long_output,
+            "write tool results should be preserved regardless of age"
+        );
+        assert_eq!(
+            recent_read, long_output,
+            "tool results from the last 3 turns should be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_budget_tracks_usage() {
+        let dir = tempdir().expect("should create temp dir");
+        let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
+        let store = Arc::new(SessionStore::new(db));
+        let provider = Arc::new(MockStreamProvider::new(vec![make_text_stream("budget")]));
+        let mut session = ChatSession::new(
+            provider,
+            dir.path().to_path_buf(),
+            "pending-session".to_string(),
+            store,
+        );
+
+        let _ = session
+            .send("track usage", |_| {})
+            .await
+            .expect("send should work");
+
+        assert_eq!(
+            session.budget.consumed_tokens(),
+            15,
+            "budget should accumulate usage from send()"
         );
     }
 }

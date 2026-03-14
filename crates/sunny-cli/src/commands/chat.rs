@@ -10,6 +10,7 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use sunny_mind::{AnthropicProvider, LlmProvider, StreamEvent};
 use sunny_store::{Database, SessionStore};
+use tokio_util::sync::CancellationToken;
 
 use crate::chat::ChatSession;
 
@@ -23,6 +24,14 @@ pub struct ChatArgs {
     /// Anthropic API key override (overrides ANTHROPIC_API_KEY env var and OAuth credentials).
     #[arg(long)]
     pub api_key: Option<String>,
+
+    /// Resume the most recent session for the current working directory.
+    #[arg(long = "continue")]
+    pub continue_session: bool,
+
+    /// Resume a specific session by ID.
+    #[arg(long)]
+    pub resume: Option<String>,
 }
 
 /// Run the interactive chat REPL.
@@ -66,20 +75,67 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to open session store: {e}"))?;
     #[allow(clippy::arc_with_non_send_sync)]
     let store = Arc::new(SessionStore::new(store_db));
-    let session_id = format!(
-        "pending-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let mut session = ChatSession::new(
-        Arc::clone(&provider),
-        workspace_root.clone(),
-        session_id,
-        store,
-    );
+    let mut session = if args.continue_session || args.resume.is_some() {
+        let cwd = workspace_root.to_string_lossy().to_string();
+        let resume_id = args.resume.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let db = Database::open_default()
+                .map_err(|e| anyhow::anyhow!("failed to open session store: {e}"))?;
+            let store = SessionStore::new(db);
+
+            let saved = if let Some(id) = resume_id {
+                store
+                    .load_session(&id)
+                    .map_err(|e| anyhow::anyhow!("failed to load session: {e}"))?
+            } else {
+                store
+                    .most_recent_session(&cwd)
+                    .map_err(|e| anyhow::anyhow!("failed to find most recent session: {e}"))?
+            };
+
+            match saved {
+                Some(saved_session) => {
+                    let messages = store
+                        .load_messages(&saved_session.id)
+                        .map_err(|e| anyhow::anyhow!("failed to load messages: {e}"))?;
+                    Ok::<_, anyhow::Error>(Some((saved_session, messages)))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to join session load task: {e}"))??;
+
+        if let Some((saved_session, messages)) = loaded {
+            println!(
+                "Resumed session: {} ({}) - {} messages",
+                saved_session.title.as_deref().unwrap_or("untitled"),
+                saved_session.id,
+                messages.len()
+            );
+            ChatSession::from_saved(
+                Arc::clone(&store),
+                saved_session,
+                messages,
+                Arc::clone(&provider),
+                workspace_root.clone(),
+                CancellationToken::new(),
+            )
+        } else {
+            eprintln!("No session found. Starting new session.");
+            create_new_session(
+                Arc::clone(&provider),
+                workspace_root.clone(),
+                Arc::clone(&store),
+            )
+        }
+    } else {
+        create_new_session(
+            Arc::clone(&provider),
+            workspace_root.clone(),
+            Arc::clone(&store),
+        )
+    };
     let mut rl = DefaultEditor::new()?;
 
     loop {
@@ -93,6 +149,147 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                 if input == "/quit" || input == "/exit" {
                     println!("Goodbye.");
                     break;
+                }
+
+                if input.starts_with('/') {
+                    let mut parts = input.split_whitespace();
+                    let command = parts.next().unwrap_or_default();
+
+                    match command {
+                        "/sessions" => {
+                            let sub = parts.next();
+                            if sub.is_none() || sub == Some("list") {
+                                let cwd = workspace_root.to_string_lossy().to_string();
+                                let listed = tokio::task::spawn_blocking(move || {
+                                    let db = Database::open_default().map_err(|e| {
+                                        anyhow::anyhow!("failed to open session store: {e}")
+                                    })?;
+                                    let store = SessionStore::new(db);
+                                    store.list_sessions(Some(&cwd)).map_err(|e| {
+                                        anyhow::anyhow!("failed to list sessions: {e}")
+                                    })
+                                })
+                                .await
+                                .map_err(|e| {
+                                    anyhow::anyhow!("failed to join session list task: {e}")
+                                })?;
+
+                                match listed {
+                                    Ok(sessions) if sessions.is_empty() => {
+                                        println!("No sessions found.")
+                                    }
+                                    Ok(sessions) => {
+                                        println!(
+                                            "{:<36} {:<25} {:>5}  Updated",
+                                            "ID", "Title", "Msgs"
+                                        );
+                                        println!("{}", "-".repeat(80));
+                                        for s in sessions {
+                                            let title: String = s
+                                                .title
+                                                .as_deref()
+                                                .unwrap_or("untitled")
+                                                .chars()
+                                                .take(25)
+                                                .collect();
+                                            println!(
+                                                "{:<36} {:<25} {:>5}  {}",
+                                                &s.id[..36.min(s.id.len())],
+                                                title,
+                                                s.token_count,
+                                                s.updated_at.format("%Y-%m-%d %H:%M")
+                                            );
+                                        }
+                                    }
+                                    Err(e) => eprintln!("Failed to list sessions: {e}"),
+                                }
+                            } else {
+                                eprintln!("Usage: /sessions list");
+                            }
+                        }
+                        "/new" => {
+                            println!("Starting new session...");
+                            session = create_new_session(
+                                Arc::clone(&provider),
+                                workspace_root.clone(),
+                                Arc::clone(&store),
+                            );
+                        }
+                        "/clear" => {
+                            println!("Cleared session messages.");
+                            session = ChatSession::new(
+                                Arc::clone(&provider),
+                                workspace_root.clone(),
+                                session.session_id().to_string(),
+                                Arc::clone(&store),
+                            );
+                        }
+                        "/switch" => {
+                            if let Some(id) = parts.next() {
+                                let id = id.to_string();
+                                let loaded = tokio::task::spawn_blocking(move || {
+                                    let db = Database::open_default().map_err(|e| {
+                                        anyhow::anyhow!("failed to open session store: {e}")
+                                    })?;
+                                    let store = SessionStore::new(db);
+                                    let saved = store.load_session(&id).map_err(|e| {
+                                        anyhow::anyhow!("failed to load session: {e}")
+                                    })?;
+                                    match saved {
+                                        Some(saved_session) => {
+                                            let messages = store
+                                                .load_messages(&saved_session.id)
+                                                .map_err(|e| {
+                                                anyhow::anyhow!(
+                                                    "failed to load session messages: {e}"
+                                                )
+                                            })?;
+                                            Ok::<_, anyhow::Error>(Some((saved_session, messages)))
+                                        }
+                                        None => Ok(None),
+                                    }
+                                })
+                                .await
+                                .map_err(|e| {
+                                    anyhow::anyhow!("failed to join session switch task: {e}")
+                                })?;
+
+                                match loaded {
+                                    Ok(Some((saved_session, messages))) => {
+                                        println!("Switched to session: {}", saved_session.id);
+                                        session = ChatSession::from_saved(
+                                            Arc::clone(&store),
+                                            saved_session,
+                                            messages,
+                                            Arc::clone(&provider),
+                                            workspace_root.clone(),
+                                            CancellationToken::new(),
+                                        );
+                                    }
+                                    Ok(None) => eprintln!("Session not found."),
+                                    Err(e) => eprintln!("Failed to switch sessions: {e}"),
+                                }
+                            } else {
+                                eprintln!("Usage: /switch <id>");
+                            }
+                        }
+                        "/compact" => println!("Compaction not yet implemented"),
+                        "/help" => {
+                            println!("Available commands:");
+                            println!(
+                                "  /sessions list         List sessions for current directory"
+                            );
+                            println!("  /new                   Start a new session");
+                            println!("  /clear                 Clear current session messages");
+                            println!("  /switch <id>           Switch to a specific session");
+                            println!("  /compact               Compact conversation context");
+                            println!("  /help                  Show this help");
+                            println!("  /quit, /exit           Exit sunny");
+                        }
+                        _ => eprintln!("Unknown command. Type /help for available commands."),
+                    }
+
+                    continue;
                 }
 
                 let _ = rl.add_history_entry(&input);
@@ -187,5 +384,48 @@ fn truncate(s: &str, max_len: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..max_len.saturating_sub(1)])
+    }
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+fn create_new_session(
+    provider: Arc<dyn LlmProvider>,
+    workspace_root: PathBuf,
+    store: Arc<SessionStore>,
+) -> ChatSession {
+    let session_id = format!(
+        "pending-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+
+    ChatSession::new(provider, workspace_root, session_id, store)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::ChatArgs;
+
+    #[derive(Parser, Debug)]
+    struct TestCli {
+        #[command(flatten)]
+        args: ChatArgs,
+    }
+
+    #[test]
+    fn test_parse_continue_flag() {
+        let parsed = TestCli::parse_from(["sunny", "--continue"]);
+        assert!(parsed.args.continue_session);
+    }
+
+    #[test]
+    fn test_parse_resume_flag() {
+        let parsed = TestCli::parse_from(["sunny", "--resume", "session-123"]);
+        assert_eq!(parsed.args.resume.as_deref(), Some("session-123"));
     }
 }
