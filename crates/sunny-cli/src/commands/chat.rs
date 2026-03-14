@@ -404,13 +404,12 @@ fn detect_auth_source(api_key_override: &Option<String>) -> String {
     if std::env::var("ANTHROPIC_API_KEY").is_ok() {
         return "api-key (ANTHROPIC_API_KEY)".to_string();
     }
-    let cred_path = dirs::home_dir()
-        .map(|h| h.join(".claude").join(".credentials.json"))
-        .filter(|p| p.exists());
-    if cred_path.is_some() {
-        return "oauth (~/.claude/.credentials.json)".to_string();
+    if let Some(sunny_creds) = dirs::home_dir().map(|h| h.join(".sunny").join("credentials.json")) {
+        if sunny_creds.exists() {
+            return "oauth (~/.sunny/credentials.json)".to_string();
+        }
     }
-    "unknown".to_string()
+    "none".to_string()
 }
 
 /// Truncate a string to fit within `max_len` display chars (ASCII-safe).

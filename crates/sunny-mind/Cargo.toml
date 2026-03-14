@@ -19,6 +19,8 @@ base64 = "0.22" # dep: decode Anthropic OAuth client id for refresh flow
 tracing = "0.1" # dep: structured provider logs for auth/request lifecycle
 tiktoken-rs = "0.5" # dep: exact token counting for OpenAI-compatible models
 dirs = "5" # dep: home directory resolution for ~/.sunny/ credentials persistence
+sha2 = "0.10" # dep: SHA-256 for PKCE S256 code challenge generation
+rand = "0.8" # dep: cryptographic random bytes for PKCE verifier and OAuth state
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] } # dep: async test runtime

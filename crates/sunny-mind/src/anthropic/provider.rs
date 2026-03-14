@@ -10,8 +10,7 @@ use crate::stream::StreamResult;
 use crate::types::{ChatRole, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage, ToolCall};
 
 use super::credentials::{
-    load_credentials, load_from_claude_credentials, refresh_oauth_token, save_credentials,
-    AnthropicCredentials, CredentialSource,
+    load_credentials, refresh_oauth_token, save_credentials, AnthropicCredentials, CredentialSource,
 };
 use super::stream_parser::StreamParser;
 
@@ -57,7 +56,6 @@ impl AnthropicProvider {
                 &mut creds,
                 refresh_token,
                 |client, token| Box::pin(refresh_oauth_token(client, token)),
-                load_from_claude_credentials,
                 save_credentials,
             )
             .await?;
@@ -69,12 +67,11 @@ impl AnthropicProvider {
         }
     }
 
-    async fn refresh_with_recovery<RF, LF, SF>(
+    async fn refresh_with_recovery<RF, SF>(
         client: &reqwest::Client,
         creds: &mut AnthropicCredentials,
         refresh_token: String,
         mut refresh_fn: RF,
-        load_claude_fn: LF,
         save_fn: SF,
     ) -> Result<(), LlmError>
     where
@@ -84,7 +81,6 @@ impl AnthropicProvider {
         ) -> Pin<
             Box<dyn Future<Output = Result<AnthropicCredentials, LlmError>> + Send + 'a>,
         >,
-        LF: Fn() -> Result<AnthropicCredentials, LlmError>,
         SF: Fn(&AnthropicCredentials) -> Result<(), LlmError>,
     {
         match refresh_fn(client, &refresh_token).await {
@@ -99,33 +95,13 @@ impl AnthropicProvider {
                 Ok(())
             }
             Err(e) => {
-                if !e.to_string().contains("invalid_grant") {
-                    return Err(e);
+                if e.to_string().contains("invalid_grant") {
+                    Err(LlmError::AuthFailed {
+                        message: "OAuth token refresh failed (invalid_grant). Your refresh token has been invalidated. Run `sunny login` to re-authenticate.".to_string(),
+                    })
+                } else {
+                    Err(e)
                 }
-
-                warn!(
-                    provider = "anthropic",
-                    "Refresh token invalid, attempting to re-sync from Claude Code credentials"
-                );
-
-                if let Ok(claude_creds) = load_claude_fn() {
-                    if let Some(fresh_refresh) = claude_creds.refresh_token {
-                        if let Ok(refreshed) = refresh_fn(client, &fresh_refresh).await {
-                            *creds = refreshed;
-                            if let Err(save_err) = save_fn(creds) {
-                                warn!(
-                                    provider = "anthropic",
-                                    "Failed to persist re-synced credentials: {save_err}"
-                                );
-                            }
-                            return Ok(());
-                        }
-                    }
-                }
-
-                Err(LlmError::AuthFailed {
-                    message: "OAuth token refresh failed. Your refresh token may be invalidated. Run `claude` to re-authenticate, then restart sunny.".to_string(),
-                })
             }
         }
     }
@@ -781,7 +757,6 @@ mod tests {
                     .expect("refresh result must exist");
                 Box::pin(async move { next })
             },
-            || panic!("claude fallback should not be loaded on successful refresh"),
             move |saved| {
                 persisted_clone
                     .lock()
@@ -812,52 +787,30 @@ mod tests {
         let invalid_grant = Err(LlmError::AuthFailed {
             message: "token refresh failed (400): {\"error\":\"invalid_grant\"}".to_string(),
         });
-        let retry_success = Ok(AnthropicCredentials {
-            access_token: "retry-access".to_string(),
-            refresh_token: Some("retry-refresh".to_string()),
-            expires_at: Some(9_999_999_999),
-            source: CredentialSource::OAuthFile,
-        });
-
-        let refresh_results = Arc::new(Mutex::new(VecDeque::from([invalid_grant, retry_success])));
+        let refresh_results = Arc::new(Mutex::new(VecDeque::from([invalid_grant])));
         let refresh_results_clone = Arc::clone(&refresh_results);
 
-        let used_tokens = Arc::new(Mutex::new(Vec::new()));
-        let used_tokens_clone = Arc::clone(&used_tokens);
-
-        AnthropicProvider::refresh_with_recovery(
+        let result = AnthropicProvider::refresh_with_recovery(
             &client,
             &mut creds,
             "expired-refresh".to_string(),
-            move |_, token| {
-                used_tokens_clone
-                    .lock()
-                    .expect("used_tokens lock")
-                    .push(token.to_string());
+            move |_, _| {
                 let next = refresh_results_clone
                     .lock()
-                    .expect("refresh queue lock")
+                    .expect("lock")
                     .pop_front()
-                    .expect("refresh result must exist");
+                    .expect("result");
                 Box::pin(async move { next })
-            },
-            || {
-                Ok(AnthropicCredentials {
-                    access_token: "claude-access".to_string(),
-                    refresh_token: Some("claude-refresh".to_string()),
-                    expires_at: Some(9_999_999_999),
-                    source: CredentialSource::OAuthFile,
-                })
             },
             |_| Ok(()),
         )
-        .await
-        .expect("invalid_grant should retry once and succeed");
+        .await;
 
-        assert_eq!(creds.access_token, "retry-access");
-        let tokens = used_tokens.lock().expect("used_tokens read lock");
-        assert_eq!(tokens.len(), 2, "must attempt exactly one retry");
-        assert_eq!(tokens[0], "expired-refresh");
-        assert_eq!(tokens[1], "claude-refresh");
+        assert!(result.is_err(), "invalid_grant must return error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("sunny login"),
+            "error must mention 'sunny login', got: {err}"
+        );
     }
 }

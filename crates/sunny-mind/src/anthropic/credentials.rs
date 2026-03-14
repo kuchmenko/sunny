@@ -52,31 +52,10 @@ pub(crate) fn load_credentials() -> Result<AnthropicCredentials, LlmError> {
         }
     }
 
-    let claude_path = oauth_credentials_path();
-    if claude_path.exists() {
-        let creds = load_from_file(&claude_path)?;
-        if let Err(e) = save_credentials(&creds) {
-            tracing::warn!("Failed to seed sunny credentials from Claude's file: {e}");
-        }
-        return Ok(creds);
-    }
-
     Err(LlmError::NotConfigured {
-        message:
-            "no Anthropic credentials found: set ANTHROPIC_API_KEY or run `claude` to authenticate"
-                .to_string(),
+        message: "no credentials found: set ANTHROPIC_API_KEY or run `sunny login` to authenticate"
+            .to_string(),
     })
-}
-
-fn oauth_credentials_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(home)
-        .join(".claude")
-        .join(".credentials.json")
-}
-
-pub(crate) fn load_from_claude_credentials() -> Result<AnthropicCredentials, LlmError> {
-    load_from_file(&oauth_credentials_path())
 }
 
 pub(crate) fn sunny_credentials_path() -> Option<PathBuf> {
@@ -479,5 +458,33 @@ mod tests {
         assert!(path.exists(), "credentials.json must exist after save");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_credentials_no_claude_fallback() {
+        // When ANTHROPIC_API_KEY is not set and ~/.sunny/credentials.json doesn't exist,
+        // load_credentials must return NotConfigured with a message pointing to sunny login.
+        // This test verifies we don't fall back to ~/.claude/.credentials.json.
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        // If the test machine happens to have ~/.sunny/credentials.json, skip gracefully
+        if let Some(path) = sunny_credentials_path() {
+            if path.exists() {
+                return; // Skip — can't test NotConfigured when file exists
+            }
+        }
+        let result = load_credentials();
+        match result {
+            Err(LlmError::NotConfigured { message }) => {
+                assert!(
+                    message.contains("sunny login"),
+                    "NotConfigured error must mention 'sunny login', got: {message}"
+                );
+            }
+            Ok(_) => {
+                // Either ANTHROPIC_API_KEY was set by test runner, or ~/.sunny/credentials.json exists
+                // Both are valid — skip
+            }
+            Err(other) => panic!("unexpected error variant: {other}"),
+        }
     }
 }

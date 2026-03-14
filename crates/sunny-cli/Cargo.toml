@@ -18,6 +18,7 @@ tracing-subscriber = "0.3" # dep: logging output for CLI
 dotenvy = "0.15" # dep: load .env variables for provider configuration
 thiserror = "1" # dep: error handling for CLI commands
 anyhow = "1" # dep: error propagation in CLI command handlers
+reqwest = { version = "0.12", features = ["json"] } # dep: HTTP client for OAuth token exchange in login command
 async-trait = "0.1" # dep: async methods in LlmProvider test mocks (session.rs)
 rustyline = { version = "14", features = [] } # dep: REPL input with history and line editing
 crossterm = "0.27" # dep: terminal color output for tool indicators
