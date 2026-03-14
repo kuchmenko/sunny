@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sunny_cli::chat::ChatSession;
+use sunny_boys::agent::AgentSession;
 use sunny_mind::{
     ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, StreamEvent,
     StreamResult, TokenUsage,
@@ -99,7 +99,7 @@ async fn test_chat_simple_response_no_tools() {
     let provider = Arc::new(MockStreamProvider::new(vec![make_text_stream("4")]));
     let tmp = tempdir().expect("temp dir");
     let (store, _dir) = make_store();
-    let mut session = ChatSession::new(
+    let mut session = AgentSession::new(
         provider,
         tmp.path().to_path_buf(),
         "pending-session".to_string(),
@@ -134,7 +134,7 @@ async fn test_chat_tool_call_flow_fs_read() {
     let provider = Arc::new(MockStreamProvider::new(vec![first_stream, second_stream]));
     let provider_handle = Arc::clone(&provider);
     let (store, _dir) = make_store();
-    let mut session = ChatSession::new(
+    let mut session = AgentSession::new(
         provider,
         tmp.path().to_path_buf(),
         "pending-session".to_string(),
@@ -158,7 +158,7 @@ async fn test_chat_multi_turn_conversation_history() {
     ]));
     let tmp = tempdir().expect("temp dir");
     let (store, _dir) = make_store();
-    let mut session = ChatSession::new(
+    let mut session = AgentSession::new(
         provider,
         tmp.path().to_path_buf(),
         "pending-session".to_string(),
@@ -183,7 +183,7 @@ async fn test_chat_context_management_trims_old_messages() {
     ]));
     let tmp = tempdir().expect("temp dir");
     let (store, _dir) = make_store();
-    let mut session = ChatSession::new(
+    let mut session = AgentSession::new(
         provider,
         tmp.path().to_path_buf(),
         "pending-session".to_string(),

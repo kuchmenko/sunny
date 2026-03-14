@@ -2309,6 +2309,7 @@ dependencies = [
  "serde_json",
  "sunny-core",
  "sunny-mind",
+ "sunny-store",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

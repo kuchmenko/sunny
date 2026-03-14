@@ -13,7 +13,8 @@ use sunny_store::{Database, SessionStore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::chat::ChatSession;
+#[allow(unused_imports)]
+use sunny_boys::{AgentError, AgentSession};
 
 /// Arguments for the `sunny chat` subcommand.
 #[derive(Args, Debug)]
@@ -122,7 +123,7 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                 saved_session.id,
                 messages.len()
             );
-            ChatSession::from_saved(
+            AgentSession::from_saved(
                 Arc::clone(&store),
                 saved_session,
                 messages,
@@ -226,7 +227,7 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                         }
                         "/clear" => {
                             println!("Cleared session messages.");
-                            session = ChatSession::new(
+                            session = AgentSession::new(
                                 Arc::clone(&provider),
                                 workspace_root.clone(),
                                 session.session_id().to_string(),
@@ -266,7 +267,7 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                                 match loaded {
                                     Ok(Some((saved_session, messages))) => {
                                         println!("Switched to session: {}", saved_session.id);
-                                        session = ChatSession::from_saved(
+                                        session = AgentSession::from_saved(
                                             Arc::clone(&store),
                                             saved_session,
                                             messages,
@@ -500,10 +501,10 @@ fn create_new_session(
     provider: Arc<dyn LlmProvider>,
     workspace_root: PathBuf,
     store: Arc<SessionStore>,
-) -> ChatSession {
+) -> AgentSession {
     let session_id = Uuid::new_v4().to_string();
 
-    ChatSession::new(provider, workspace_root, session_id, store)
+    AgentSession::new(provider, workspace_root, session_id, store)
 }
 
 #[cfg(test)]
