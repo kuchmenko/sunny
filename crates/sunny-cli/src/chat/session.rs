@@ -1,3 +1,5 @@
+//! Chat session — manages conversation history and delegates to the streaming tool loop.
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -40,21 +42,27 @@ pub struct ChatSession {
     root: PathBuf,
     cancel: CancellationToken,
     session_id: String,
+    #[allow(clippy::arc_with_non_send_sync)]
     store: Arc<SessionStore>,
     is_new_session: bool,
+    /// Whether to generate a title after the first exchange.
+    /// True for new sessions, false for resumed sessions.
+    generate_title: bool,
 }
 
 impl ChatSession {
     /// Create a new chat session with the given provider and workspace root.
     ///
-    /// Initialises the message history with the Claude Code system prompt.
+    /// Initialises the message history with the Claude Code system prompt,
+    /// optionally appending SUNNY.md project context if present.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(
         provider: Arc<dyn LlmProvider>,
         root: PathBuf,
         session_id: String,
         store: Arc<SessionStore>,
     ) -> Self {
-        let system_prompt = format!(
+        let mut system_prompt = format!(
             "You are Claude Code, Anthropic's official CLI for Claude.\n\n\
              You are an expert software engineer working in the workspace at: {}.\n\n\
              You have access to tools for reading, writing, editing files, executing shell \
@@ -63,6 +71,15 @@ impl ChatSession {
              broad exploration.",
             root.display()
         );
+
+        // Inject SUNNY.md context if available (capped at 12 000 chars total).
+        if let Ok(context) = sunny_store::context_file::read_context_files(&root) {
+            if !context.is_empty() {
+                let truncated: String = context.chars().take(12_000).collect();
+                system_prompt.push_str("\n\n# Project Context\n\n");
+                system_prompt.push_str(&truncated);
+            }
+        }
 
         let messages = vec![ChatMessage {
             role: ChatRole::System,
@@ -80,9 +97,11 @@ impl ChatSession {
             session_id,
             store,
             is_new_session: true,
+            generate_title: true,
         }
     }
 
+    /// Reconstruct a session from persisted state.
     pub fn from_saved(
         store: Arc<SessionStore>,
         saved: SavedSession,
@@ -99,7 +118,6 @@ impl ChatSession {
                 "session was created in a different directory"
             );
         }
-
         Self {
             messages,
             provider,
@@ -108,6 +126,7 @@ impl ChatSession {
             session_id: saved.id,
             store,
             is_new_session: false,
+            generate_title: false,
         }
     }
 
@@ -115,6 +134,11 @@ impl ChatSession {
     #[allow(dead_code)]
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancel.clone()
+    }
+
+    /// Return the workspace root path.
+    pub fn root(&self) -> &PathBuf {
+        &self.root
     }
 
     /// Cancel the current request and reset the token for the next one.
@@ -135,10 +159,15 @@ impl ChatSession {
         self.messages.iter().map(|m| m.content.len()).sum()
     }
 
+    /// The current session ID.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// Send a user message and stream the response.
     ///
     /// Appends the user message to history, runs the streaming tool loop,
-    /// appends loop-produced messages, and returns the final text content.
+    /// appends loop-produced messages, auto-saves, and returns the final text.
     pub async fn send<F>(&mut self, user_input: &str, on_event: F) -> Result<String, ChatError>
     where
         F: Fn(StreamEvent) + Send + Sync,
@@ -171,30 +200,97 @@ impl ChatSession {
 
         let result = loop_runner.run(request, tool_executor, on_event).await?;
         let content = result.content.clone();
+
+        // Extend message history with full tool chain from this exchange.
         self.messages.extend(result.messages);
+
+        // Persist to SQLite in background (don't block conversation).
         self.auto_save().await;
+
+        // Generate a title after the first exchange (non-blocking background task).
+        if self.generate_title {
+            self.generate_title = false;
+            let fallback_title: String = user_input.chars().take(50).collect();
+            let _store = Arc::clone(&self.store); // kept for API compatibility, fresh conn used below
+            let session_id = self.session_id.clone();
+            let provider = Arc::clone(&self.provider);
+            let first_msg = user_input.to_string();
+
+            tokio::spawn(async move {
+                let title_request = sunny_mind::LlmRequest {
+                    messages: vec![sunny_mind::ChatMessage {
+                        role: sunny_mind::ChatRole::User,
+                        content: format!(
+                            "Generate a concise 5-word title for this coding conversation. \
+                             Respond with ONLY the title, nothing else.\n\nUser's first message: {first_msg}"
+                        ),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    }],
+                    max_tokens: Some(20),
+                    temperature: Some(0.3),
+                    tools: None,
+                    tool_choice: None,
+                };
+
+                let title = match provider.chat(title_request).await {
+                    Ok(response) => {
+                        let t = response.content.trim().to_string();
+                        if t.is_empty() {
+                            fallback_title
+                        } else {
+                            t
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "title generation failed, using fallback");
+                        fallback_title
+                    }
+                };
+
+                let _ =
+                    tokio::task::spawn_blocking(
+                        move || match sunny_store::Database::open_default() {
+                            Ok(db) => {
+                                let s = SessionStore::new(db);
+                                if let Err(e) = s.update_title(&session_id, &title) {
+                                    warn!(error = %e, "failed to store session title");
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "failed to open db for title update"),
+                        },
+                    )
+                    .await;
+            });
+        }
 
         Ok(content)
     }
 
     async fn auto_save(&mut self) {
-        let _store_refs = Arc::strong_count(&self.store);
-
         if self.is_new_session {
             let working_dir = self.root.to_string_lossy().to_string();
             let model = self.provider.model_id().to_string();
+            let working_dir_clone = working_dir.clone();
+            let model_clone = model.clone();
+            let session_id_clone = self.session_id.clone();
             match tokio::task::spawn_blocking(move || {
-                let db = match sunny_store::Database::open_default() {
-                    Ok(db) => db,
-                    Err(e) => return Err(e),
-                };
-                let store = SessionStore::new(db);
-                store.create_session(&working_dir, Some(&model))
+                // Open a fresh DB connection (rusqlite::Connection is not Send).
+                let db = sunny_store::Database::open_default()
+                    .map_err(|e| sunny_store::StoreError::Migration(e.to_string()))?;
+                let s = SessionStore::new(db);
+                match s.load_session(&session_id_clone) {
+                    Ok(None) => s
+                        .create_session(&working_dir_clone, Some(&model_clone))
+                        .map(|_| ()),
+                    Ok(Some(_)) => Ok(()),
+                    Err(e) => Err(e),
+                }
             })
             .await
             {
-                Ok(Ok(saved)) => {
-                    self.session_id = saved.id;
+                Ok(Ok(())) => {
                     self.is_new_session = false;
                 }
                 Ok(Err(e)) => {
@@ -210,18 +306,14 @@ impl ChatSession {
 
         let session_id = self.session_id.clone();
         let messages = self.messages.clone();
-        tokio::task::spawn_blocking(move || {
-            let db = match sunny_store::Database::open_default() {
-                Ok(db) => db,
-                Err(e) => {
-                    warn!(error = %e, "failed to open session store for auto-save");
-                    return;
+        tokio::task::spawn_blocking(move || match sunny_store::Database::open_default() {
+            Ok(db) => {
+                let s = SessionStore::new(db);
+                if let Err(e) = s.save_messages(&session_id, &messages) {
+                    warn!(error = %e, "failed to auto-save session messages");
                 }
-            };
-            let store = SessionStore::new(db);
-            if let Err(e) = store.save_messages(&session_id, &messages) {
-                warn!(error = %e, "failed to auto-save session messages");
             }
+            Err(e) => warn!(error = %e, "failed to open db for auto-save: {e}"),
         });
     }
 
@@ -254,6 +346,7 @@ impl ChatSession {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::arc_with_non_send_sync)]
     use super::*;
     use std::collections::VecDeque;
 
@@ -309,7 +402,6 @@ mod tests {
             let events = streams
                 .pop_front()
                 .unwrap_or_else(|| vec![Ok(StreamEvent::Done)]);
-            // Convert the Vec into a stream using tokio_stream::iter.
             Ok(Box::pin(tokio_stream::iter(events)))
         }
     }
@@ -331,19 +423,23 @@ mod tests {
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn make_store() -> (Arc<SessionStore>, tempfile::TempDir) {
-        let dir = tempdir().expect("should create temp dir");
-        let db_path = dir.path().join("session_test.db");
-        let db = Database::open(&db_path).expect("should open database");
-        (Arc::new(SessionStore::new(db)), dir)
+    fn make_session_in(dir: &tempfile::TempDir) -> ChatSession {
+        let db = Database::open(dir.path().join("session_test.db").as_path())
+            .expect("should open database");
+        let store = Arc::new(SessionStore::new(db));
+        let provider = Arc::new(MockStreamProvider::new(vec![]));
+        ChatSession::new(
+            provider,
+            dir.path().to_path_buf(),
+            "pending-session".to_string(),
+            store,
+        )
     }
 
     #[tokio::test]
     async fn test_chat_session_new_has_system_message() {
-        let provider = Arc::new(MockStreamProvider::new(vec![]));
-        let root = std::env::temp_dir();
-        let (store, _dir) = make_store();
-        let session = ChatSession::new(provider, root, "pending-session".to_string(), store);
+        let dir = tempdir().expect("should create temp dir");
+        let session = make_session_in(&dir);
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].role, ChatRole::System);
         assert!(session.messages[0]
@@ -353,22 +449,49 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_has_session_id() {
-        let provider = Arc::new(MockStreamProvider::new(vec![]));
-        let root = std::env::temp_dir();
-        let (store, _dir) = make_store();
-        let session = ChatSession::new(provider, root, "pending-session".to_string(), store);
+        let dir = tempdir().expect("should create temp dir");
+        let session = make_session_in(&dir);
         assert!(!session.session_id.is_empty());
     }
 
     #[tokio::test]
-    async fn test_session_from_saved_restores_messages() {
-        let provider = Arc::new(MockStreamProvider::new(vec![]));
-        let root = std::env::temp_dir();
-        let (store, _dir) = make_store();
-        let working_dir = root.to_string_lossy().to_string();
+    async fn test_generate_title_flag_set_on_new_session() {
+        let dir = tempdir().expect("should create temp dir");
+        let session = make_session_in(&dir);
+        assert!(session.generate_title, "new session should generate title");
+    }
+
+    #[tokio::test]
+    async fn test_generate_title_false_on_from_saved() {
+        let dir = tempdir().expect("should create temp dir");
+        let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
+        let store = Arc::new(SessionStore::new(db));
         let saved = store
-            .create_session(&working_dir, Some(provider.model_id()))
-            .expect("should create session");
+            .create_session("/test", Some("model"))
+            .expect("create session");
+        let provider = Arc::new(MockStreamProvider::new(vec![]));
+        let session = ChatSession::from_saved(
+            store,
+            saved,
+            vec![],
+            provider,
+            dir.path().to_path_buf(),
+            CancellationToken::new(),
+        );
+        assert!(
+            !session.generate_title,
+            "resumed session should not generate title"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_from_saved_restores_messages() {
+        let dir = tempdir().expect("should create temp dir");
+        let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
+        let store = Arc::new(SessionStore::new(db));
+        let saved = store
+            .create_session("/test", Some("model"))
+            .expect("create session");
         let messages = vec![
             ChatMessage {
                 role: ChatRole::System,
@@ -392,12 +515,13 @@ mod tests {
                 reasoning_content: None,
             },
         ];
+        let provider = Arc::new(MockStreamProvider::new(vec![]));
         let session = ChatSession::from_saved(
-            Arc::clone(&store),
+            store,
             saved,
             messages,
             provider,
-            root,
+            dir.path().to_path_buf(),
             CancellationToken::new(),
         );
         assert_eq!(session.message_count(), 3);
@@ -405,10 +529,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_chat_session_send_appends_messages() {
+        let dir = tempdir().expect("should create temp dir");
+        let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
+        let store = Arc::new(SessionStore::new(db));
         let provider = Arc::new(MockStreamProvider::new(vec![make_text_stream("Hello!")]));
-        let root = std::env::temp_dir();
-        let (store, _dir) = make_store();
-        let mut session = ChatSession::new(provider, root, "pending-session".to_string(), store);
+        let mut session = ChatSession::new(
+            provider,
+            dir.path().to_path_buf(),
+            "pending-session".to_string(),
+            store,
+        );
 
         let result = session.send("hi", |_| {}).await;
         assert!(result.is_ok(), "send should succeed");
@@ -420,12 +550,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_chat_session_send_returns_content() {
+        let dir = tempdir().expect("should create temp dir");
+        let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
+        let store = Arc::new(SessionStore::new(db));
         let provider = Arc::new(MockStreamProvider::new(vec![make_text_stream(
             "Hello world",
         )]));
-        let root = std::env::temp_dir();
-        let (store, _dir) = make_store();
-        let mut session = ChatSession::new(provider, root, "pending-session".to_string(), store);
+        let mut session = ChatSession::new(
+            provider,
+            dir.path().to_path_buf(),
+            "pending-session".to_string(),
+            store,
+        );
 
         let content = session.send("hi", |_| {}).await.unwrap();
         assert_eq!(content, "Hello world");
@@ -433,10 +569,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_chat_session_cancel_resets_token() {
-        let provider = Arc::new(MockStreamProvider::new(vec![]));
-        let root = std::env::temp_dir();
-        let (store, _dir) = make_store();
-        let mut session = ChatSession::new(provider, root, "pending-session".to_string(), store);
+        let dir = tempdir().expect("should create temp dir");
+        let mut session = make_session_in(&dir);
 
         let token_before = session.cancellation_token();
         session.cancel_current();
@@ -449,10 +583,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_chat_session_context_trim() {
+        let dir = tempdir().expect("should create temp dir");
+        let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
+        let store = Arc::new(SessionStore::new(db));
         let provider = Arc::new(MockStreamProvider::new(vec![make_text_stream("ok")]));
-        let root = std::env::temp_dir();
-        let (store, _dir) = make_store();
-        let mut session = ChatSession::new(provider, root, "pending-session".to_string(), store);
+        let mut session = ChatSession::new(
+            provider,
+            dir.path().to_path_buf(),
+            "pending-session".to_string(),
+            store,
+        );
 
         // Add messages to push over MAX_CONTEXT_CHARS (760_000 chars).
         let large_msg = "x".repeat(200_000);
@@ -484,5 +624,30 @@ mod tests {
         );
         // System message must always be kept.
         assert_eq!(session.messages[0].role, ChatRole::System);
+    }
+
+    #[tokio::test]
+    async fn test_sunny_md_injected_into_system_prompt() {
+        let dir = tempdir().expect("should create temp dir");
+        // Write SUNNY.md to the tempdir
+        let sunny_md = dir.path().join("SUNNY.md");
+        std::fs::write(&sunny_md, "Use async/await everywhere").expect("write SUNNY.md");
+
+        let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
+        let store = Arc::new(SessionStore::new(db));
+        let provider = Arc::new(MockStreamProvider::new(vec![]));
+        let session = ChatSession::new(
+            provider,
+            dir.path().to_path_buf(),
+            "pending-session".to_string(),
+            store,
+        );
+
+        assert!(
+            session.messages[0]
+                .content
+                .contains("Use async/await everywhere"),
+            "system prompt should contain SUNNY.md content"
+        );
     }
 }

@@ -27,3 +27,4 @@ dirs = "5" # dep: locate home directory for OAuth credential file path
 tokio = { version = "1", features = ["test-util", "macros"] } # dep: async test runtime
 tokio-stream = "0.1" # dep: stream utilities for mock providers in tests
 tempfile = "3" # dep: isolated fixture directories for integration tests
+uuid = { version = "1", features = ["v4"] } # dep: UUID for test session IDs
