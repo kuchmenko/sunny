@@ -13,8 +13,7 @@ use sunny_store::{Database, SessionStore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-#[allow(unused_imports)]
-use sunny_boys::{AgentError, AgentSession};
+use sunny_boys::AgentSession;
 
 /// Arguments for the `sunny chat` subcommand.
 #[derive(Args, Debug)]

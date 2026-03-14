@@ -20,7 +20,7 @@ use super::tools::{build_tool_definitions, build_tool_executor, build_tool_polic
 /// Uses a 4 chars ≈ 1 token heuristic with a ~190K token model limit.
 const MAX_CONTEXT_CHARS: usize = 190_000 * 4;
 
-/// Errors that can occur during a chat session.
+/// Errors that can occur during an agent session.
 #[derive(thiserror::Error, Debug)]
 pub enum AgentError {
     #[error("LLM error: {0}")]
@@ -53,7 +53,7 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    /// Create a new chat session with the given provider and workspace root.
+    /// Create a new agent session with the given provider and workspace root.
     ///
     /// Initialises the message history with the Claude Code system prompt,
     /// optionally appending SUNNY.md project context if present.
