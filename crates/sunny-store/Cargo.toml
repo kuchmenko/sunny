@@ -13,6 +13,8 @@ tracing = "0.1" # dep: structured logging, no println per AGENTS.md
 serde = { version = "1", features = ["derive"] } # dep: serialization for SavedSession
 serde_json = "1" # dep: JSON blob serialization for tool_calls field
 dirs = "5" # dep: home directory resolution for ~/.sunny/
+tree-sitter = "0.24" # dep: AST parsing for codebase symbol index
+tree-sitter-rust = "0.23" # dep: Rust language grammar for tree-sitter symbol extraction
 
 [dev-dependencies]
 tempfile = "3" # dep: temporary directories for database tests
