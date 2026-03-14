@@ -21,6 +21,7 @@ pub mod stream;
 pub mod tokenizer;
 pub mod types;
 
+pub use anthropic::oauth::{build_login_context, complete_login, LoginContext};
 pub use anthropic::AnthropicProvider;
 pub use error::LlmError;
 pub use provider::LlmProvider;

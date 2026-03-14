@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::{future::Future, pin::Pin};
 
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -9,7 +10,7 @@ use crate::stream::StreamResult;
 use crate::types::{ChatRole, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage, ToolCall};
 
 use super::credentials::{
-    load_credentials, refresh_oauth_token, AnthropicCredentials, CredentialSource,
+    load_credentials, refresh_oauth_token, save_credentials, AnthropicCredentials, CredentialSource,
 };
 use super::stream_parser::StreamParser;
 
@@ -50,13 +51,58 @@ impl AnthropicProvider {
 
         if let Some(refresh_token) = creds.refresh_token.clone() {
             warn!(provider = "anthropic", "OAuth token expired, refreshing");
-            let refreshed = refresh_oauth_token(&self.client, &refresh_token).await?;
-            *creds = refreshed;
+            Self::refresh_with_recovery(
+                &self.client,
+                &mut creds,
+                refresh_token,
+                |client, token| Box::pin(refresh_oauth_token(client, token)),
+                save_credentials,
+            )
+            .await?;
             Ok((creds.access_token.clone(), creds.source.clone()))
         } else {
             Err(LlmError::AuthFailed {
                 message: "OAuth token expired and no refresh token available".to_string(),
             })
+        }
+    }
+
+    async fn refresh_with_recovery<RF, SF>(
+        client: &reqwest::Client,
+        creds: &mut AnthropicCredentials,
+        refresh_token: String,
+        mut refresh_fn: RF,
+        save_fn: SF,
+    ) -> Result<(), LlmError>
+    where
+        RF: for<'a> FnMut(
+            &'a reqwest::Client,
+            &'a str,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<AnthropicCredentials, LlmError>> + Send + 'a>,
+        >,
+        SF: Fn(&AnthropicCredentials) -> Result<(), LlmError>,
+    {
+        match refresh_fn(client, &refresh_token).await {
+            Ok(refreshed) => {
+                *creds = refreshed;
+                if let Err(e) = save_fn(creds) {
+                    warn!(
+                        provider = "anthropic",
+                        "Failed to persist refreshed credentials: {e}"
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if e.to_string().contains("invalid_grant") {
+                    Err(LlmError::AuthFailed {
+                        message: "OAuth token refresh failed (invalid_grant). Your refresh token has been invalidated. Run `sunny login` to re-authenticate.".to_string(),
+                    })
+                } else {
+                    Err(e)
+                }
+            }
         }
     }
 
@@ -444,6 +490,8 @@ impl LlmProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     use crate::provider::LlmProvider;
 
@@ -672,5 +720,97 @@ mod tests {
         };
         assert_eq!(provider.provider_id(), "anthropic");
         assert_eq!(provider.model_id(), "claude-sonnet-4-6");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_persists_to_disk() {
+        let client = reqwest::Client::new();
+        let mut creds = AnthropicCredentials {
+            access_token: "expired-access".to_string(),
+            refresh_token: Some("expired-refresh".to_string()),
+            expires_at: Some(1),
+            source: CredentialSource::OAuthFile,
+        };
+
+        let refreshed = AnthropicCredentials {
+            access_token: "new-access".to_string(),
+            refresh_token: Some("new-refresh".to_string()),
+            expires_at: Some(9_999_999_999),
+            source: CredentialSource::OAuthFile,
+        };
+
+        let refresh_results = Arc::new(Mutex::new(VecDeque::from([Ok(refreshed.clone())])));
+        let refresh_results_clone = Arc::clone(&refresh_results);
+
+        let persisted = Arc::new(Mutex::new(Vec::new()));
+        let persisted_clone = Arc::clone(&persisted);
+
+        AnthropicProvider::refresh_with_recovery(
+            &client,
+            &mut creds,
+            "expired-refresh".to_string(),
+            move |_, _| {
+                let next = refresh_results_clone
+                    .lock()
+                    .expect("refresh queue lock")
+                    .pop_front()
+                    .expect("refresh result must exist");
+                Box::pin(async move { next })
+            },
+            move |saved| {
+                persisted_clone
+                    .lock()
+                    .expect("persisted lock")
+                    .push(saved.clone());
+                Ok(())
+            },
+        )
+        .await
+        .expect("refresh should succeed");
+
+        assert_eq!(creds.access_token, "new-access");
+        let writes = persisted.lock().expect("persisted lock read");
+        assert_eq!(writes.len(), 1, "successful refresh should persist once");
+        assert_eq!(writes[0].access_token, "new-access");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_grant_retry() {
+        let client = reqwest::Client::new();
+        let mut creds = AnthropicCredentials {
+            access_token: "expired-access".to_string(),
+            refresh_token: Some("expired-refresh".to_string()),
+            expires_at: Some(1),
+            source: CredentialSource::OAuthFile,
+        };
+
+        let invalid_grant = Err(LlmError::AuthFailed {
+            message: "token refresh failed (400): {\"error\":\"invalid_grant\"}".to_string(),
+        });
+        let refresh_results = Arc::new(Mutex::new(VecDeque::from([invalid_grant])));
+        let refresh_results_clone = Arc::clone(&refresh_results);
+
+        let result = AnthropicProvider::refresh_with_recovery(
+            &client,
+            &mut creds,
+            "expired-refresh".to_string(),
+            move |_, _| {
+                let next = refresh_results_clone
+                    .lock()
+                    .expect("lock")
+                    .pop_front()
+                    .expect("result");
+                Box::pin(async move { next })
+            },
+            |_| Ok(()),
+        )
+        .await;
+
+        assert!(result.is_err(), "invalid_grant must return error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("sunny login"),
+            "error must mention 'sunny login', got: {err}"
+        );
     }
 }

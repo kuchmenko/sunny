@@ -11,6 +11,7 @@ use rustyline::DefaultEditor;
 use sunny_mind::{AnthropicProvider, LlmProvider, StreamEvent};
 use sunny_store::{Database, SessionStore};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::chat::ChatSession;
 
@@ -84,9 +85,17 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
             let store = SessionStore::new(db);
 
             let saved = if let Some(id) = resume_id {
-                store
+                let exact = store
                     .load_session(&id)
-                    .map_err(|e| anyhow::anyhow!("failed to load session: {e}"))?
+                    .map_err(|e| anyhow::anyhow!("failed to load session: {e}"))?;
+                if exact.is_some() {
+                    exact
+                } else {
+                    let matches = store
+                        .search_sessions(&id)
+                        .map_err(|e| anyhow::anyhow!("failed to search sessions: {e}"))?;
+                    matches.into_iter().next()
+                }
             } else {
                 store
                     .most_recent_session(&cwd)
@@ -280,6 +289,23 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                                 Err(e) => eprintln!("Compaction failed: {e}"),
                             }
                         }
+                        "/reindex" => {
+                            println!("Indexing codebase...");
+                            let root = workspace_root.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                let db = sunny_store::Database::open_default()
+                                    .map_err(|e| anyhow::anyhow!("failed to open index db: {e}"))?;
+                                let idx = sunny_store::SymbolIndex::new(db);
+                                idx.index_directory(&root)
+                                    .map_err(|e| anyhow::anyhow!("indexing failed: {e}"))
+                            })
+                            .await
+                            {
+                                Ok(Ok(count)) => println!("Indexed {count} symbols."),
+                                Ok(Err(e)) => eprintln!("Reindex failed: {e}"),
+                                Err(e) => eprintln!("Reindex task panicked: {e}"),
+                            }
+                        }
                         "/help" => {
                             println!("Available commands:");
                             println!(
@@ -289,6 +315,9 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                             println!("  /clear                 Clear current session messages");
                             println!("  /switch <id>           Switch to a specific session");
                             println!("  /compact               Compact conversation context");
+                            println!(
+                                "  /reindex               Index the codebase for symbol search"
+                            );
                             println!("  /help                  Show this help");
                             println!("  /quit, /exit           Exit sunny");
                         }
@@ -375,13 +404,12 @@ fn detect_auth_source(api_key_override: &Option<String>) -> String {
     if std::env::var("ANTHROPIC_API_KEY").is_ok() {
         return "api-key (ANTHROPIC_API_KEY)".to_string();
     }
-    let cred_path = dirs::home_dir()
-        .map(|h| h.join(".claude").join(".credentials.json"))
-        .filter(|p| p.exists());
-    if cred_path.is_some() {
-        return "oauth (~/.claude/.credentials.json)".to_string();
+    if let Some(sunny_creds) = dirs::home_dir().map(|h| h.join(".sunny").join("credentials.json")) {
+        if sunny_creds.exists() {
+            return "oauth (~/.sunny/credentials.json)".to_string();
+        }
     }
-    "unknown".to_string()
+    "none".to_string()
 }
 
 /// Truncate a string to fit within `max_len` display chars (ASCII-safe).
@@ -399,14 +427,7 @@ fn create_new_session(
     workspace_root: PathBuf,
     store: Arc<SessionStore>,
 ) -> ChatSession {
-    let session_id = format!(
-        "pending-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
+    let session_id = Uuid::new_v4().to_string();
 
     ChatSession::new(provider, workspace_root, session_id, store)
 }

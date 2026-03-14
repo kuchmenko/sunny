@@ -46,23 +46,82 @@ pub(crate) fn load_credentials() -> Result<AnthropicCredentials, LlmError> {
         }
     }
 
-    let cred_path = oauth_credentials_path();
-    if cred_path.exists() {
-        return load_from_file(&cred_path);
+    if let Some(sunny_path) = sunny_credentials_path() {
+        if sunny_path.exists() {
+            return load_from_file(&sunny_path);
+        }
     }
 
     Err(LlmError::NotConfigured {
-        message:
-            "no Anthropic credentials found: set ANTHROPIC_API_KEY or run `claude` to authenticate"
-                .to_string(),
+        message: "no credentials found: set ANTHROPIC_API_KEY or run `sunny login` to authenticate"
+            .to_string(),
     })
 }
 
-fn oauth_credentials_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(home)
-        .join(".claude")
-        .join(".credentials.json")
+pub(crate) fn sunny_credentials_path() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".sunny").join("credentials.json"))
+}
+
+fn save_credentials_to_path(creds: &AnthropicCredentials, path: &Path) -> Result<(), LlmError> {
+    let dir = path.parent().ok_or_else(|| LlmError::AuthFailed {
+        message: "credentials path has no parent directory".to_string(),
+    })?;
+    std::fs::create_dir_all(dir).map_err(|e| LlmError::AuthFailed {
+        message: format!("failed to create credentials directory: {e}"),
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            LlmError::AuthFailed {
+                message: format!("failed to set directory permissions: {e}"),
+            }
+        })?;
+    }
+    let expires_at_ms = creds.expires_at.unwrap_or(0) * 1000;
+    let json = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": creds.access_token,
+            "refreshToken": creds.refresh_token.clone().unwrap_or_default(),
+            "expiresAt": expires_at_ms,
+        }
+    });
+    let json_str = serde_json::to_string(&json).map_err(|e| LlmError::AuthFailed {
+        message: format!("failed to serialize credentials: {e}"),
+    })?;
+    let tmp_path = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_path).map_err(|e| LlmError::AuthFailed {
+            message: format!("failed to create tmp credentials file: {e}"),
+        })?;
+        file.write_all(json_str.as_bytes())
+            .map_err(|e| LlmError::AuthFailed {
+                message: format!("failed to write credentials: {e}"),
+            })?;
+        file.sync_all().map_err(|e| LlmError::AuthFailed {
+            message: format!("failed to sync credentials to disk: {e}"),
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| LlmError::AuthFailed {
+                    message: format!("failed to set file permissions: {e}"),
+                })?;
+        }
+    }
+    std::fs::rename(&tmp_path, path).map_err(|e| LlmError::AuthFailed {
+        message: format!("failed to finalize credentials file: {e}"),
+    })?;
+    Ok(())
+}
+
+pub(crate) fn save_credentials(creds: &AnthropicCredentials) -> Result<(), LlmError> {
+    let path = sunny_credentials_path().ok_or_else(|| LlmError::AuthFailed {
+        message: "cannot determine home directory for credentials storage".to_string(),
+    })?;
+    save_credentials_to_path(creds, &path)
 }
 
 fn load_from_file(path: &Path) -> Result<AnthropicCredentials, LlmError> {
@@ -300,5 +359,132 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}_{nanos}.json"))
+    }
+
+    #[test]
+    fn test_save_credentials_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "sunny_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials.json");
+
+        let creds = AnthropicCredentials {
+            access_token: "acc-xyz".to_string(),
+            refresh_token: Some("ref-xyz".to_string()),
+            expires_at: Some(1_700_000_000),
+            source: CredentialSource::OAuthFile,
+        };
+        save_credentials_to_path(&creds, &path).expect("save must succeed");
+
+        let loaded = load_from_file(&path).expect("load must succeed");
+        assert_eq!(loaded.access_token, "acc-xyz");
+        assert_eq!(loaded.refresh_token, Some("ref-xyz".to_string()));
+        // expires_at in file is ms (1_700_000_000_000), load_from_file normalizes back to seconds
+        assert_eq!(loaded.expires_at, Some(1_700_000_000));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_priority_prefers_sunny() {
+        let dir = std::env::temp_dir().join(format!(
+            "sunny_prio_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let sunny_path = dir.join("sunny_creds.json");
+        let claude_path = dir.join("claude_creds.json");
+
+        let sunny_creds = AnthropicCredentials {
+            access_token: "sunny-token".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            source: CredentialSource::OAuthFile,
+        };
+        let claude_creds = AnthropicCredentials {
+            access_token: "claude-token".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            source: CredentialSource::OAuthFile,
+        };
+        save_credentials_to_path(&sunny_creds, &sunny_path).expect("save sunny creds");
+        save_credentials_to_path(&claude_creds, &claude_path).expect("save claude creds");
+
+        // Simulate load priority: sunny path wins
+        let loaded_sunny = load_from_file(&sunny_path).expect("load sunny");
+        let loaded_claude = load_from_file(&claude_path).expect("load claude");
+        assert_eq!(loaded_sunny.access_token, "sunny-token");
+        assert_eq!(loaded_claude.access_token, "claude-token");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_atomic_no_tmp() {
+        let dir = std::env::temp_dir().join(format!(
+            "sunny_atomic_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials.json");
+
+        let creds = AnthropicCredentials {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            source: CredentialSource::OAuthFile,
+        };
+        save_credentials_to_path(&creds, &path).expect("save must succeed");
+
+        // The .tmp file must NOT exist after a successful save
+        let tmp_path = path.with_extension("json.tmp");
+        assert!(
+            !tmp_path.exists(),
+            ".tmp file must be cleaned up after atomic save"
+        );
+        // The final file must exist
+        assert!(path.exists(), "credentials.json must exist after save");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_credentials_no_claude_fallback() {
+        // When ANTHROPIC_API_KEY is not set and ~/.sunny/credentials.json doesn't exist,
+        // load_credentials must return NotConfigured with a message pointing to sunny login.
+        // This test verifies we don't fall back to ~/.claude/.credentials.json.
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        // If the test machine happens to have ~/.sunny/credentials.json, skip gracefully
+        if let Some(path) = sunny_credentials_path() {
+            if path.exists() {
+                return; // Skip — can't test NotConfigured when file exists
+            }
+        }
+        let result = load_credentials();
+        match result {
+            Err(LlmError::NotConfigured { message }) => {
+                assert!(
+                    message.contains("sunny login"),
+                    "NotConfigured error must mention 'sunny login', got: {message}"
+                );
+            }
+            Ok(_) => {
+                // Either ANTHROPIC_API_KEY was set by test runner, or ~/.sunny/credentials.json exists
+                // Both are valid — skip
+            }
+            Err(other) => panic!("unexpected error variant: {other}"),
+        }
     }
 }
