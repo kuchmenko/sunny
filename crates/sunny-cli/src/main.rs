@@ -5,6 +5,9 @@ use sunny_cli::commands::ChatArgs;
 #[command(name = "sunny")]
 #[command(about = "Sunny — AI coding assistant")]
 struct Cli {
+    #[arg(long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -21,9 +24,16 @@ enum Command {
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
-    tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+
+    let filter = if cli.verbose {
+        tracing_subscriber::EnvFilter::new("debug")
+    } else {
+        tracing_subscriber::EnvFilter::new("warn")
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
     let result = match cli.command {
         Some(Command::Login) => sunny_cli::commands::login::run().await,
         None => sunny_cli::commands::chat::run(cli.chat).await,
@@ -81,5 +91,18 @@ mod tests {
             cli.command.is_none(),
             "--continue should not set a subcommand"
         );
+    }
+
+    #[test]
+    fn test_verbose_flag_default() {
+        let cli = Cli::try_parse_from(["sunny"]).expect("bare sunny should parse");
+        assert!(!cli.verbose, "verbose should default to false");
+    }
+
+    #[test]
+    fn test_verbose_flag_enabled() {
+        let cli =
+            Cli::try_parse_from(["sunny", "--verbose"]).expect("sunny --verbose should parse");
+        assert!(cli.verbose, "--verbose flag should set verbose to true");
     }
 }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Args;
-use crossterm::style::Stylize;
+use crossterm::{cursor, execute, style::Stylize, terminal};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use sunny_mind::{AnthropicProvider, LlmProvider, StreamEvent};
@@ -330,14 +330,24 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                 let _ = rl.add_history_entry(&input);
 
                 // Run the streaming request.
+                let mut response_text = String::new();
+                let mut streamed_line_count = 0usize;
                 let result = session
                     .send(&input, |event| {
-                        handle_stream_event(event);
+                        if let Err(err) =
+                            handle_stream_event(event, &mut response_text, &mut streamed_line_count)
+                        {
+                            eprintln!("stream render error: {err}");
+                        }
                     })
                     .await;
 
                 // Newline after streamed output.
                 println!();
+
+                if should_rerender_markdown(&response_text, result.is_ok()) {
+                    rerender_markdown_response(&response_text, streamed_line_count)?;
+                }
 
                 if let Err(e) = result {
                     eprintln!("Error: {e}");
@@ -364,17 +374,81 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
 }
 
 /// Handle a single stream event from the tool loop.
-fn handle_stream_event(event: StreamEvent) {
+fn handle_stream_event(
+    event: StreamEvent,
+    response_text: &mut String,
+    streamed_line_count: &mut usize,
+) -> std::io::Result<()> {
     match event {
         StreamEvent::ContentDelta { text } => {
+            *streamed_line_count += text.chars().filter(|c| *c == '\n').count();
+            response_text.push_str(&text);
             print!("{text}");
-            let _ = std::io::stdout().flush();
+            std::io::stdout().flush()?;
+        }
+        StreamEvent::ThinkingDelta { text } => {
+            eprint!("{}", text.dark_grey().italic());
+            std::io::stderr().flush()?;
         }
         StreamEvent::ToolCallStart { name, .. } => {
-            eprintln!("{}", format!("[tool: {name}]").grey());
+            eprintln!("{}", tool_call_start_line(&name).dark_grey());
         }
-        _ => {}
+        StreamEvent::ToolCallDelta { .. } => {}
+        StreamEvent::ToolCallComplete {
+            name, arguments, ..
+        } => {
+            eprintln!("{}", tool_call_complete_line(&name, &arguments).dark_grey());
+        }
+        StreamEvent::Usage { .. } => {}
+        StreamEvent::Error { message } => {
+            eprintln!("  ✗ {}", message.red());
+        }
+        StreamEvent::Done => {}
     }
+
+    Ok(())
+}
+
+fn should_rerender_markdown(response_text: &str, stream_completed: bool) -> bool {
+    stream_completed && !response_text.is_empty()
+}
+
+fn rerender_markdown_response(
+    response_text: &str,
+    streamed_line_count: usize,
+) -> std::io::Result<()> {
+    if response_text.is_empty() {
+        return Ok(());
+    }
+
+    let mut stdout = std::io::stdout();
+    let lines_to_clear = streamed_line_count.saturating_add(1).min(u16::MAX as usize) as u16;
+
+    execute!(
+        stdout,
+        cursor::MoveUp(lines_to_clear),
+        terminal::Clear(terminal::ClearType::FromCursorDown)
+    )?;
+
+    termimad::print_text(response_text);
+
+    Ok(())
+}
+
+fn summarize_tool_arguments(arguments: &str) -> String {
+    arguments.chars().take(60).collect()
+}
+
+fn tool_call_start_line(name: &str) -> String {
+    format!("  ▸ {name}")
+}
+
+fn tool_call_complete_line(name: &str, arguments: &str) -> String {
+    format!(
+        "{} {}",
+        tool_call_start_line(name),
+        summarize_tool_arguments(arguments)
+    )
 }
 
 /// Detect the workspace root by running `git rev-parse --show-toplevel`.
@@ -435,8 +509,13 @@ fn create_new_session(
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use sunny_mind::StreamEvent;
 
     use super::ChatArgs;
+    use super::{
+        handle_stream_event, should_rerender_markdown, summarize_tool_arguments,
+        tool_call_complete_line, tool_call_start_line,
+    };
 
     #[derive(Parser, Debug)]
     struct TestCli {
@@ -454,5 +533,74 @@ mod tests {
     fn test_parse_resume_flag() {
         let parsed = TestCli::parse_from(["sunny", "--resume", "session-123"]);
         assert_eq!(parsed.args.resume.as_deref(), Some("session-123"));
+    }
+
+    #[test]
+    fn test_handle_stream_event_tool_call() {
+        assert!(tool_call_start_line("grep").contains("▸"));
+        assert_eq!(
+            tool_call_complete_line(
+                "grep",
+                "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz1234567890"
+            ),
+            "  ▸ grep abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz12345678"
+        );
+    }
+
+    #[test]
+    fn test_handle_stream_event_thinking() {
+        let mut response_text = String::new();
+        let mut streamed_line_count = 0;
+
+        handle_stream_event(
+            StreamEvent::ThinkingDelta {
+                text: "thinking".to_string(),
+            },
+            &mut response_text,
+            &mut streamed_line_count,
+        )
+        .expect("thinking event should render without io errors");
+
+        assert!(response_text.is_empty());
+        assert_eq!(streamed_line_count, 0);
+    }
+
+    #[test]
+    fn test_handle_stream_event_content_accumulates_response_text() {
+        let mut response_text = String::new();
+        let mut streamed_line_count = 0;
+
+        handle_stream_event(
+            StreamEvent::ContentDelta {
+                text: "hello\nworld".to_string(),
+            },
+            &mut response_text,
+            &mut streamed_line_count,
+        )
+        .expect("content event should render without io errors");
+
+        assert_eq!(response_text, "hello\nworld");
+        assert_eq!(streamed_line_count, 1);
+    }
+
+    #[test]
+    fn test_markdown_rerender_empty() {
+        assert!(!should_rerender_markdown("", true));
+        assert!(!should_rerender_markdown("", false));
+    }
+
+    #[test]
+    fn test_markdown_rerender() {
+        assert!(should_rerender_markdown("# hello\n\n- item", true));
+        assert!(!should_rerender_markdown("# hello\n\n- item", false));
+    }
+
+    #[test]
+    fn test_summarize_tool_arguments_truncates_to_sixty_chars() {
+        let arguments = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz1234567890";
+        assert_eq!(
+            summarize_tool_arguments(arguments),
+            "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz12345678"
+        );
     }
 }

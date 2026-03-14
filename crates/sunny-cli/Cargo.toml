@@ -14,7 +14,7 @@ tokio-util = { version = "0.7", features = ["full"] } # dep: CancellationToken f
 serde = { version = "1", features = ["derive"] } # dep: serialization for JSON output
 serde_json = "1" # dep: JSON output formatting
 tracing = "0.1" # dep: structured logging
-tracing-subscriber = "0.3" # dep: logging output for CLI
+tracing-subscriber = { version = "0.3", features = ["env-filter"] } # dep: logging output for CLI with env filtering
 dotenvy = "0.15" # dep: load .env variables for provider configuration
 thiserror = "1" # dep: error handling for CLI commands
 anyhow = "1" # dep: error propagation in CLI command handlers
@@ -22,6 +22,7 @@ reqwest = { version = "0.12", features = ["json"] } # dep: HTTP client for OAuth
 async-trait = "0.1" # dep: async methods in LlmProvider test mocks (session.rs)
 rustyline = { version = "14", features = [] } # dep: REPL input with history and line editing
 crossterm = "0.27" # dep: terminal color output for tool indicators
+termimad = "0.30" # dep: terminal markdown rendering for LLM responses
 dirs = "5" # dep: locate home directory for OAuth credential file path
 uuid = { version = "1", features = ["v4"] } # dep: UUID v4 session IDs
 

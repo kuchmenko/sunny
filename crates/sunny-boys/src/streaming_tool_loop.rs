@@ -80,10 +80,10 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
         &self,
         request: LlmRequest,
         tool_executor: Arc<ToolExecutor>,
-        on_event: F,
+        mut on_event: F,
     ) -> Result<StreamingToolResult, ToolCallError>
     where
-        F: Fn(StreamEvent) + Send + Sync,
+        F: FnMut(StreamEvent) + Send,
     {
         let mut current_request = request;
         let mut metrics = StreamingToolMetrics::default();
@@ -144,6 +144,7 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                             on_event(StreamEvent::ThinkingDelta { text });
                         }
                         StreamEvent::ToolCallStart { id, name } => {
+                            on_event(StreamEvent::ToolCallStart { id: id.clone(), name: name.clone() });
                             started_tool_calls.insert(id, name);
                         }
                         StreamEvent::ToolCallDelta { .. } => {}
@@ -152,6 +153,11 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                             name,
                             arguments,
                         } => {
+                            on_event(StreamEvent::ToolCallComplete {
+                                id: id.clone(),
+                                name: name.clone(),
+                                arguments: arguments.clone(),
+                            });
                             let _ = started_tool_calls.remove(&id);
                             pending_tool_calls.push(ToolCall {
                                 id,
@@ -161,11 +167,13 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                             });
                         }
                         StreamEvent::Usage { usage: stream_usage } => {
+                            on_event(StreamEvent::Usage { usage: stream_usage.clone() });
                             usage.input_tokens += stream_usage.input_tokens;
                             usage.output_tokens += stream_usage.output_tokens;
                             usage.total_tokens += stream_usage.total_tokens;
                         }
                         StreamEvent::Error { message } => {
+                            on_event(StreamEvent::Error { message: message.clone() });
                             return Err(ToolCallError::Llm {
                                 source: LlmError::InvalidResponse { message },
                             });

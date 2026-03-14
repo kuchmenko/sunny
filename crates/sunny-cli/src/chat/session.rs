@@ -174,7 +174,7 @@ impl ChatSession {
     /// appends loop-produced messages, auto-saves, and returns the final text.
     pub async fn send<F>(&mut self, user_input: &str, on_event: F) -> Result<String, ChatError>
     where
-        F: Fn(StreamEvent) + Send + Sync,
+        F: FnMut(StreamEvent) + Send,
     {
         self.messages.push(ChatMessage {
             role: ChatRole::User,
@@ -392,7 +392,11 @@ impl ChatSession {
                 let s = SessionStore::new(db);
                 match s.load_session(&session_id_clone) {
                     Ok(None) => s
-                        .create_session(&working_dir_clone, Some(&model_clone))
+                        .create_session_with_id(
+                            &session_id_clone,
+                            &working_dir_clone,
+                            Some(&model_clone),
+                        )
                         .map(|_| ()),
                     Ok(Some(_)) => Ok(()),
                     Err(e) => Err(e),

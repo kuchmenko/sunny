@@ -57,6 +57,31 @@ impl SessionStore {
         })
     }
 
+    /// Create a new session record with an explicit ID and return it.
+    pub fn create_session_with_id(
+        &self,
+        id: &str,
+        working_dir: &str,
+        model: Option<&str>,
+    ) -> Result<SavedSession, StoreError> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        self.db.connection().execute(
+            "INSERT INTO sessions (id, title, model, working_dir, token_count, created_at, updated_at) \
+             VALUES (?1, NULL, ?2, ?3, 0, ?4, ?5)",
+            rusqlite::params![id, model, working_dir, now_str, now_str],
+        )?;
+        Ok(SavedSession {
+            id: id.to_string(),
+            title: None,
+            model: model.map(String::from),
+            working_dir: working_dir.to_string(),
+            token_count: 0,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
     /// Persist messages for a session (replaces any existing messages).
     pub fn save_messages(
         &self,
@@ -470,5 +495,59 @@ mod tests {
             .expect("should load session")
             .expect("session should exist");
         assert_eq!(loaded.token_count, 1234);
+    }
+
+    #[test]
+    fn test_create_session_with_id_then_save_messages() {
+        let (store, _dir) = make_store();
+        let session = store
+            .create_session_with_id("test-session-123", "/project/a", Some("claude-sonnet"))
+            .expect("should create session with explicit id");
+        assert_eq!(session.id, "test-session-123");
+        assert_eq!(session.working_dir, "/project/a");
+        assert_eq!(session.model.as_deref(), Some("claude-sonnet"));
+
+        let messages = vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: "Hello".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "Hi there".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        store
+            .save_messages(&session.id, &messages)
+            .expect("should save messages with matching session id");
+
+        let loaded = store
+            .load_messages(&session.id)
+            .expect("should load messages");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].role, ChatRole::User);
+        assert_eq!(loaded[1].role, ChatRole::Assistant);
+    }
+
+    #[test]
+    fn test_save_messages_without_session_fails() {
+        let (store, _dir) = make_store();
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "test".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        let result = store.save_messages("nonexistent-session-id", &messages);
+        assert!(result.is_err(), "should fail with FK constraint error");
     }
 }
