@@ -15,6 +15,7 @@ serde_json = "1" # dep: JSON blob serialization for tool_calls field
 dirs = "5" # dep: home directory resolution for ~/.sunny/
 tree-sitter = "0.24" # dep: AST parsing for codebase symbol index
 tree-sitter-rust = "0.23" # dep: Rust language grammar for tree-sitter symbol extraction
+ignore = "0.4" # dep: directory walking respecting .gitignore for symbol indexing
 
 [dev-dependencies]
 tempfile = "3" # dep: temporary directories for database tests

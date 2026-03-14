@@ -1,4 +1,4 @@
-//! Tree-sitter-based Rust symbol extraction for codebase search.
+//! Tree-sitter-based Rust symbol extraction and SQLite-backed index.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -170,10 +170,184 @@ fn walk_node(
     }
 }
 
+// ─── SymbolIndex: SQLite-backed storage and search ────────────────────────────
+
+/// Statistics about the symbol index.
+#[derive(Debug)]
+pub struct IndexStats {
+    pub total_symbols: u32,
+    pub files_indexed: u32,
+}
+
+/// SQLite-backed index for codebase symbol search.
+///
+/// Uses tree-sitter for extraction and SQLite for persistent storage
+/// with case-insensitive name search.
+pub struct SymbolIndex {
+    db: crate::Database,
+}
+
+impl SymbolIndex {
+    pub fn new(db: crate::Database) -> Self {
+        Self { db }
+    }
+
+    /// Index a single file: extract symbols and persist in DB.
+    /// Returns the number of symbols stored.
+    pub fn index_file(&self, file_path: &Path) -> Result<usize, StoreError> {
+        let canonical = file_path
+            .canonicalize()
+            .unwrap_or_else(|_| file_path.to_path_buf());
+        let path_str = canonical.to_string_lossy().to_string();
+        let content = std::fs::read_to_string(&canonical)?;
+        let hash = content_hash(&content);
+        self.clear_file(&path_str)?;
+        let symbols = extract_symbols(&content, &path_str);
+        let conn = self.db.connection();
+        for symbol in &symbols {
+            conn.execute(
+                "INSERT INTO symbols \
+                 (name, file_path, line, end_line, kind, signature, parent, content_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    symbol.name,
+                    symbol.file_path,
+                    symbol.line as i64,
+                    symbol.end_line as i64,
+                    symbol.kind.as_str(),
+                    symbol.signature,
+                    symbol.parent,
+                    hash,
+                ],
+            )?;
+        }
+        Ok(symbols.len())
+    }
+
+    /// Walk a directory respecting .gitignore and index all `.rs` files.
+    pub fn index_directory(&self, root: &Path) -> Result<usize, StoreError> {
+        let mut total = 0;
+        for result in ignore::WalkBuilder::new(root).build() {
+            let entry = match result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && entry.path().extension().and_then(|e| e.to_str()) == Some("rs")
+            {
+                match self.index_file(entry.path()) {
+                    Ok(n) => total += n,
+                    Err(e) => tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "failed to index file"
+                    ),
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Search symbols by name substring (case-insensitive).
+    pub fn search(&self, query: &str) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.db.connection();
+        let pattern = format!("%{query}%");
+        let mut stmt = conn.prepare(
+            "SELECT name, file_path, line, end_line, kind, signature, parent \
+             FROM symbols WHERE name LIKE ?1 COLLATE NOCASE",
+        )?;
+        let rows: Result<Vec<_>, rusqlite::Error> = stmt
+            .query_map(rusqlite::params![pattern], row_to_symbol)?
+            .collect();
+        rows.map_err(StoreError::Db)
+    }
+
+    /// Search symbols by name and kind.
+    pub fn search_by_kind(&self, query: &str, kind: SymbolKind) -> Result<Vec<Symbol>, StoreError> {
+        let conn = self.db.connection();
+        let pattern = format!("%{query}%");
+        let kind_str = kind.as_str();
+        let mut stmt = conn.prepare(
+            "SELECT name, file_path, line, end_line, kind, signature, parent \
+             FROM symbols WHERE name LIKE ?1 COLLATE NOCASE AND kind = ?2",
+        )?;
+        let rows: Result<Vec<_>, rusqlite::Error> = stmt
+            .query_map(rusqlite::params![pattern, kind_str], row_to_symbol)?
+            .collect();
+        rows.map_err(StoreError::Db)
+    }
+
+    /// Returns true if the file has changed since last index (or was never indexed).
+    pub fn needs_reindex(&self, file_path: &Path) -> Result<bool, StoreError> {
+        let canonical = file_path
+            .canonicalize()
+            .unwrap_or_else(|_| file_path.to_path_buf());
+        let path_str = canonical.to_string_lossy().to_string();
+        let content = std::fs::read_to_string(&canonical)?;
+        let current_hash = content_hash(&content);
+        let conn = self.db.connection();
+        let mut stmt =
+            conn.prepare("SELECT content_hash FROM symbols WHERE file_path = ?1 LIMIT 1")?;
+        let stored = stmt.query_row(rusqlite::params![path_str], |r| r.get::<_, String>(0));
+        match stored {
+            Ok(h) => Ok(h != current_hash),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(true),
+            Err(e) => Err(StoreError::Db(e)),
+        }
+    }
+
+    /// Delete all symbols for a file (call before re-indexing).
+    pub fn clear_file(&self, file_path: &str) -> Result<(), StoreError> {
+        self.db.connection().execute(
+            "DELETE FROM symbols WHERE file_path = ?1",
+            rusqlite::params![file_path],
+        )?;
+        Ok(())
+    }
+
+    /// Return index statistics.
+    pub fn stats(&self) -> Result<IndexStats, StoreError> {
+        let conn = self.db.connection();
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;
+        let files: i64 =
+            conn.query_row("SELECT COUNT(DISTINCT file_path) FROM symbols", [], |r| {
+                r.get(0)
+            })?;
+        Ok(IndexStats {
+            total_symbols: total as u32,
+            files_indexed: files as u32,
+        })
+    }
+}
+
+fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
+    let kind_str: String = row.get(4)?;
+    let kind = SymbolKind::from_kind_str(&kind_str).unwrap_or(SymbolKind::Function);
+    Ok(Symbol {
+        name: row.get(0)?,
+        file_path: row.get(1)?,
+        line: row.get::<_, i64>(2)? as u32,
+        end_line: row.get::<_, i64>(3)? as u32,
+        kind,
+        signature: row.get(5)?,
+        parent: row.get(6)?,
+    })
+}
+
+fn content_hash(content: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // ── T7: extract_symbols tests ─────────────────────────────────────────────
 
     #[test]
     fn test_extract_function_symbol() {
@@ -221,7 +395,6 @@ const MY_CONST: u32 = 42;
             .iter()
             .filter(|s| s.kind == SymbolKind::Trait)
             .collect();
-        // hello, world, and method inside trait
         assert!(
             functions.len() >= 2,
             "expected at least 2 functions, got {}",
@@ -284,5 +457,121 @@ impl Foo {
     fn test_empty_source_returns_empty() {
         let symbols = extract_symbols("", "empty.rs");
         assert!(symbols.is_empty());
+    }
+
+    // ── T12: SymbolIndex tests ────────────────────────────────────────────────
+
+    fn make_index() -> (SymbolIndex, tempfile::TempDir) {
+        let dir = tempdir().expect("should create temp dir");
+        let db = crate::Database::open(dir.path().join("test.db").as_path())
+            .expect("should open database");
+        (SymbolIndex::new(db), dir)
+    }
+
+    #[test]
+    fn test_index_and_search() {
+        let (idx, dir) = make_index();
+        let file = dir.path().join("foo.rs");
+        std::fs::write(&file, "pub fn process_data(x: i32) -> i32 { x * 2 }").expect("write file");
+        let n = idx.index_file(&file).expect("index file");
+        assert_eq!(n, 1);
+        let results = idx.search("process").expect("search");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "process_data");
+        assert_eq!(results[0].kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_search_by_kind() {
+        let (idx, dir) = make_index();
+        let file = dir.path().join("bar.rs");
+        std::fs::write(&file, "fn foo() {} struct Bar;").expect("write file");
+        idx.index_file(&file).expect("index file");
+        let fns = idx
+            .search_by_kind("foo", SymbolKind::Function)
+            .expect("search");
+        assert_eq!(fns.len(), 1);
+        let structs = idx
+            .search_by_kind("bar", SymbolKind::Struct)
+            .expect("search");
+        assert_eq!(structs.len(), 1);
+    }
+
+    #[test]
+    fn test_index_directory() {
+        let (idx, dir) = make_index();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").expect("write a");
+        std::fs::write(dir.path().join("b.rs"), "struct B;").expect("write b");
+        let total = idx.index_directory(dir.path()).expect("index dir");
+        assert!(total >= 2, "expected at least 2 symbols, got {total}");
+    }
+
+    #[test]
+    fn test_incremental_reindex() {
+        let (idx, dir) = make_index();
+        let file = dir.path().join("c.rs");
+        std::fs::write(&file, "fn original() {}").expect("write file");
+        idx.index_file(&file).expect("index original");
+        assert!(
+            !idx.needs_reindex(&file).expect("check"),
+            "should not need reindex after fresh index"
+        );
+        std::fs::write(&file, "fn modified() {}").expect("modify file");
+        assert!(
+            idx.needs_reindex(&file).expect("check"),
+            "should need reindex after modification"
+        );
+        idx.index_file(&file).expect("re-index");
+        assert!(
+            !idx.needs_reindex(&file).expect("check"),
+            "should not need reindex after re-index"
+        );
+    }
+
+    #[test]
+    fn test_clear_file_removes_symbols() {
+        let (idx, dir) = make_index();
+        let file = dir.path().join("d.rs");
+        std::fs::write(&file, "fn clear_me() {}").expect("write file");
+        idx.index_file(&file).expect("index");
+        assert_eq!(idx.search("clear_me").expect("search").len(), 1);
+        let path_str = file.canonicalize().unwrap().to_string_lossy().to_string();
+        idx.clear_file(&path_str).expect("clear");
+        assert_eq!(idx.search("clear_me").expect("search after clear").len(), 0);
+    }
+
+    #[test]
+    fn test_stats_after_indexing() {
+        let (idx, dir) = make_index();
+        std::fs::write(dir.path().join("e.rs"), "fn e1() {} fn e2() {}").expect("write");
+        idx.index_directory(dir.path()).expect("index");
+        let stats = idx.stats().expect("stats");
+        assert!(stats.total_symbols >= 2);
+        assert!(stats.files_indexed >= 1);
+    }
+
+    #[test]
+    fn test_search_case_insensitive() {
+        let (idx, dir) = make_index();
+        let file = dir.path().join("f.rs");
+        std::fs::write(&file, "fn MyHandler() {}").expect("write file");
+        idx.index_file(&file).expect("index");
+        let results = idx.search("myhandler").expect("search");
+        assert_eq!(
+            results.len(),
+            1,
+            "case-insensitive search should find MyHandler"
+        );
+    }
+
+    #[test]
+    fn test_needs_reindex_new_file() {
+        let (idx, dir) = make_index();
+        let file = dir.path().join("new.rs");
+        std::fs::write(&file, "fn new_fn() {}").expect("write");
+        assert!(
+            idx.needs_reindex(&file).expect("check"),
+            "new file should need reindex"
+        );
     }
 }

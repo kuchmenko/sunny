@@ -2120,6 +2120,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dirs",
+ "ignore",
  "rusqlite",
  "serde",
  "serde_json",

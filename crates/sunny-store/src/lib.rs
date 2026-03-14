@@ -11,5 +11,6 @@ pub mod token_budget;
 
 pub use db::Database;
 pub use error::StoreError;
+pub use index::{IndexStats, Symbol, SymbolIndex, SymbolKind};
 pub use session::{SavedSession, SessionStore};
 pub use token_budget::TokenBudget;
