@@ -373,6 +373,102 @@ fn content_hash(content: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Generate a compact text map of all public symbols in the Rust files under `root`.
+///
+/// Walks `root` with `ignore::WalkBuilder` (respects .gitignore), extracts symbols from
+/// each `.rs` file using [`extract_symbols_from_file`], and formats them as:
+///
+/// ```text
+/// relative/path/file.rs
+///   pub struct Foo  (L12)
+///   impl Foo > pub fn bar(&self, x: i32) -> Result<(), Error>  (L25)
+/// ```
+///
+/// Only `pub` items are included. `Impl` entries are skipped (their children appear
+/// via impl context). Const, Static, Macro, and Module kinds are skipped.
+///
+/// Truncation stops at file boundaries - no partial files in output.
+///
+/// Returns an empty string if no `.rs` files exist or all symbols are private.
+pub fn generate_repo_map(root: &Path, max_chars: usize) -> Result<String, StoreError> {
+    let mut output = String::new();
+
+    for result in ignore::WalkBuilder::new(root).build() {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+            && entry.path().extension().and_then(|e| e.to_str()) == Some("rs")
+        {
+            let path = entry.path();
+            let symbols = extract_symbols_from_file(path)?;
+            let source = std::fs::read_to_string(path)?;
+            let source_lines: Vec<&str> = source.lines().collect();
+
+            let mut lines = Vec::new();
+            for symbol in symbols {
+                let line_idx = symbol.line.saturating_sub(1) as usize;
+                let is_public = source_lines
+                    .get(line_idx)
+                    .map(|line| line.contains("pub "))
+                    .unwrap_or(false);
+                if !is_public {
+                    continue;
+                }
+
+                let formatted = match symbol.kind {
+                    SymbolKind::Function => {
+                        let signature = symbol
+                            .signature
+                            .unwrap_or_else(|| format!("fn {}", symbol.name));
+                        if let Some(parent) = symbol.parent {
+                            format!("  impl {parent} > {signature}  (L{})\n", symbol.line)
+                        } else {
+                            format!("  {signature}  (L{})\n", symbol.line)
+                        }
+                    }
+                    SymbolKind::Struct => {
+                        format!("  pub struct {}  (L{})\n", symbol.name, symbol.line)
+                    }
+                    SymbolKind::Enum => format!("  pub enum {}  (L{})\n", symbol.name, symbol.line),
+                    SymbolKind::Trait => {
+                        format!("  pub trait {}  (L{})\n", symbol.name, symbol.line)
+                    }
+                    SymbolKind::TypeAlias => {
+                        format!("  pub type {}  (L{})\n", symbol.name, symbol.line)
+                    }
+                    SymbolKind::Impl
+                    | SymbolKind::Const
+                    | SymbolKind::Static
+                    | SymbolKind::Macro
+                    | SymbolKind::Module => continue,
+                };
+
+                lines.push(formatted);
+            }
+
+            if lines.is_empty() {
+                continue;
+            }
+
+            let relative_path = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
+            let mut file_section = format!("{relative_path}\n");
+            for line in lines {
+                file_section.push_str(&line);
+            }
+
+            if output.len() + file_section.len() > max_chars {
+                break;
+            }
+
+            output.push_str(&file_section);
+        }
+    }
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +700,84 @@ impl Foo {
             idx.needs_reindex(&file).expect("check"),
             "new file should need reindex"
         );
+    }
+
+    #[test]
+    fn test_generate_repo_map_includes_pub_symbols() {
+        let dir = tempdir().expect("should create temp dir");
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn visible() {}\nfn private() {}",
+        )
+        .expect("should write file");
+
+        let result = generate_repo_map(dir.path(), 10_000).expect("should generate repo map");
+        assert!(result.contains("visible"), "should contain pub fn");
+        assert!(!result.contains("private"), "should not contain private fn");
+    }
+
+    #[test]
+    fn test_generate_repo_map_format() {
+        let dir = tempdir().expect("should create temp dir");
+        let source = "pub struct Foo;\nimpl Foo {\n    pub fn bar(&self) -> i32 { 0 }\n    fn baz(&self) {}\n}";
+        std::fs::write(dir.path().join("foo.rs"), source).expect("should write file");
+
+        let result = generate_repo_map(dir.path(), 10_000).expect("should generate repo map");
+        assert!(result.contains("pub struct Foo"), "struct in output");
+        assert!(result.contains("impl Foo >"), "impl context in output");
+        assert!(!result.contains("baz"), "private method not in output");
+    }
+
+    #[test]
+    fn test_generate_repo_map_impl_context() {
+        let dir = tempdir().expect("should create temp dir");
+        let source = "pub struct Bar;\nimpl Bar {\n    pub fn method(&self) {}\n}";
+        std::fs::write(dir.path().join("bar.rs"), source).expect("should write file");
+
+        let result = generate_repo_map(dir.path(), 10_000).expect("should generate repo map");
+        assert!(
+            result.contains("impl Bar > "),
+            "method should show impl context"
+        );
+    }
+
+    #[test]
+    fn test_generate_repo_map_truncation() {
+        let dir = tempdir().expect("should create temp dir");
+        for i in 0..10 {
+            std::fs::write(
+                dir.path().join(format!("file{i}.rs")),
+                format!("pub fn func_{i}() {{}}"),
+            )
+            .expect("should write file");
+        }
+
+        let result = generate_repo_map(dir.path(), 200).expect("should generate repo map");
+        assert!(result.len() <= 200, "output must be within max_chars");
+        assert!(
+            result.is_empty() || result.ends_with('\n'),
+            "result should end at whole-file boundary"
+        );
+    }
+
+    #[test]
+    fn test_generate_repo_map_empty_project() {
+        let dir = tempdir().expect("should create temp dir");
+
+        let result = generate_repo_map(dir.path(), 10_000).expect("should generate repo map");
+        assert_eq!(result, "", "empty project should produce empty string");
+    }
+
+    #[test]
+    fn test_generate_repo_map_relative_paths() {
+        let dir = tempdir().expect("should create temp dir");
+        std::fs::write(dir.path().join("src.rs"), "pub fn hello() {}").expect("should write file");
+
+        let result = generate_repo_map(dir.path(), 10_000).expect("should generate repo map");
+        assert!(
+            !result.contains(&dir.path().to_string_lossy().to_string()),
+            "should use relative paths"
+        );
+        assert!(result.contains("src.rs"), "should contain filename");
     }
 }

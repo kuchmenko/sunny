@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sunny_boys::git_tools::{GitDiff, GitLog, GitStatus};
-use sunny_boys::tool_loop::ToolExecutor;
+use crate::git_tools::{GitDiff, GitLog, GitStatus};
+use crate::tool_loop::ToolExecutor;
 use sunny_core::tool::{
     FileEditor, FileReader, FileScanner, FileWriter, GrepFiles, PathGuard, ShellExecutor, TextGrep,
     ToolError, ToolPolicy,

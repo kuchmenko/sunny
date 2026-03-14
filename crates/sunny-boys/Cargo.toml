@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 sunny-core = { path = "../sunny-core" } # dep: tool infrastructure for chat
 sunny-mind = { path = "../sunny-mind" } # dep: LLM provider for streaming tool loop
+sunny-store = { path = "../sunny-store" } # dep: session persistence and symbol index for agent
 async-trait = "0.1" # dep: async methods in tool loop test mocks
 thiserror = "1" # dep: typed error enums per AGENTS.md
 tracing = "0.1" # dep: structured logging, no println per AGENTS.md

@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::{collections::HashMap, collections::HashSet};
 
-use sunny_boys::streaming_tool_loop::StreamingToolLoop;
-use sunny_boys::tool_loop::{ToolCallError, ToolExecutor};
+use crate::streaming_tool_loop::StreamingToolLoop;
+use crate::tool_loop::{ToolCallError, ToolExecutor};
 use sunny_mind::{
     ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, StreamEvent, ToolChoice,
 };
@@ -20,9 +20,9 @@ use super::tools::{build_tool_definitions, build_tool_executor, build_tool_polic
 /// Uses a 4 chars ≈ 1 token heuristic with a ~190K token model limit.
 const MAX_CONTEXT_CHARS: usize = 190_000 * 4;
 
-/// Errors that can occur during a chat session.
+/// Errors that can occur during an agent session.
 #[derive(thiserror::Error, Debug)]
-pub enum ChatError {
+pub enum AgentError {
     #[error("LLM error: {0}")]
     Llm(#[from] LlmError),
     #[error("tool loop error: {0}")]
@@ -34,10 +34,10 @@ pub enum ChatError {
 
 /// In-memory conversation session for the `sunny chat` REPL.
 ///
-/// `ChatSession` is NOT an agent — it does not implement the `Agent` trait.
+/// Stateful agent session for LLM-powered tool execution.
 /// It manages conversation history and delegates streaming tool execution
 /// to [`StreamingToolLoop`].
-pub struct ChatSession {
+pub struct AgentSession {
     messages: Vec<ChatMessage>,
     budget: sunny_store::TokenBudget,
     provider: Arc<dyn LlmProvider>,
@@ -52,8 +52,8 @@ pub struct ChatSession {
     generate_title: bool,
 }
 
-impl ChatSession {
-    /// Create a new chat session with the given provider and workspace root.
+impl AgentSession {
+    /// Create a new agent session with the given provider and workspace root.
     ///
     /// Initialises the message history with the Claude Code system prompt,
     /// optionally appending SUNNY.md project context if present.
@@ -80,6 +80,14 @@ impl ChatSession {
                 let truncated: String = context.chars().take(12_000).collect();
                 system_prompt.push_str("\n\n# Project Context\n\n");
                 system_prompt.push_str(&truncated);
+            }
+        }
+
+        // Generate and inject repository map for structural awareness.
+        if let Ok(repo_map) = sunny_store::generate_repo_map(&root, 20_000) {
+            if !repo_map.is_empty() {
+                system_prompt.push_str("\n\n# Repository Map\n\n");
+                system_prompt.push_str(&repo_map);
             }
         }
 
@@ -172,9 +180,9 @@ impl ChatSession {
     ///
     /// Appends the user message to history, runs the streaming tool loop,
     /// appends loop-produced messages, auto-saves, and returns the final text.
-    pub async fn send<F>(&mut self, user_input: &str, on_event: F) -> Result<String, ChatError>
+    pub async fn send<F>(&mut self, user_input: &str, on_event: F) -> Result<String, AgentError>
     where
-        F: Fn(StreamEvent) + Send + Sync,
+        F: FnMut(StreamEvent) + Send,
     {
         self.messages.push(ChatMessage {
             role: ChatRole::User,
@@ -282,7 +290,7 @@ impl ChatSession {
     ///
     /// Summarizes messages older than the last 5 turns and replaces them
     /// with a single `[Context Summary]` user message.
-    pub async fn compact_with_llm(&mut self) -> Result<String, ChatError> {
+    pub async fn compact_with_llm(&mut self) -> Result<String, AgentError> {
         let user_msgs: Vec<usize> = self
             .messages
             .iter()
@@ -392,7 +400,11 @@ impl ChatSession {
                 let s = SessionStore::new(db);
                 match s.load_session(&session_id_clone) {
                     Ok(None) => s
-                        .create_session(&working_dir_clone, Some(&model_clone))
+                        .create_session_with_id(
+                            &session_id_clone,
+                            &working_dir_clone,
+                            Some(&model_clone),
+                        )
                         .map(|_| ()),
                     Ok(Some(_)) => Ok(()),
                     Err(e) => Err(e),
@@ -610,12 +622,12 @@ mod tests {
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn make_session_in(dir: &tempfile::TempDir) -> ChatSession {
+    fn make_session_in(dir: &tempfile::TempDir) -> AgentSession {
         let db = Database::open(dir.path().join("session_test.db").as_path())
             .expect("should open database");
         let store = Arc::new(SessionStore::new(db));
         let provider = Arc::new(MockStreamProvider::new(vec![]));
-        ChatSession::new(
+        AgentSession::new(
             provider,
             dir.path().to_path_buf(),
             "pending-session".to_string(),
@@ -657,7 +669,7 @@ mod tests {
             .create_session("/test", Some("model"))
             .expect("create session");
         let provider = Arc::new(MockStreamProvider::new(vec![]));
-        let session = ChatSession::from_saved(
+        let session = AgentSession::from_saved(
             store,
             saved,
             vec![],
@@ -703,7 +715,7 @@ mod tests {
             },
         ];
         let provider = Arc::new(MockStreamProvider::new(vec![]));
-        let session = ChatSession::from_saved(
+        let session = AgentSession::from_saved(
             store,
             saved,
             messages,
@@ -720,7 +732,7 @@ mod tests {
         let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
         let store = Arc::new(SessionStore::new(db));
         let provider = Arc::new(MockStreamProvider::new(vec![make_text_stream("Hello!")]));
-        let mut session = ChatSession::new(
+        let mut session = AgentSession::new(
             provider,
             dir.path().to_path_buf(),
             "pending-session".to_string(),
@@ -743,7 +755,7 @@ mod tests {
         let provider = Arc::new(MockStreamProvider::new(vec![make_text_stream(
             "Hello world",
         )]));
-        let mut session = ChatSession::new(
+        let mut session = AgentSession::new(
             provider,
             dir.path().to_path_buf(),
             "pending-session".to_string(),
@@ -774,7 +786,7 @@ mod tests {
         let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
         let store = Arc::new(SessionStore::new(db));
         let provider = Arc::new(MockStreamProvider::new(vec![make_text_stream("ok")]));
-        let mut session = ChatSession::new(
+        let mut session = AgentSession::new(
             provider,
             dir.path().to_path_buf(),
             "pending-session".to_string(),
@@ -823,7 +835,7 @@ mod tests {
         let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
         let store = Arc::new(SessionStore::new(db));
         let provider = Arc::new(MockStreamProvider::new(vec![]));
-        let session = ChatSession::new(
+        let session = AgentSession::new(
             provider,
             dir.path().to_path_buf(),
             "pending-session".to_string(),
@@ -835,6 +847,32 @@ mod tests {
                 .content
                 .contains("Use async/await everywhere"),
             "system prompt should contain SUNNY.md content"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repo_map_injected_into_system_prompt() {
+        let dir = tempdir().expect("should create temp dir");
+        // Write a Rust file with a pub fn to the tempdir
+        std::fs::write(dir.path().join("hello.rs"), "pub fn hello() {}").expect("write hello.rs");
+
+        let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
+        let store = Arc::new(SessionStore::new(db));
+        let provider = Arc::new(MockStreamProvider::new(vec![]));
+        let session = AgentSession::new(
+            provider,
+            dir.path().to_path_buf(),
+            "pending-session".to_string(),
+            store,
+        );
+
+        assert!(
+            session.messages[0].content.contains("# Repository Map"),
+            "system prompt should contain repo map header"
+        );
+        assert!(
+            session.messages[0].content.contains("hello"),
+            "system prompt should contain pub fn name"
         );
     }
 
@@ -974,7 +1012,7 @@ mod tests {
         let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
         let store = Arc::new(SessionStore::new(db));
         let provider = Arc::new(MockStreamProvider::new(vec![make_text_stream("budget")]));
-        let mut session = ChatSession::new(
+        let mut session = AgentSession::new(
             provider,
             dir.path().to_path_buf(),
             "pending-session".to_string(),

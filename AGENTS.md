@@ -179,8 +179,8 @@ Current workspace paths:
 - Event constants: `crates/sunny-core/src/events.rs`
 - LLM abstractions: `crates/sunny-mind/src/`
 - Tool loops and git tools: `crates/sunny-boys/src/`
-- CLI chat command: `crates/sunny-cli/src/commands/`
-- Chat session: `crates/sunny-cli/src/chat/`
+- CLI chat command: `apps/sunny-cli/src/commands/`
+- Agent session: `crates/sunny-boys/src/agent/`
 
 ## 9) Testing Strategy
 
