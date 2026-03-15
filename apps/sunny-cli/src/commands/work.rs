@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use sunny_boys::{ExecutionOutcome, TaskExecutor};
 use sunny_mind::AnthropicProvider;
-use sunny_tasks::{TaskReadyEvent, TaskScheduler, TaskStore, UserConfig, WorkspaceDetector};
+use sunny_tasks::{TaskReadyEvent, TaskScheduler, TaskStatus, TaskStore, UserConfig, WorkspaceDetector};
 
 #[derive(Args, Debug)]
 pub struct WorkArgs {
@@ -26,6 +26,9 @@ pub async fn run(args: WorkArgs) -> anyhow::Result<()> {
     let store = TaskStore::open_default()?;
     let workspace = store.find_or_create_workspace(git_root_str)?;
     let workspace_id = workspace.id.clone();
+
+    // Startup recovery: re-queue suspended tasks whose children all completed
+    recover_suspended_tasks(&store, &workspace_id);
 
     let config = UserConfig::load(Some(&git_root));
     let max_concurrent = if args.max_concurrent > 0 {
@@ -86,7 +89,7 @@ pub async fn run(args: WorkArgs) -> anyhow::Result<()> {
 
                         tokio::task::spawn_local(async move {
                             let _permit = permit;
-                            let _task_store = match TaskStore::open_default() {
+                            let task_store = match TaskStore::open_default() {
                                 Ok(store) => store,
                                 Err(error) => {
                                     warn!(task_id = %event.task.id, error = %error, "failed to open task store for worker task");
@@ -98,9 +101,11 @@ pub async fn run(args: WorkArgs) -> anyhow::Result<()> {
                             match outcome {
                                 ExecutionOutcome::Completed { summary } => {
                                     info!(task_id = %event.task.id, summary = %summary, "task completed");
+                                    check_parent_requeue(&task_store, &event.task.id);
                                 }
                                 ExecutionOutcome::Failed { error } => {
                                     warn!(task_id = %event.task.id, error = %error, "task failed");
+                                    check_parent_requeue(&task_store, &event.task.id);
                                 }
                                 ExecutionOutcome::BlockedOnHuman => {
                                     info!(task_id = %event.task.id, "task blocked on human input");
@@ -110,12 +115,13 @@ pub async fn run(args: WorkArgs) -> anyhow::Result<()> {
                                 }
                                 ExecutionOutcome::Cancelled => {
                                     info!(task_id = %event.task.id, "task cancelled");
+                                    check_parent_requeue(&task_store, &event.task.id);
                                 }
                                 ExecutionOutcome::MaxIterationsReached => {
                                     warn!(task_id = %event.task.id, "task hit max iterations");
                                 }
                                 ExecutionOutcome::NoTerminalAction => {
-                                    info!(task_id = %event.task.id, "task ended without terminal action (suspension handled separately)");
+                                    handle_no_terminal_action(&task_store, &event.task.id);
                                 }
                             }
                         });
@@ -129,4 +135,148 @@ pub async fn run(args: WorkArgs) -> anyhow::Result<()> {
 
     info!("worker stopped");
     Ok(())
+}
+
+/// Suspension detection: called when an agent ends without task_complete/task_fail.
+/// - Has pending children → set Suspended (implicit suspension design)
+/// - All children already terminal → set Pending (immediate re-queue)
+/// - No children → genuine failure
+fn handle_no_terminal_action(store: &TaskStore, task_id: &str) {
+    let children = match store.list_children(task_id) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(task_id = %task_id, error = %e, "failed to list children for suspension check");
+            return;
+        }
+    };
+
+    if children.is_empty() {
+        // No children — genuinely failed without terminal action
+        if let Err(e) = store.set_error(task_id, "agent ended without calling task_complete or task_fail") {
+            warn!(task_id = %task_id, error = %e, "failed to set error on task");
+        }
+        if let Err(e) = store.update_status(task_id, TaskStatus::Failed) {
+            warn!(task_id = %task_id, error = %e, "failed to mark task failed");
+        }
+        warn!(task_id = %task_id, "task failed: no terminal action and no children");
+        return;
+    }
+
+    let all_terminal = children.iter().all(|c| {
+        matches!(
+            c.status,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        )
+    });
+
+    if all_terminal {
+        // Children all done already — re-queue immediately
+        if let Err(e) = store.update_status(task_id, TaskStatus::Pending) {
+            warn!(task_id = %task_id, error = %e, "failed to re-queue task");
+        }
+        info!(task_id = %task_id, "children already complete, re-queuing parent");
+        return;
+    }
+
+    // Check and enforce max suspension cap (5) via task metadata
+    let task = match store.get_task(task_id) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            warn!(task_id = %task_id, "task not found during suspension check");
+            return;
+        }
+        Err(e) => {
+            warn!(task_id = %task_id, error = %e, "failed to load task for suspension check");
+            return;
+        }
+    };
+
+    let suspension_count = task
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("suspension_count"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    if suspension_count >= 5 {
+        // set_error sets status=failed + completed_at internally
+        if let Err(e) = store.set_error(task_id, "max suspension count (5) exceeded") {
+            warn!(task_id = %task_id, error = %e, "failed to mark task failed after cap");
+        }
+        warn!(task_id = %task_id, suspension_count, "task failed: max suspension count exceeded");
+        return;
+    }
+
+    // Increment suspension_count and suspend
+    let new_count = suspension_count + 1;
+    let new_metadata = {
+        let mut m = task.metadata.unwrap_or_else(|| serde_json::json!({}));
+        m["suspension_count"] = serde_json::json!(new_count);
+        m
+    };
+    if let Err(e) = store.update_metadata(task_id, new_metadata) {
+        warn!(task_id = %task_id, error = %e, "failed to update suspension_count metadata");
+    }
+    if let Err(e) = store.update_status(task_id, TaskStatus::Suspended) {
+        warn!(task_id = %task_id, error = %e, "failed to suspend task");
+    }
+    info!(task_id = %task_id, children = children.len(), suspension_count = new_count, "task suspended awaiting children");
+}
+
+/// Re-queue a suspended parent when all its children reach terminal state.
+/// Called after every task reaches a terminal outcome.
+fn check_parent_requeue(store: &TaskStore, child_task_id: &str) {
+    let child = match store.get_task(child_task_id) {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+    let Some(ref parent_id) = child.parent_id else {
+        return;
+    };
+    let parent = match store.get_task(parent_id) {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+    if parent.status != TaskStatus::Suspended {
+        return;
+    }
+    match store.all_children_terminal(parent_id) {
+        Ok(true) => {
+            if let Err(e) = store.update_status(parent_id, TaskStatus::Pending) {
+                warn!(parent_id = %parent_id, error = %e, "failed to re-queue suspended parent");
+            } else {
+                info!(parent_id = %parent_id, "re-queued suspended parent: all children terminal");
+            }
+        }
+        Ok(false) => {}
+        Err(e) => {
+            warn!(parent_id = %parent_id, error = %e, "failed to check all_children_terminal");
+        }
+    }
+}
+
+/// Startup recovery: find suspended tasks whose children are all terminal and re-queue them.
+pub fn recover_suspended_tasks(store: &TaskStore, workspace_id: &str) {
+    let suspended = match store.list_tasks_by_status(workspace_id, TaskStatus::Suspended) {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            warn!(error = %e, "startup recovery: failed to list suspended tasks");
+            return;
+        }
+    };
+    for task in suspended {
+        match store.all_children_terminal(&task.id) {
+            Ok(true) => {
+                if let Err(e) = store.update_status(&task.id, TaskStatus::Pending) {
+                    warn!(task_id = %task.id, error = %e, "startup recovery: failed to re-queue");
+                } else {
+                    info!(task_id = %task.id, "startup recovery: re-queued stale suspended task");
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(task_id = %task.id, error = %e, "startup recovery: all_children_terminal failed");
+            }
+        }
+    }
 }

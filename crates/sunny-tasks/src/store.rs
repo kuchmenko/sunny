@@ -308,6 +308,42 @@ impl TaskStore {
         Ok(non_terminal_count == 0)
     }
 
+    pub fn list_tasks_by_status(
+        &self,
+        workspace_id: &str,
+        status: TaskStatus,
+    ) -> Result<Vec<Task>, TaskError> {
+        let mut stmt = self.db.connection().prepare(
+            "SELECT
+                id, workspace_id, parent_id, title, description, status,
+                session_id, created_by, priority, created_at, updated_at,
+                started_at, completed_at, result_diff, result_summary, result_files,
+                result_verify, error, retry_count, max_retries, metadata
+             FROM tasks
+             WHERE workspace_id = ?1 AND status = ?2
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![workspace_id, status.to_string()],
+            row_to_task,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(TaskError::Db)
+    }
+
+    pub fn update_metadata(
+        &self,
+        id: &str,
+        metadata: serde_json::Value,
+    ) -> Result<(), TaskError> {
+        let now = Utc::now().to_rfc3339();
+        let json = serde_json::to_string(&metadata).map_err(TaskError::Serialization)?;
+        self.db.connection().execute(
+            "UPDATE tasks SET metadata = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![json, now, id],
+        )?;
+        Ok(())
+    }
+
     pub fn add_dep(&self, task_id: &str, depends_on: &str) -> Result<(), TaskError> {
         if self.has_cycle(task_id, depends_on)? {
             return Err(TaskError::DependencyCycle);
@@ -1303,5 +1339,48 @@ mod tests {
         assert_eq!(updated.status, TaskStatus::Suspended);
         // Verify completed_at is NOT set
         assert_eq!(updated.completed_at, None);
+    }
+
+    #[test]
+    fn test_list_tasks_by_status_returns_only_matching() {
+        let (store, _dir) = make_store();
+        let ws = make_workspace(&store);
+        let t1 = make_task(&store, &ws.id, "pending-task");
+        let t2 = make_task(&store, &ws.id, "running-task");
+        store.update_status(&t2.id, TaskStatus::Running).expect("should update");
+        let pending = store.list_tasks_by_status(&ws.id, TaskStatus::Pending).expect("should list");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, t1.id);
+        let running = store.list_tasks_by_status(&ws.id, TaskStatus::Running).expect("should list");
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, t2.id);
+    }
+
+    #[test]
+    fn test_list_tasks_by_status_suspended_returns_suspended() {
+        let (store, _dir) = make_store();
+        let ws = make_workspace(&store);
+        let t = make_task(&store, &ws.id, "suspended-task");
+        store.update_status(&t.id, TaskStatus::Suspended).expect("should update");
+        let suspended = store.list_tasks_by_status(&ws.id, TaskStatus::Suspended).expect("should list");
+        assert_eq!(suspended.len(), 1);
+        assert_eq!(suspended[0].id, t.id);
+    }
+
+    #[test]
+    fn test_update_metadata_stores_and_retrieves() {
+        let (store, _dir) = make_store();
+        let ws = make_workspace(&store);
+        let t = make_task(&store, &ws.id, "meta-task");
+        let meta = serde_json::json!({"suspension_count": 3});
+        store.update_metadata(&t.id, meta.clone()).expect("should update metadata");
+        let saved = store.get_task(&t.id).expect("should load").expect("should exist");
+        let count = saved
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("suspension_count"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        assert_eq!(count, 3);
     }
 }
