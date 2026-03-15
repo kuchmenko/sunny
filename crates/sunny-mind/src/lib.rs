@@ -16,6 +16,7 @@ pub mod anthropic;
 pub mod error;
 #[cfg(test)]
 pub(crate) mod mock_provider;
+pub mod openai;
 pub mod provider;
 pub mod stream;
 pub mod tokenizer;
