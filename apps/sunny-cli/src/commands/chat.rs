@@ -235,8 +235,9 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
             let provider: Arc<dyn LlmProvider> = Arc::new(provider);
 
             // Build provider registry for category-based model routing.
+            // Load workspace config so [models] in .sunny/config.toml is respected.
             let models_config = {
-                let cfg = UserConfig::load(None);
+                let cfg = UserConfig::load(Some(&executor_git_root));
                 cfg.models
             };
             let mut registry = ProviderRegistry::new(models_config.clone());
