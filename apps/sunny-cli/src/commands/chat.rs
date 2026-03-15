@@ -11,12 +11,17 @@ use rustyline::DefaultEditor;
 use sunny_mind::{AnthropicProvider, LlmProvider, StreamEvent};
 use sunny_store::{Database, SessionStore};
 use sunny_tasks::{
-    CapabilityPolicyEntry, CapabilityScope, CapabilityStore, PolicyFile, UserConfig,
+    CapabilityPolicyEntry, CapabilityScope, CapabilityStore, PolicyFile, TaskReadyEvent,
+    TaskScheduler, TaskStore, UserConfig,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use uuid::Uuid;
 
-use sunny_boys::{AgentSession, GateDecision, HumanApprovalGate, SharedApprovalGate};
+use sunny_boys::{
+    AgentSession, ExecutionOutcome, GateDecision, HumanApprovalGate, SharedApprovalGate,
+    TaskExecutor,
+};
 
 /// Arguments for the `sunny chat` subcommand.
 #[derive(Args, Debug)]
@@ -153,6 +158,143 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
             Arc::clone(&store),
         )
     };
+
+    let worker_config = UserConfig::load(Some(&workspace_root));
+    let worker_max_concurrent = worker_config.tasks.max_concurrent;
+    let worker_cancel = CancellationToken::new();
+
+    {
+        let (ready_tx, ready_rx_for_executor) =
+            tokio::sync::mpsc::unbounded_channel::<TaskReadyEvent>();
+
+        let scheduler_cancel = worker_cancel.clone();
+        let scheduler_git_root = workspace_root.clone();
+        std::thread::spawn(move || {
+            let store = match TaskStore::open_default() {
+                Ok(store) => store,
+                Err(error) => {
+                    warn!(error = %error, "worker: failed to open task store for scheduler");
+                    return;
+                }
+            };
+
+            let git_root_str = scheduler_git_root.to_string_lossy().to_string();
+            let workspace = match store.find_or_create_workspace(&git_root_str) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    warn!(error = %error, "worker: failed to find workspace");
+                    return;
+                }
+            };
+
+            if let Err(error) = sunny_tasks::worker::recover_suspended_tasks(&store, &workspace.id)
+            {
+                warn!(error = %error, "worker: startup recovery failed");
+            }
+
+            #[allow(clippy::arc_with_non_send_sync)]
+            let scheduler =
+                TaskScheduler::new(Arc::new(store), workspace.id, worker_max_concurrent)
+                    .with_ready_channel(ready_tx);
+
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    warn!(error = %error, "worker: failed to build scheduler runtime");
+                    return;
+                }
+            };
+
+            runtime.block_on(scheduler.run(scheduler_cancel));
+        });
+
+        let executor_cancel = worker_cancel.clone();
+        let executor_model = args.model.clone();
+        let executor_git_root = workspace_root.clone();
+        std::thread::spawn(move || {
+            let provider = match AnthropicProvider::new(&executor_model) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    warn!(error = %error, "worker: failed to create provider for executor");
+                    return;
+                }
+            };
+            let provider: Arc<dyn LlmProvider> = Arc::new(provider);
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(worker_max_concurrent));
+
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    warn!(error = %error, "worker: failed to build executor runtime");
+                    return;
+                }
+            };
+
+            let local = tokio::task::LocalSet::new();
+            runtime.block_on(local.run_until(async move {
+                let mut ready_rx = ready_rx_for_executor;
+                while let Some(event) = ready_rx.recv().await {
+                    if executor_cancel.is_cancelled() {
+                        break;
+                    }
+
+                    let permit = match semaphore.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    };
+
+                    let task_cancel = executor_cancel.child_token();
+                    let provider = Arc::clone(&provider);
+                    let git_root = executor_git_root.clone();
+
+                    tokio::task::spawn_local(async move {
+                        let _permit = permit;
+                        let task_store = match TaskStore::open_default() {
+                            Ok(store) => store,
+                            Err(error) => {
+                                warn!(
+                                    task_id = %event.task.id,
+                                    error = %error,
+                                    "worker: failed to open store for task"
+                                );
+                                return;
+                            }
+                        };
+
+                        let executor = TaskExecutor::new(provider);
+                        let outcome = executor
+                            .execute(event.task.clone(), git_root, task_cancel)
+                            .await;
+
+                        match outcome {
+                            ExecutionOutcome::Completed { .. }
+                            | ExecutionOutcome::Failed { .. }
+                            | ExecutionOutcome::Cancelled => {
+                                let _ = sunny_tasks::worker::check_parent_requeue(
+                                    &task_store,
+                                    &event.task.id,
+                                );
+                            }
+                            ExecutionOutcome::NoTerminalAction => {
+                                let _ = sunny_tasks::worker::handle_no_terminal_action(
+                                    &task_store,
+                                    &event.task.id,
+                                );
+                            }
+                            _ => {}
+                        }
+                    });
+                }
+            }));
+        });
+    }
+
     let mut rl = DefaultEditor::new()?;
 
     loop {
@@ -165,6 +307,7 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                 }
                 if input == "/quit" || input == "/exit" {
                     println!("Goodbye.");
+                    worker_cancel.cancel();
                     break;
                 }
 
@@ -382,14 +525,18 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
             Err(ReadlineError::Eof) => {
                 // Ctrl+D — exit.
                 println!("Goodbye.");
+                worker_cancel.cancel();
                 break;
             }
             Err(e) => {
                 eprintln!("readline error: {e}");
+                worker_cancel.cancel();
                 break;
             }
         }
     }
+
+    worker_cancel.cancel();
 
     Ok(())
 }
