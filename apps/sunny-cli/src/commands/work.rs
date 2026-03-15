@@ -7,7 +7,9 @@ use tracing::{info, warn};
 
 use sunny_boys::{ExecutionOutcome, TaskExecutor};
 use sunny_mind::AnthropicProvider;
-use sunny_tasks::{TaskReadyEvent, TaskScheduler, TaskStatus, TaskStore, UserConfig, WorkspaceDetector};
+use sunny_tasks::{
+    TaskReadyEvent, TaskScheduler, TaskStatus, TaskStore, UserConfig, WorkspaceDetector,
+};
 
 #[derive(Args, Debug)]
 pub struct WorkArgs {
@@ -17,8 +19,8 @@ pub struct WorkArgs {
 }
 
 pub async fn run(args: WorkArgs) -> anyhow::Result<()> {
-    let git_root = WorkspaceDetector::detect_cwd()
-        .ok_or_else(|| anyhow::anyhow!("no git workspace found"))?;
+    let git_root =
+        WorkspaceDetector::detect_cwd().ok_or_else(|| anyhow::anyhow!("no git workspace found"))?;
     let git_root_str = git_root
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("workspace path not valid UTF-8"))?;
@@ -49,8 +51,8 @@ pub async fn run(args: WorkArgs) -> anyhow::Result<()> {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let scheduler_store = Arc::new(TaskStore::open_default()?);
-    let scheduler =
-        TaskScheduler::new(scheduler_store, workspace_id, max_concurrent).with_ready_channel(ready_tx);
+    let scheduler = TaskScheduler::new(scheduler_store, workspace_id, max_concurrent)
+        .with_ready_channel(ready_tx);
 
     let local = tokio::task::LocalSet::new();
     local
@@ -152,7 +154,10 @@ fn handle_no_terminal_action(store: &TaskStore, task_id: &str) {
 
     if children.is_empty() {
         // No children — genuinely failed without terminal action
-        if let Err(e) = store.set_error(task_id, "agent ended without calling task_complete or task_fail") {
+        if let Err(e) = store.set_error(
+            task_id,
+            "agent ended without calling task_complete or task_fail",
+        ) {
             warn!(task_id = %task_id, error = %e, "failed to set error on task");
         }
         if let Err(e) = store.update_status(task_id, TaskStatus::Failed) {

@@ -17,7 +17,6 @@ pub struct TaskPromptContext {
     pub repo_map: Option<String>,
 }
 
-
 pub struct CompletedDepResult {
     pub task_id: String,
     pub title: String,
