@@ -235,7 +235,8 @@ impl AgentSession {
             build_tool_policy(),
             max_iterations,
             self.cancel.clone(),
-        );
+        )
+        .with_dedup_tools(Self::dedup_eligible_tools());
 
         let result = loop_runner.run(request, tool_executor, on_event).await?;
         let content = result.content.clone();
@@ -567,6 +568,22 @@ impl AgentSession {
         }
 
         self.trim_context();
+    }
+
+    fn dedup_eligible_tools() -> HashSet<String> {
+        [
+            "fs_read",
+            "fs_scan",
+            "text_grep",
+            "grep_files",
+            "git_log",
+            "git_diff",
+            "git_status",
+            "codebase_search",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 }
 
