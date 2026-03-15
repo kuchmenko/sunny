@@ -281,6 +281,10 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                         let executor = TaskExecutor::new(provider);
                         let task_id = event.task.id.clone();
                         let title = event.task.title.clone();
+                        let _ = progress_tx.send(TaskProgressEvent::Started {
+                            task_id: task_id.clone(),
+                            title: title.clone(),
+                        });
                         let outcome = executor
                             .execute(event.task.clone(), git_root, task_cancel)
                             .await;
@@ -292,10 +296,12 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                                     title: title.clone(),
                                     summary,
                                 });
-                                let _ = sunny_tasks::worker::check_parent_requeue(
+                                if let Err(e) = sunny_tasks::worker::check_parent_requeue(
                                     &task_store,
                                     &task_id,
-                                );
+                                ) {
+                                    warn!(task_id = %task_id, error = %e, "worker: check_parent_requeue failed");
+                                }
                             }
                             ExecutionOutcome::Failed { error } => {
                                 let _ = progress_tx.send(TaskProgressEvent::Failed {
@@ -303,16 +309,20 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                                     title: title.clone(),
                                     error,
                                 });
-                                let _ = sunny_tasks::worker::check_parent_requeue(
+                                if let Err(e) = sunny_tasks::worker::check_parent_requeue(
                                     &task_store,
                                     &task_id,
-                                );
+                                ) {
+                                    warn!(task_id = %task_id, error = %e, "worker: check_parent_requeue failed");
+                                }
                             }
                             ExecutionOutcome::Cancelled => {
-                                let _ = sunny_tasks::worker::check_parent_requeue(
+                                if let Err(e) = sunny_tasks::worker::check_parent_requeue(
                                     &task_store,
                                     &task_id,
-                                );
+                                ) {
+                                    warn!(task_id = %task_id, error = %e, "worker: check_parent_requeue failed");
+                                }
                             }
                             ExecutionOutcome::NoTerminalAction => {
                                 let children_count = task_store
@@ -335,7 +345,12 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                                         let _ = progress_tx
                                             .send(TaskProgressEvent::Requeued { task_id, title });
                                     }
-                                    Ok(WorkerAction::Failed(_)) | Err(_) => {}
+                                    Ok(WorkerAction::Failed(msg)) => {
+                                        warn!(task_id = %task_id, msg = %msg, "worker: task failed via NoTerminalAction");
+                                    }
+                                    Err(e) => {
+                                        warn!(task_id = %task_id, error = %e, "worker: handle_no_terminal_action error");
+                                    }
                                 }
                             }
                             _ => {}
