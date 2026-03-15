@@ -10,11 +10,13 @@ pub struct TaskPromptContext {
     pub accept_criteria: Option<AcceptCriteria>,
     pub verify_commands: Vec<VerifyCommand>,
     pub dep_results: Vec<CompletedDepResult>,
+    pub children_results: Vec<CompletedDepResult>,
     pub workspace_snapshot: WorkspaceSnapshot,
     pub running_siblings: Vec<SiblingTask>,
     pub conventions: Option<String>,
     pub repo_map: Option<String>,
 }
+
 
 pub struct CompletedDepResult {
     pub task_id: String,
@@ -59,6 +61,10 @@ impl SystemPromptBuilder {
 
         if !ctx.dep_results.is_empty() {
             parts.push(Self::layer_dep_results(&ctx.dep_results, 8_000));
+        }
+
+        if !ctx.children_results.is_empty() {
+            parts.push(Self::layer_children_results(&ctx.children_results, 8_000));
         }
 
         parts.push(Self::layer_workspace_snapshot(
@@ -185,6 +191,47 @@ impl SystemPromptBuilder {
         }
     }
 
+    fn layer_children_results(children: &[CompletedDepResult], budget: usize) -> String {
+        let mut sorted: Vec<&CompletedDepResult> = children.iter().collect();
+        sorted.sort_by_key(|item| std::cmp::Reverse(item.completed_at));
+
+        let mut output = String::from("# Child Task Results\n\n");
+        let per_diff_cap = std::cmp::max(budget / sorted.len(), 500);
+
+        for child in sorted {
+            let changed_files = if child.changed_files.is_empty() {
+                "(none)".to_string()
+            } else {
+                child.changed_files.join(", ")
+            };
+
+            output.push_str(&format!("## [Child] {} ({})\n", child.title, child.task_id));
+            output.push_str(&format!("Completed: {}\n", child.completed_at.to_rfc3339()));
+            output.push_str(&format!("Summary: {}\n", child.summary));
+            output.push_str(&format!("Changed files: {}\n", changed_files));
+
+            if let Some(diff) = child.diff.as_ref() {
+                let diff_truncated: String = diff.chars().take(per_diff_cap).collect();
+                output.push_str("Diff (truncated):\n");
+                output.push_str(&diff_truncated);
+                output.push('\n');
+                output.push_str("Full diff available via fs_read if needed.\n");
+            }
+
+            output.push('\n');
+            if output.chars().count() > budget {
+                let capped: String = output.chars().take(budget).collect();
+                return capped;
+            }
+        }
+
+        if output.chars().count() > budget {
+            output.chars().take(budget).collect()
+        } else {
+            output
+        }
+    }
+
     fn layer_workspace_snapshot(snapshot: &WorkspaceSnapshot, cap: usize) -> String {
         let modified_count = snapshot
             .status_short
@@ -284,6 +331,7 @@ mod tests {
                 seq: 0,
             }],
             dep_results: vec![],
+            children_results: vec![],
             workspace_snapshot: WorkspaceSnapshot {
                 branch: "master".to_string(),
                 status_short: "".to_string(),

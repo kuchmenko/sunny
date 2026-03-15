@@ -72,6 +72,24 @@ impl TaskSession {
             });
         }
 
+        let children = self.store.list_children(&self.task_id)?;
+        let mut children_results = Vec::new();
+        for child in children {
+            if child.status != TaskStatus::Completed {
+                continue;
+            }
+            children_results.push(CompletedDepResult {
+                task_id: child.id,
+                title: child.title,
+                completed_at: child.completed_at.unwrap_or(child.updated_at),
+                summary: child
+                    .result_summary
+                    .unwrap_or_else(|| "No summary recorded.".to_string()),
+                diff: child.result_diff,
+                changed_files: child.result_files.unwrap_or_default(),
+            });
+        }
+
         let mut running_siblings = Vec::new();
         for sibling in self.store.list_running_tasks(&task.workspace_id)? {
             if sibling.id == self.task_id {
@@ -98,6 +116,7 @@ impl TaskSession {
             accept_criteria,
             verify_commands,
             dep_results,
+            children_results,
             workspace_snapshot,
             running_siblings,
             conventions,
@@ -447,5 +466,52 @@ mod tests {
             .expect("build system prompt should succeed");
 
         assert!(prompt.contains("**Title**: task title"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_includes_children_results() {
+        let (store, _dir) = make_store();
+        let workspace = store
+            .find_or_create_workspace("/tmp/repo")
+            .expect("should create workspace");
+        let parent = make_task(&store, &workspace.id, "parent task");
+        let child = store
+            .create_task(CreateTaskInput {
+                workspace_id: workspace.id.clone(),
+                parent_id: Some(parent.id.clone()),
+                title: "child task".to_string(),
+                description: "description for child task".to_string(),
+                created_by: "human".to_string(),
+                priority: 0,
+                max_retries: 3,
+                dep_ids: vec![],
+                accept_criteria: None,
+                delegate_capabilities: vec![],
+                metadata: None,
+            })
+            .expect("should create child task");
+        store
+            .set_result(&child.id, None, "child done", &[], None)
+            .expect("should complete child task");
+        let session = TaskSession::new(
+            parent.id.clone(),
+            Arc::clone(&store),
+            PathBuf::from("/tmp/repo"),
+        );
+
+        let prompt = session
+            .build_system_prompt(
+                WorkspaceSnapshot {
+                    branch: "master".to_string(),
+                    status_short: "".to_string(),
+                    recent_log: "abc123 test".to_string(),
+                },
+                None,
+                None,
+            )
+            .expect("build system prompt should succeed");
+
+        assert!(prompt.contains("# Child Task Results"));
+        assert!(prompt.contains("child done"));
     }
 }
