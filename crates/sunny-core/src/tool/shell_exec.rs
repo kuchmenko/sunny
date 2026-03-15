@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::info;
@@ -8,6 +9,17 @@ use crate::events::{
     OUTCOME_SUCCESS,
 };
 use crate::tool::ToolError;
+
+/// Checks whether a named capability is active for the current session/task.
+pub trait CapabilityChecker: Send + Sync {
+    /// Returns true if the capability is granted for the given pattern.
+    /// - `capability`: e.g. "shell_pipes"
+    /// - `pattern`: optional refinement, e.g. the RHS command "tail" for shell_pipes
+    fn is_granted(&self, capability: &str, pattern: Option<&str>) -> bool;
+
+    /// Returns a human-readable hint for the agent on how to request this capability.
+    fn denied_hint(&self, capability: &str, pattern: Option<&str>) -> String;
+}
 
 /// Default command timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -30,17 +42,13 @@ const ALLOWLIST: &[&str] = &[
     // Rust toolchain
     "cargo", "rustfmt", "rustup", "rustc",
     // Version control (broad operations not covered by git_log/diff/status tools)
-    "git",
-    // JavaScript / Node
-    "npm", "npx", "yarn", "pnpm", "node",
-    // Python / packaging
-    "python", "python3", "pip", "pip3", "uv", "poetry",
-    // Build systems
+    "git", // JavaScript / Node
+    "npm", "npx", "yarn", "pnpm", "node", // Python / packaging
+    "python", "python3", "pip", "pip3", "uv", "poetry", // Build systems
     "make", "cmake",
     // Read-only file and text inspection
     // (`find` is excluded — use fs_scan / grep_files tools instead)
-    "ls", "cat", "head", "tail", "wc", "echo", "pwd",
-    "grep", "rg", "ag", "fd", "jq",
+    "ls", "cat", "head", "tail", "wc", "echo", "pwd", "grep", "rg", "ag", "fd", "jq",
     // Environment introspection
     "which", "type", "date", "env", "stat", "du", "df",
 ];
@@ -51,14 +59,19 @@ const ALLOWLIST: &[&str] = &[
 /// These prevent chaining an allowlisted prefix with an arbitrary second
 /// command: `cargo build; rm -rf ~` starts with `"cargo"` but is dangerous.
 const BLOCKED_OPERATORS: &[&str] = &[
-    ";",   // sequential execution
-    "&&",  // conditional AND
-    "||",  // conditional OR
-    "|",   // pipe (right-hand side is unvalidated)
-    "$(",  // command substitution
-    "`",   // command substitution (legacy backtick)
+    ";",  // sequential execution
+    "&&", // conditional AND
+    "||", // conditional OR
+    "|",  // pipe (right-hand side is unvalidated)
+    "$(", // command substitution
+    "`",  // command substitution (legacy backtick)
     "\n", // newline-separated commands
 ];
+
+/// Pipe targets that are always permitted without any capability check.
+/// These are pure output formatters - they have zero side effects regardless
+/// of what command precedes them, and they are already in ALLOWLIST.
+const ALWAYS_ALLOWED_PIPE_RHS: &[&str] = &["tail", "head", "grep", "wc"];
 /// Environment variables injected into every spawned command.
 ///
 /// Prevents interactive prompts that would hang the timeout silently:
@@ -102,11 +115,22 @@ pub struct ExecResult {
 /// Executes shell commands within a sandboxed working directory.
 pub struct ShellExecutor {
     root: PathBuf,
+    checker: Option<Arc<dyn CapabilityChecker>>,
 }
 
 impl ShellExecutor {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            checker: None,
+        }
+    }
+
+    pub fn with_capabilities(root: PathBuf, checker: Arc<dyn CapabilityChecker>) -> Self {
+        Self {
+            root,
+            checker: Some(checker),
+        }
     }
 
     /// Execute `command` in the workspace root directory.
@@ -125,14 +149,56 @@ impl ShellExecutor {
         // Checked before the allowlist so the error message is specific.
         let cmd_trimmed = command.trim();
         for op in BLOCKED_OPERATORS {
-            if cmd_trimmed.contains(op) {
-                let err = ToolError::CommandDenied {
-                    command: command.to_string(),
-                    reason: format!("shell operator '{op}' is not permitted; use a single command without chaining"),
-                };
-                info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "shell_exec", outcome = OUTCOME_ERROR, error_kind = "CommandDenied", error_message = %err);
-                return Err(err);
+            if !cmd_trimmed.contains(op) {
+                continue;
             }
+
+            if op == &"|" {
+                let rhs = cmd_trimmed
+                    .split('|')
+                    .nth(1)
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+
+                // Always-allowed output shapers need no capability approval
+                if ALWAYS_ALLOWED_PIPE_RHS.contains(&rhs) && ALLOWLIST.contains(&rhs) {
+                    continue;
+                }
+
+                if let Some(ref checker) = self.checker {
+                    if checker.is_granted("shell_pipes", Some(rhs)) {
+                        if ALLOWLIST.contains(&rhs) {
+                            continue;
+                        }
+
+                        let err = ToolError::CommandDenied {
+                            command: command.to_string(),
+                            reason: format!("pipe target '{rhs}' is not in the command allowlist"),
+                        };
+                        info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "shell_exec", outcome = OUTCOME_ERROR, error_kind = "CommandDenied", error_message = %err);
+                        return Err(err);
+                    }
+
+                    let hint = checker.denied_hint("shell_pipes", Some(rhs));
+                    let err = ToolError::CommandDenied {
+                        command: command.to_string(),
+                        reason: hint,
+                    };
+                    info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "shell_exec", outcome = OUTCOME_ERROR, error_kind = "CommandDenied", error_message = %err);
+                    return Err(err);
+                }
+            }
+
+            let err = ToolError::CommandDenied {
+                command: command.to_string(),
+                reason: format!(
+                    "shell operator '{op}' is not permitted; use a single command without chaining"
+                ),
+            };
+            info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "shell_exec", outcome = OUTCOME_ERROR, error_kind = "CommandDenied", error_message = %err);
+            return Err(err);
         }
 
         // Validate the first token against the allowlist.
@@ -205,6 +271,68 @@ impl ShellExecutor {
             }
         }
     }
+
+    /// Execute `command` bypassing shell operator restrictions.
+    ///
+    /// Identical to `execute()` except that `BLOCKED_OPERATORS` are not checked.
+    /// The command allowlist still applies - only the first token is validated.
+    /// Use only after explicit human approval has been obtained.
+    pub async fn execute_approved(
+        &self,
+        command: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<ExecResult, ToolError> {
+        info!(name: EVENT_TOOL_EXEC_START, tool_name = "shell_exec_approved", command = command);
+
+        let cmd_trimmed = command.trim();
+
+        // Allowlist still applies - we approved the operator, not arbitrary commands
+        let first_token = cmd_trimmed.split_whitespace().next().unwrap_or("");
+        if !ALLOWLIST.contains(&first_token) {
+            let err = ToolError::CommandDenied {
+                command: command.to_string(),
+                reason: format!(
+                    "'{}' is not in the command allowlist even with approval",
+                    first_token
+                ),
+            };
+            return Err(err);
+        }
+
+        let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&self.root)
+            .envs(NON_INTERACTIVE_ENV.iter().copied())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| ToolError::ExecutionFailed {
+                source: Box::new(e),
+            })?;
+
+        match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Err(_) => Err(ToolError::CommandTimeout {
+                command: command.to_string(),
+                timeout_secs: timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            }),
+            Ok(Err(e)) => Err(ToolError::ExecutionFailed {
+                source: Box::new(e),
+            }),
+            Ok(Ok(output)) => {
+                let exit_code = output.status.code().unwrap_or(-1);
+                info!(name: EVENT_TOOL_EXEC_END, tool_name = "shell_exec_approved", outcome = OUTCOME_SUCCESS, exit_code = exit_code);
+                Ok(ExecResult {
+                    stdout: truncate_output(String::from_utf8_lossy(&output.stdout).into_owned()),
+                    stderr: truncate_output(String::from_utf8_lossy(&output.stderr).into_owned()),
+                    exit_code,
+                    timed_out: false,
+                })
+            }
+        }
+    }
 }
 
 fn truncate_output(mut s: String) -> String {
@@ -218,6 +346,32 @@ fn truncate_output(mut s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct MockCapabilityChecker {
+        grant_shell_pipes_tail: bool,
+        grant_all_shell_pipes: bool,
+    }
+
+    impl CapabilityChecker for MockCapabilityChecker {
+        fn is_granted(&self, capability: &str, pattern: Option<&str>) -> bool {
+            if capability != "shell_pipes" {
+                return false;
+            }
+
+            if self.grant_all_shell_pipes {
+                return true;
+            }
+
+            pattern == Some("tail") && self.grant_shell_pipes_tail
+        }
+
+        fn denied_hint(&self, capability: &str, pattern: Option<&str>) -> String {
+            format!(
+                "capability '{capability}' denied for pattern '{}'",
+                pattern.unwrap_or_default()
+            )
+        }
+    }
 
     fn setup() -> (tempfile::TempDir, ShellExecutor) {
         let dir = tempfile::tempdir().expect("test: create temp dir");
@@ -258,7 +412,10 @@ mod tests {
         let err = result.expect_err("test: expected CommandDenied");
         assert!(matches!(err, ToolError::CommandDenied { .. }));
         if let ToolError::CommandDenied { reason, .. } = err {
-            assert!(reason.contains("sudo"), "reason should name the rejected token");
+            assert!(
+                reason.contains("sudo"),
+                "reason should name the rejected token"
+            );
         }
     }
 
@@ -294,6 +451,68 @@ mod tests {
             result.expect_err("test: expected CommandDenied"),
             ToolError::CommandDenied { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_shell_executor_pipe_allowed_with_capability() {
+        let dir = tempfile::tempdir().expect("test: create temp dir");
+        let checker = Arc::new(MockCapabilityChecker {
+            grant_shell_pipes_tail: false,
+            grant_all_shell_pipes: true,
+        });
+        let exec = ShellExecutor::with_capabilities(dir.path().to_path_buf(), checker);
+
+        let result = exec
+            .execute("echo hello | cat", None)
+            .await
+            .expect("pipe should be allowed with shell_pipes capability");
+
+        assert!(result.stdout.contains("hello"));
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn test_shell_executor_allows_pipe_to_always_allowed_rhs() {
+        let (_dir, exec) = setup();
+        // echo "hello" | wc -l is always allowed (wc is in ALWAYS_ALLOWED_PIPE_RHS)
+        let result = exec.execute("echo hello | wc -l", None).await;
+        assert!(
+            result.is_ok(),
+            "pipe to wc should be allowed without capability: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_executor_pipe_denied_without_capability() {
+        let (_dir, exec) = setup();
+        let result = exec.execute("echo hello | cat", None).await;
+
+        assert!(matches!(
+            result.expect_err("test: expected CommandDenied"),
+            ToolError::CommandDenied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_shell_executor_pipe_denied_for_non_allowlisted_rhs() {
+        let dir = tempfile::tempdir().expect("test: create temp dir");
+        let checker = Arc::new(MockCapabilityChecker {
+            grant_shell_pipes_tail: true,
+            grant_all_shell_pipes: true,
+        });
+        let exec = ShellExecutor::with_capabilities(dir.path().to_path_buf(), checker);
+
+        let err = exec
+            .execute("echo hello | rm -rf /tmp/x", None)
+            .await
+            .expect_err("test: expected CommandDenied for non-allowlisted rhs");
+
+        match err {
+            ToolError::CommandDenied { reason, .. } => {
+                assert!(reason.contains("pipe target 'rm' is not in the command allowlist"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[tokio::test]
@@ -344,7 +563,10 @@ mod tests {
     async fn test_shell_executor_non_interactive_env_injected() {
         let (_dir, exec) = setup();
         let result = exec
-            .execute("echo CI=$CI GIT_TERMINAL_PROMPT=$GIT_TERMINAL_PROMPT PAGER=$PAGER", None)
+            .execute(
+                "echo CI=$CI GIT_TERMINAL_PROMPT=$GIT_TERMINAL_PROMPT PAGER=$PAGER",
+                None,
+            )
             .await
             .expect("echo is on the allowlist");
         assert!(result.stdout.contains("CI=true"), "CI should be set");
@@ -353,5 +575,28 @@ mod tests {
             "GIT_TERMINAL_PROMPT should be 0"
         );
         assert!(result.stdout.contains("PAGER=cat"), "PAGER should be cat");
+    }
+
+    #[tokio::test]
+    async fn test_shell_executor_execute_approved_skips_operator_check() {
+        let (_dir, exec) = setup();
+        let result = exec.execute_approved("echo hello | cat", None).await;
+        assert!(
+            result.is_ok(),
+            "approved exec should skip operator check: {result:?}"
+        );
+        assert!(result
+            .expect("approved command should run")
+            .stdout
+            .contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_shell_executor_execute_approved_still_enforces_allowlist() {
+        let (_dir, exec) = setup();
+        let result = exec
+            .execute_approved("curl https://example.com", None)
+            .await;
+        assert!(matches!(result, Err(ToolError::CommandDenied { .. })));
     }
 }

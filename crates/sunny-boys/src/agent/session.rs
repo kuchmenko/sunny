@@ -13,7 +13,9 @@ use sunny_store::{SavedSession, SessionStore, TokenBudget};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::tools::{build_tool_definitions, build_tool_executor, build_tool_policy};
+use super::tools::{
+    build_tool_definitions, build_tool_executor_with_capabilities, build_tool_policy,
+};
 
 /// Maximum character budget for the conversation context.
 ///
@@ -46,6 +48,8 @@ pub struct AgentSession {
     session_id: String,
     #[allow(clippy::arc_with_non_send_sync)]
     store: Arc<SessionStore>,
+    task_id: Option<String>,
+    approval_gate: Option<crate::agent::approval::SharedApprovalGate>,
     is_new_session: bool,
     /// Whether to generate a title after the first exchange.
     /// True for new sessions, false for resumed sessions.
@@ -107,6 +111,8 @@ impl AgentSession {
             cancel: CancellationToken::new(),
             session_id,
             store,
+            task_id: None,
+            approval_gate: None,
             is_new_session: true,
             generate_title: true,
         }
@@ -137,9 +143,23 @@ impl AgentSession {
             cancel,
             session_id: saved.id,
             store,
+            task_id: None,
+            approval_gate: None,
             is_new_session: false,
             generate_title: false,
         }
+    }
+
+    /// Set the task ID for this session. Tool calls will have access to this
+    /// task context without needing environment variables.
+    pub fn with_task(mut self, task_id: String) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
+
+    pub fn with_approval_gate(mut self, gate: crate::agent::approval::SharedApprovalGate) -> Self {
+        self.approval_gate = Some(gate);
+        self
     }
 
     /// Return a clone of the cancellation token for external cancellation.
@@ -202,11 +222,18 @@ impl AgentSession {
             tool_choice: Some(ToolChoice::Auto),
         };
 
-        let tool_executor: Arc<ToolExecutor> = build_tool_executor(self.root.clone());
+        let tool_executor: Arc<ToolExecutor> = build_tool_executor_with_capabilities(
+            self.root.clone(),
+            None,
+            self.task_id.clone(),
+            Some(self.session_id.clone()),
+            self.approval_gate.clone(),
+        );
+        let max_iterations = if self.task_id.is_some() { 50 } else { 15 };
         let loop_runner = StreamingToolLoop::new(
             Arc::clone(&self.provider),
             build_tool_policy(),
-            15,
+            max_iterations,
             self.cancel.clone(),
         );
 

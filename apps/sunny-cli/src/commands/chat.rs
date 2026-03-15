@@ -10,10 +10,13 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use sunny_mind::{AnthropicProvider, LlmProvider, StreamEvent};
 use sunny_store::{Database, SessionStore};
+use sunny_tasks::{
+    CapabilityPolicyEntry, CapabilityScope, CapabilityStore, PolicyFile, UserConfig,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use sunny_boys::AgentSession;
+use sunny_boys::{AgentSession, GateDecision, HumanApprovalGate, SharedApprovalGate};
 
 /// Arguments for the `sunny chat` subcommand.
 #[derive(Args, Debug)]
@@ -116,6 +119,7 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to join session load task: {e}"))??;
 
         if let Some((saved_session, messages)) = loaded {
+            let resumed_session_id = saved_session.id.clone();
             println!(
                 "Resumed session: {} ({}) - {} messages",
                 saved_session.title.as_deref().unwrap_or("untitled"),
@@ -130,6 +134,10 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                 workspace_root.clone(),
                 CancellationToken::new(),
             )
+            .with_approval_gate(Arc::new(CliApprovalGate::new(
+                resumed_session_id,
+                Some(workspace_root.clone()),
+            )) as SharedApprovalGate)
         } else {
             eprintln!("No session found. Starting new session.");
             create_new_session(
@@ -231,7 +239,14 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                                 workspace_root.clone(),
                                 session.session_id().to_string(),
                                 Arc::clone(&store),
-                            );
+                            )
+                            .with_approval_gate(Arc::new(
+                                CliApprovalGate::new(
+                                    session.session_id().to_string(),
+                                    Some(workspace_root.clone()),
+                                ),
+                            )
+                                as SharedApprovalGate);
                         }
                         "/switch" => {
                             if let Some(id) = parts.next() {
@@ -265,6 +280,7 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
 
                                 match loaded {
                                     Ok(Some((saved_session, messages))) => {
+                                        let switched_session_id = saved_session.id.clone();
                                         println!("Switched to session: {}", saved_session.id);
                                         session = AgentSession::from_saved(
                                             Arc::clone(&store),
@@ -273,7 +289,12 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                                             Arc::clone(&provider),
                                             workspace_root.clone(),
                                             CancellationToken::new(),
-                                        );
+                                        )
+                                        .with_approval_gate(Arc::new(CliApprovalGate::new(
+                                            switched_session_id,
+                                            Some(workspace_root.clone()),
+                                        ))
+                                            as SharedApprovalGate);
                                     }
                                     Ok(None) => eprintln!("Session not found."),
                                     Err(e) => eprintln!("Failed to switch sessions: {e}"),
@@ -503,7 +524,105 @@ fn create_new_session(
 ) -> AgentSession {
     let session_id = Uuid::new_v4().to_string();
 
-    AgentSession::new(provider, workspace_root, session_id, store)
+    AgentSession::new(provider, workspace_root.clone(), session_id.clone(), store)
+        .with_approval_gate(
+            Arc::new(CliApprovalGate::new(session_id, Some(workspace_root))) as SharedApprovalGate,
+        )
+}
+
+pub struct CliApprovalGate {
+    config: UserConfig,
+    workspace_root: Option<PathBuf>,
+    session_id: String,
+}
+
+impl CliApprovalGate {
+    pub fn new(session_id: String, workspace_root: Option<PathBuf>) -> Self {
+        let config = UserConfig::load(workspace_root.as_deref());
+        Self {
+            config,
+            workspace_root,
+            session_id,
+        }
+    }
+
+    fn record_approval(&self, command: &str) {
+        let Ok(store) = CapabilityStore::open_default() else {
+            return;
+        };
+        let Ok(request) = store.create_request(
+            &self.session_id,
+            None,
+            "shell_exec_approved",
+            None,
+            Some(command),
+            "User approved inline via CLI prompt",
+        ) else {
+            return;
+        };
+        let _ = store.approve(&request.id, CapabilityScope::Session);
+    }
+
+    fn sync_policy_if_enabled(&self) {
+        if !self.config.permissions.sync_policy_on_approve {
+            return;
+        }
+        let Some(workspace_root) = self.workspace_root.as_ref() else {
+            return;
+        };
+
+        let mut policy = match PolicyFile::load(workspace_root) {
+            Ok(policy) => policy,
+            Err(_) => return,
+        };
+
+        let added_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+
+        policy.capabilities.insert(
+            "shell_exec_approved".to_string(),
+            CapabilityPolicyEntry {
+                policy: "workspace".to_string(),
+                allowed_rhs: None,
+                allowed_ops: None,
+                added_at,
+            },
+        );
+
+        let _ = policy.save(workspace_root);
+    }
+}
+
+impl HumanApprovalGate for CliApprovalGate {
+    fn on_blocked(&self, _tool_name: &str, command: &str, reason: &str) -> GateDecision {
+        if self.config.permissions.headless {
+            return GateDecision::Deny;
+        }
+
+        eprintln!();
+        eprintln!("Agent wants to run a restricted command:");
+        eprintln!("  {command}");
+        eprintln!("Blocked: {reason}");
+        eprint!("Allow? [y]es / [a]lways remember (workspace) / [n]o: ");
+        let _ = std::io::stderr().flush();
+
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return GateDecision::Deny;
+        }
+
+        match line.trim() {
+            "y" | "Y" => GateDecision::Allow,
+            "a" | "A" => {
+                self.record_approval(command);
+                self.sync_policy_if_enabled();
+                GateDecision::AllowAndRemember
+            }
+            _ => GateDecision::Deny,
+        }
+    }
 }
 
 #[cfg(test)]
