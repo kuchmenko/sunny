@@ -25,6 +25,7 @@ pub mod types;
 pub use anthropic::oauth::{build_login_context, complete_login, LoginContext};
 pub use anthropic::AnthropicProvider;
 pub use error::LlmError;
+pub use openai::OpenAiProvider;
 pub use provider::LlmProvider;
 pub use stream::{StreamEvent, StreamResult};
 pub use tokenizer::{CharHeuristicCounter, TiktokenCounter, TokenCounter};

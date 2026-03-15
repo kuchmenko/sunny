@@ -321,6 +321,11 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Capabilities to grant to the subtask (format: 'shell_pipes:tail,grep'). Agent must already hold each capability it delegates."
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["quick", "standard", "deep"],
+                        "description": "Task complexity category. quick = simple mechanical work, standard = normal implementation, deep = complex reasoning. Determines which model runs the task."
                     }
                 },
                 "required": ["title", "description"]
@@ -732,6 +737,7 @@ pub fn build_tool_executor_with_capabilities(
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let category = parsed["category"].as_str().map(str::to_string);
                     let session_id = session_id.clone();
                     let current_task_id = task_id.clone();
 
@@ -800,6 +806,12 @@ pub fn build_tool_executor_with_capabilities(
                                         .map(|cap| serde_json::Value::String(cap.clone()))
                                         .collect(),
                                 ),
+                            );
+                        }
+                        if let Some(cat) = &category {
+                            metadata.insert(
+                                "category".to_string(),
+                                serde_json::Value::String(cat.clone()),
                             );
                         }
 

@@ -12,7 +12,7 @@ use crossterm::{
 };
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use sunny_mind::{AnthropicProvider, LlmProvider, StreamEvent};
+use sunny_mind::{AnthropicProvider, LlmProvider, OpenAiProvider, StreamEvent};
 use sunny_store::{Database, SessionStore};
 use sunny_tasks::worker::WorkerAction;
 use sunny_tasks::{
@@ -24,8 +24,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use sunny_boys::{
-    AgentSession, ExecutionOutcome, GateDecision, HumanApprovalGate, SharedApprovalGate,
-    TaskExecutor,
+    AgentSession, ExecutionOutcome, GateDecision, HumanApprovalGate, ProviderRegistry,
+    SharedApprovalGate, TaskExecutor,
 };
 
 use crate::commands::task_events::TaskProgressEvent;
@@ -233,6 +233,49 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                 }
             };
             let provider: Arc<dyn LlmProvider> = Arc::new(provider);
+
+            // Build provider registry for category-based model routing.
+            let models_config = {
+                let cfg = UserConfig::load(None);
+                cfg.models
+            };
+            let mut registry = ProviderRegistry::new(models_config.clone());
+
+            // Register all Anthropic models using the same credentials.
+            for model_name in [
+                models_config.quick.as_str(),
+                models_config.standard.as_str(),
+                models_config.default.as_str(),
+            ] {
+                if model_name.starts_with("claude") {
+                    if let Ok(p) = AnthropicProvider::new(model_name) {
+                        registry.register(Arc::new(p) as Arc<dyn LlmProvider>);
+                    }
+                }
+            }
+            // Register claude-opus-4-6 and claude-haiku-4-5 explicitly.
+            for model_name in ["claude-opus-4-6", "claude-haiku-4-5", "claude-sonnet-4-6"] {
+                if let Ok(p) = AnthropicProvider::new(model_name) {
+                    registry.register_with_key(model_name, Arc::new(p) as Arc<dyn LlmProvider>);
+                }
+            }
+            // Try to register OpenAI models (skip silently if no credentials).
+            for model_name in [
+                models_config.deep.as_str(),
+                "gpt-5.4",
+                "gpt-5.3-codex",
+                "gpt-5.3-codex-spark",
+            ] {
+                if model_name.starts_with("gpt") {
+                    if let Ok(p) = OpenAiProvider::new(model_name) {
+                        registry.register_with_key(model_name, Arc::new(p) as Arc<dyn LlmProvider>);
+                    }
+                }
+            }
+            // Also register the primary provider under the executor model name as fallback.
+            registry.register_with_key(&executor_model, Arc::clone(&provider));
+
+            let registry = Arc::new(registry);
             let semaphore = Arc::new(tokio::sync::Semaphore::new(worker_max_concurrent));
 
             let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -260,6 +303,7 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                     };
 
                     let task_cancel = executor_cancel.child_token();
+                    let registry = Arc::clone(&registry);
                     let provider = Arc::clone(&provider);
                     let git_root = executor_git_root.clone();
                     let progress_tx = progress_tx_for_executor.clone();
@@ -278,7 +322,14 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                             }
                         };
 
-                        let executor = TaskExecutor::new(provider);
+                        // Resolve provider based on task category metadata.
+                        let task_category = event.task.metadata.as_ref()
+                            .and_then(|m| m.get("category"))
+                            .and_then(|v| v.as_str());
+                        let resolved_provider = registry
+                            .resolve_for_category(task_category)
+                            .unwrap_or_else(|| Arc::clone(&provider));
+                        let executor = TaskExecutor::new(resolved_provider);
                         let task_id = event.task.id.clone();
                         let title = event.task.title.clone();
                         let _ = progress_tx.send(TaskProgressEvent::Started {

@@ -38,6 +38,61 @@ impl Default for TasksConfig {
     }
 }
 
+/// Model routing configuration — maps complexity categories to model names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsConfig {
+    /// Model for quick, mechanical work (file reads, small edits, formatting).
+    #[serde(default = "default_quick")]
+    pub quick: String,
+    /// Model for standard implementation work (functions, tests, moderate logic).
+    #[serde(default = "default_standard")]
+    pub standard: String,
+    /// Model for deep reasoning (architecture, multi-file refactoring, debugging).
+    #[serde(default = "default_deep")]
+    pub deep: String,
+    /// Fallback model when no category matches or category is absent.
+    #[serde(default = "default_default")]
+    pub default: String,
+}
+
+fn default_quick() -> String {
+    "claude-haiku-4-5".into()
+}
+fn default_standard() -> String {
+    "claude-sonnet-4-6".into()
+}
+fn default_deep() -> String {
+    "gpt-5.4".into()
+}
+fn default_default() -> String {
+    "claude-sonnet-4-6".into()
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            quick: default_quick(),
+            standard: default_standard(),
+            deep: default_deep(),
+            default: default_default(),
+        }
+    }
+}
+
+impl ModelsConfig {
+    /// Resolve a category name to the configured model string.
+    ///
+    /// Returns `self.default` for any unrecognized category.
+    pub fn resolve_category(&self, category: &str) -> &str {
+        match category {
+            "quick" => &self.quick,
+            "standard" => &self.standard,
+            "deep" => &self.deep,
+            _ => &self.default,
+        }
+    }
+}
+
 /// Full user configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserConfig {
@@ -45,6 +100,9 @@ pub struct UserConfig {
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub tasks: TasksConfig,
+    /// Model routing configuration — maps categories to model strings.
+    #[serde(default)]
+    pub models: ModelsConfig,
 }
 
 impl UserConfig {
@@ -96,6 +154,28 @@ impl UserConfig {
                     workspace.tasks.max_concurrent
                 } else {
                     global.tasks.max_concurrent
+                },
+            },
+            models: ModelsConfig {
+                quick: if workspace.models.quick != default_quick() {
+                    workspace.models.quick
+                } else {
+                    global.models.quick
+                },
+                standard: if workspace.models.standard != default_standard() {
+                    workspace.models.standard
+                } else {
+                    global.models.standard
+                },
+                deep: if workspace.models.deep != default_deep() {
+                    workspace.models.deep
+                } else {
+                    global.models.deep
+                },
+                default: if workspace.models.default != default_default() {
+                    workspace.models.default
+                } else {
+                    global.models.default
                 },
             },
         }
