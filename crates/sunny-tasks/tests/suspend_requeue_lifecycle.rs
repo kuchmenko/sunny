@@ -88,7 +88,9 @@ fn make_store() -> (Arc<TaskStore>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = Database::open(dir.path().join("test.db").as_path()).expect("open db");
     ensure_task_tables(&db);
-    (Arc::new(TaskStore::new(db)), dir)
+    #[allow(clippy::arc_with_non_send_sync)]
+    let store = Arc::new(TaskStore::new(db));
+    (store, dir)
 }
 
 fn make_task_with_parent(
