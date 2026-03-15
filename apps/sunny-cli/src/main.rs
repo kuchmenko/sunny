@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use sunny_cli::commands::{ChatArgs, TasksArgs};
+use sunny_cli::commands::{ChatArgs, LoginArgs, TasksArgs};
 
 #[derive(Parser, Debug)]
 #[command(name = "sunny")]
@@ -17,8 +17,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Authenticate with Anthropic (Claude Max subscription required).
-    Login,
+    /// Authenticate with a provider (default: Anthropic, use --openai for OpenAI).
+    Login(LoginArgs),
     /// Manage autonomous task records in the current workspace.
     Tasks(TasksArgs),
 }
@@ -37,7 +37,7 @@ async fn main() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let result = match cli.command {
-        Some(Command::Login) => sunny_cli::commands::login::run().await,
+        Some(Command::Login(args)) => sunny_cli::commands::login::run(args).await,
         Some(Command::Tasks(args)) => sunny_cli::commands::tasks::run(args).await,
         None => sunny_cli::commands::chat::run(cli.chat).await,
     };
@@ -81,7 +81,7 @@ mod tests {
         let cli = Cli::try_parse_from(["sunny", "login"])
             .expect("sunny login should parse as subcommand");
         assert!(
-            matches!(cli.command, Some(Command::Login)),
+            matches!(cli.command, Some(Command::Login(_))),
             "login subcommand must be parsed as Command::Login"
         );
     }

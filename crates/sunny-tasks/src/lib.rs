@@ -12,7 +12,7 @@ pub mod worker;
 pub mod workspace;
 
 pub use capability_store::CapabilityStore;
-pub use config::UserConfig;
+pub use config::{ModelsConfig, UserConfig};
 pub use error::TaskError;
 pub use model::{
     capability_info, is_hard_blocked, AcceptCriteria, CapabilityInfo, CapabilityRequest,
