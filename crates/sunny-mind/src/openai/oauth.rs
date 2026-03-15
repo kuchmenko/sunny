@@ -29,8 +29,8 @@ use super::credentials::{save_credentials, CredentialSource, OpenAiCredentials};
 const OPENAI_ISSUER: &str = "https://auth.openai.com";
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const SCOPE: &str = "openid profile email offline_access";
-/// Codex CLI client ID — used as reference until we register our own.
-const CLIENT_ID: &str = "app_EMG3wWh0vb8C7AMKHOGb0bUh";
+/// Codex CLI public client ID (Apache-2.0, from openai/codex).
+const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CALLBACK_PORT: u16 = 1455;
 
 /// Context returned by [`build_login_context`].
