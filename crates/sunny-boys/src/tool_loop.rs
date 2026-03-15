@@ -78,13 +78,13 @@ pub struct ToolCallResult {
     pub metrics: ToolCallMetrics,
 }
 
-const MAX_RECOVERABLE_ERROR_STREAK: usize = 3;
+pub(crate) const MAX_RECOVERABLE_ERROR_STREAK: usize = 3;
 
-fn is_recoverable_tool_error(err: &ToolError) -> bool {
+pub(crate) fn is_recoverable_tool_error(err: &ToolError) -> bool {
     matches!(err, ToolError::DirectoryReadUnsupported { .. })
 }
 
-fn recoverable_tool_error_payload(err: &ToolError) -> String {
+pub(crate) fn recoverable_tool_error_payload(err: &ToolError) -> String {
     serde_json::json!({
         "ok": false,
         "recoverable": true,
@@ -94,14 +94,14 @@ fn recoverable_tool_error_payload(err: &ToolError) -> String {
     .to_string()
 }
 
-fn recoverable_error_kind(err: &ToolError) -> &'static str {
+pub(crate) fn recoverable_error_kind(err: &ToolError) -> &'static str {
     match err {
         ToolError::DirectoryReadUnsupported { .. } => "directory_read_unsupported",
         _ => "unknown",
     }
 }
 
-fn recoverable_error_fingerprint(tool_name: &str, err: &ToolError) -> String {
+pub(crate) fn recoverable_error_fingerprint(tool_name: &str, err: &ToolError) -> String {
     match err {
         ToolError::DirectoryReadUnsupported { path } => {
             format!("{tool_name}:directory_read_unsupported:{path}")
