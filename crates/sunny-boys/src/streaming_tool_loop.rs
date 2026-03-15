@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +12,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info_span, Instrument};
 
 use crate::timeouts::{tool_call_timeout, tool_provider_timeout};
-use crate::tool_loop::{ToolCallError, ToolExecutor};
+use crate::tool_loop::{
+    is_recoverable_tool_error, recoverable_error_fingerprint, recoverable_error_kind,
+    recoverable_tool_error_payload, ToolCallError, ToolExecutor, MAX_RECOVERABLE_ERROR_STREAK,
+};
 
 // ADR: StreamingToolResult.messages addition (class L - public API change)
 //
@@ -45,6 +48,7 @@ pub struct StreamingToolLoop<P: LlmProvider + ?Sized> {
     cancel: CancellationToken,
     tool_timeout: Duration,
     provider_timeout: Duration,
+    dedup_tools: HashSet<String>,
 }
 
 impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
@@ -61,7 +65,13 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
             cancel,
             tool_timeout: tool_call_timeout(),
             provider_timeout: tool_provider_timeout(),
+            dedup_tools: HashSet::new(),
         }
+    }
+
+    pub fn with_dedup_tools(mut self, tools: HashSet<String>) -> Self {
+        self.dedup_tools = tools;
+        self
     }
 
     #[cfg(test)]
@@ -95,6 +105,9 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
         let mut content = String::new();
         let mut result_messages: Vec<ChatMessage> = Vec::new();
         let mut depth = 0usize;
+        let mut last_recoverable_error: Option<String> = None;
+        let mut recoverable_error_streak = 0usize;
+        let mut dedup_cache: HashMap<(String, String), String> = HashMap::new();
 
         loop {
             if self.cancel.is_cancelled() {
@@ -234,6 +247,18 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                 let call_id = tool_call.id.clone();
                 let call_name = tool_call.name.clone();
                 let call_arguments = tool_call.arguments.clone();
+                let dedup_key = (tool_call.name.clone(), tool_call.arguments.clone());
+                if self.dedup_tools.contains(&tool_call.name) {
+                    if let Some(cached) = dedup_cache.get(&dedup_key) {
+                        tracing::debug!(
+                            event = "tool.dedup.cache_hit",
+                            tool_name = %tool_call.name,
+                            "returning cached result"
+                        );
+                        tool_results.push((tool_call, cached.clone()));
+                        continue;
+                    }
+                }
                 let tool_result = timeout(self.tool_timeout, async move {
                     tokio::task::spawn_blocking(move || {
                         executor(&call_id, &call_name, &call_arguments, depth)
@@ -252,8 +277,36 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                     _ = self.cancel.cancelled() => return Err(ToolCallError::Cancelled),
                     tool_result = tool_result => tool_result,
                 } {
-                    Ok(Ok(result)) => tool_results.push((tool_call, result)),
-                    Ok(Err(source)) => return Err(ToolCallError::ToolExecution { source }),
+                    Ok(Ok(result)) => {
+                        last_recoverable_error = None;
+                        recoverable_error_streak = 0;
+                        if self.dedup_tools.contains(&tool_call.name) {
+                            dedup_cache.insert(dedup_key, result.clone());
+                        }
+                        tool_results.push((tool_call, result));
+                    }
+                    Ok(Err(source)) => {
+                        if is_recoverable_tool_error(&source) {
+                            let fingerprint =
+                                recoverable_error_fingerprint(&tool_call.name, &source);
+                            if last_recoverable_error.as_deref() == Some(fingerprint.as_str()) {
+                                recoverable_error_streak += 1;
+                            } else {
+                                last_recoverable_error = Some(fingerprint);
+                                recoverable_error_streak = 1;
+                            }
+                            if recoverable_error_streak >= MAX_RECOVERABLE_ERROR_STREAK {
+                                return Err(ToolCallError::RecoverableErrorStreak {
+                                    tool_name: tool_call.name,
+                                    error_kind: recoverable_error_kind(&source).to_string(),
+                                    count: recoverable_error_streak,
+                                });
+                            }
+                            tool_results.push((tool_call, recoverable_tool_error_payload(&source)));
+                        } else {
+                            return Err(ToolCallError::ToolExecution { source });
+                        }
+                    }
                     Err(_) => {
                         return Err(ToolCallError::ToolTimeout {
                             tool_name: tool_call.name,
@@ -297,11 +350,11 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
     use std::sync::Arc;
     use std::time::Duration;
 
-    use sunny_core::tool::ToolPolicy;
+    use sunny_core::tool::{ToolError, ToolPolicy};
     use sunny_mind::{
         ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, StreamEvent, StreamResult,
         TokenUsage,
@@ -783,5 +836,230 @@ mod tests {
             Ok(_) => panic!("expected tool timeout error"),
             Err(other) => panic!("unexpected error variant: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_tool_loop_continues_on_recoverable_tool_error() {
+        let provider = Arc::new(MockStreamProvider::new(vec![
+            vec![
+                Ok(mk_tool_start("call-1", "fs_read")),
+                Ok(mk_tool_complete("call-1", "fs_read", "{}")),
+                Ok(mk_done()),
+            ],
+            vec![Ok(mk_content("result")), Ok(mk_done())],
+        ]));
+        let loop_runner = StreamingToolLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            4,
+            mk_cancel_token(),
+        );
+
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executions_clone = executions.clone();
+        let result = loop_runner
+            .run(
+                mk_request(),
+                Arc::new(move |_, _, _, _| {
+                    let call = executions_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if call == 0 {
+                        Err(ToolError::DirectoryReadUnsupported {
+                            path: "dir/".to_string(),
+                        })
+                    } else {
+                        Ok("result".to_string())
+                    }
+                }),
+                |_| {},
+            )
+            .await
+            .expect("recoverable tool error should not abort streaming loop");
+
+        assert_eq!(result.content, "result");
+        assert_eq!(result.metrics.iterations, 2);
+        let requests = provider.requests().await;
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_tool_loop_fails_on_repeated_recoverable_error_streak() {
+        let provider = Arc::new(MockStreamProvider::new(vec![
+            vec![
+                Ok(mk_tool_start("call-1", "fs_read")),
+                Ok(mk_tool_complete("call-1", "fs_read", "{}")),
+                Ok(mk_done()),
+            ],
+            vec![
+                Ok(mk_tool_start("call-2", "fs_read")),
+                Ok(mk_tool_complete("call-2", "fs_read", "{}")),
+                Ok(mk_done()),
+            ],
+            vec![
+                Ok(mk_tool_start("call-3", "fs_read")),
+                Ok(mk_tool_complete("call-3", "fs_read", "{}")),
+                Ok(mk_done()),
+            ],
+            vec![Ok(mk_content("unreachable")), Ok(mk_done())],
+        ]));
+        let loop_runner =
+            StreamingToolLoop::new(provider, ToolPolicy::default_ask(), 10, mk_cancel_token());
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                Arc::new(|_, _, _, _| {
+                    Err(ToolError::DirectoryReadUnsupported {
+                        path: "dir/".to_string(),
+                    })
+                }),
+                |_| {},
+            )
+            .await;
+
+        match result {
+            Err(ToolCallError::RecoverableErrorStreak {
+                tool_name,
+                error_kind,
+                count,
+            }) => {
+                assert_eq!(tool_name, "fs_read");
+                assert_eq!(error_kind, "directory_read_unsupported");
+                assert_eq!(count, 3);
+            }
+            Ok(_) => panic!("expected recoverable error streak failure"),
+            Err(other) => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_tool_loop_resets_recoverable_error_streak_after_success() {
+        let provider = Arc::new(MockStreamProvider::new(vec![
+            vec![
+                Ok(mk_tool_start("call-1", "fs_read")),
+                Ok(mk_tool_complete("call-1", "fs_read", "{}")),
+                Ok(mk_done()),
+            ],
+            vec![
+                Ok(mk_tool_start("call-2", "fs_read")),
+                Ok(mk_tool_complete("call-2", "fs_read", "{}")),
+                Ok(mk_done()),
+            ],
+            vec![
+                Ok(mk_tool_start("call-3", "fs_read")),
+                Ok(mk_tool_complete("call-3", "fs_read", "{}")),
+                Ok(mk_done()),
+            ],
+            vec![
+                Ok(mk_tool_start("call-4", "fs_read")),
+                Ok(mk_tool_complete("call-4", "fs_read", "{}")),
+                Ok(mk_done()),
+            ],
+            vec![Ok(mk_content("done")), Ok(mk_done())],
+        ]));
+        let loop_runner =
+            StreamingToolLoop::new(provider, ToolPolicy::default_ask(), 10, mk_cancel_token());
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                Arc::new(|id, _, _, _| {
+                    if id == "call-3" {
+                        Ok("result".to_string())
+                    } else {
+                        Err(ToolError::DirectoryReadUnsupported {
+                            path: "dir/".to_string(),
+                        })
+                    }
+                }),
+                |_| {},
+            )
+            .await
+            .expect("recoverable error streak should reset after success");
+
+        assert_eq!(result.content, "done");
+        assert_eq!(result.metrics.iterations, 5);
+        assert_eq!(result.metrics.total_tool_calls, 4);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_tool_loop_dedup_cache_hit() {
+        let provider = Arc::new(MockStreamProvider::new(vec![
+            vec![
+                Ok(mk_content("first ")),
+                Ok(mk_tool_start("call-1", "fs_read")),
+                Ok(mk_tool_complete("call-1", "fs_read", "{\"path\":\"a.rs\"}")),
+                Ok(mk_done()),
+            ],
+            vec![
+                Ok(mk_content("second ")),
+                Ok(mk_tool_start("call-2", "fs_read")),
+                Ok(mk_tool_complete("call-2", "fs_read", "{\"path\":\"a.rs\"}")),
+                Ok(mk_done()),
+            ],
+            vec![Ok(mk_content("done")), Ok(mk_done())],
+        ]));
+
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executions_clone = executions.clone();
+        let loop_runner =
+            StreamingToolLoop::new(provider, ToolPolicy::default_ask(), 5, mk_cancel_token())
+                .with_dedup_tools(HashSet::from(["fs_read".to_string()]));
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                Arc::new(move |_, _, _, _| {
+                    executions_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok("file content".to_string())
+                }),
+                |_| {},
+            )
+            .await
+            .expect("streaming loop should reuse cached tool result");
+
+        assert_eq!(result.content, "first second done");
+        assert_eq!(result.metrics.total_tool_calls, 2);
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_tool_loop_no_dedup_non_eligible() {
+        let provider = Arc::new(MockStreamProvider::new(vec![
+            vec![
+                Ok(mk_content("first ")),
+                Ok(mk_tool_start("call-1", "fs_scan")),
+                Ok(mk_tool_complete("call-1", "fs_scan", "{}")),
+                Ok(mk_done()),
+            ],
+            vec![
+                Ok(mk_content("second ")),
+                Ok(mk_tool_start("call-2", "fs_scan")),
+                Ok(mk_tool_complete("call-2", "fs_scan", "{}")),
+                Ok(mk_done()),
+            ],
+            vec![Ok(mk_content("done")), Ok(mk_done())],
+        ]));
+
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executions_clone = executions.clone();
+        let loop_runner =
+            StreamingToolLoop::new(provider, ToolPolicy::default_ask(), 5, mk_cancel_token())
+                .with_dedup_tools(HashSet::from(["fs_read".to_string()]));
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                Arc::new(move |_, _, _, _| {
+                    executions_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok("scan result".to_string())
+                }),
+                |_| {},
+            )
+            .await
+            .expect("streaming loop should execute non-eligible tool twice");
+
+        assert_eq!(result.content, "first second done");
+        assert_eq!(result.metrics.total_tool_calls, 2);
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

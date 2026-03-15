@@ -13,7 +13,9 @@ use sunny_store::{SavedSession, SessionStore, TokenBudget};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::tools::{build_tool_definitions, build_tool_executor, build_tool_policy};
+use super::tools::{
+    build_tool_definitions, build_tool_executor_with_capabilities, build_tool_policy,
+};
 
 /// Maximum character budget for the conversation context.
 ///
@@ -46,6 +48,8 @@ pub struct AgentSession {
     session_id: String,
     #[allow(clippy::arc_with_non_send_sync)]
     store: Arc<SessionStore>,
+    task_id: Option<String>,
+    approval_gate: Option<crate::agent::approval::SharedApprovalGate>,
     is_new_session: bool,
     /// Whether to generate a title after the first exchange.
     /// True for new sessions, false for resumed sessions.
@@ -91,6 +95,21 @@ impl AgentSession {
             }
         }
 
+        // Task management guidance for chat mode.
+        // (Task execution sessions use TaskSession::build_system_prompt() instead.)
+        system_prompt.push_str(
+            "\n\n# Task Management\n\n\
+             You have access to a task management system for delegating and decomposing complex work:\n\
+             - task_create: Create subtasks for parallel or sequential work. Each subtask gets its own agent session.\n\
+             - task_list: See all tasks and their statuses.\n\
+             - task_get: Get detailed info about a specific task.\n\
+             - task_complete: Mark your current task as complete (only when executing a task).\n\
+             - task_fail: Mark your current task as failed (only when executing a task).\n\
+             \n\
+             When a task is complex, decompose it into smaller subtasks. Subtasks execute automatically in the background.\n\
+             After creating subtasks, you can continue working on other things. The system will execute them.",
+        );
+
         let messages = vec![ChatMessage {
             role: ChatRole::System,
             content: system_prompt,
@@ -107,6 +126,8 @@ impl AgentSession {
             cancel: CancellationToken::new(),
             session_id,
             store,
+            task_id: None,
+            approval_gate: None,
             is_new_session: true,
             generate_title: true,
         }
@@ -137,9 +158,23 @@ impl AgentSession {
             cancel,
             session_id: saved.id,
             store,
+            task_id: None,
+            approval_gate: None,
             is_new_session: false,
             generate_title: false,
         }
+    }
+
+    /// Set the task ID for this session. Tool calls will have access to this
+    /// task context without needing environment variables.
+    pub fn with_task(mut self, task_id: String) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
+
+    pub fn with_approval_gate(mut self, gate: crate::agent::approval::SharedApprovalGate) -> Self {
+        self.approval_gate = Some(gate);
+        self
     }
 
     /// Return a clone of the cancellation token for external cancellation.
@@ -202,13 +237,21 @@ impl AgentSession {
             tool_choice: Some(ToolChoice::Auto),
         };
 
-        let tool_executor: Arc<ToolExecutor> = build_tool_executor(self.root.clone());
+        let tool_executor: Arc<ToolExecutor> = build_tool_executor_with_capabilities(
+            self.root.clone(),
+            None,
+            self.task_id.clone(),
+            Some(self.session_id.clone()),
+            self.approval_gate.clone(),
+        );
+        let max_iterations = if self.task_id.is_some() { 50 } else { 15 };
         let loop_runner = StreamingToolLoop::new(
             Arc::clone(&self.provider),
             build_tool_policy(),
-            15,
+            max_iterations,
             self.cancel.clone(),
-        );
+        )
+        .with_dedup_tools(Self::dedup_eligible_tools());
 
         let result = loop_runner.run(request, tool_executor, on_event).await?;
         let content = result.content.clone();
@@ -540,6 +583,22 @@ impl AgentSession {
         }
 
         self.trim_context();
+    }
+
+    fn dedup_eligible_tools() -> HashSet<String> {
+        [
+            "fs_read",
+            "fs_scan",
+            "text_grep",
+            "grep_files",
+            "git_log",
+            "git_diff",
+            "git_status",
+            "codebase_search",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 }
 
@@ -1104,5 +1163,30 @@ mod tests {
             "Not enough messages to compact (need more than 5 turns)."
         );
         assert_eq!(session.messages, before);
+    }
+
+    #[tokio::test]
+    async fn test_chat_session_system_prompt_contains_task_guidance() {
+        let dir = tempdir().expect("should create temp dir");
+        let session = make_session_in(&dir);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].role, ChatRole::System);
+        let content = &session.messages[0].content;
+        assert!(
+            content.contains("task_create"),
+            "system prompt should mention task_create"
+        );
+        assert!(
+            content.contains("task_list"),
+            "system prompt should mention task_list"
+        );
+        assert!(
+            content.contains("task_get"),
+            "system prompt should mention task_get"
+        );
+        assert!(
+            content.contains("Task Management"),
+            "system prompt should have Task Management section"
+        );
     }
 }

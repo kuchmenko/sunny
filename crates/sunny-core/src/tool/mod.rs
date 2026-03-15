@@ -17,7 +17,7 @@ pub use fs_write::{FileWriter, WriteResult};
 pub use grep_files::{GrepFileMatch, GrepFiles};
 pub use path_guard::PathGuard;
 pub use policy::ToolPolicy;
-pub use shell_exec::{ExecResult, ShellExecutor};
+pub use shell_exec::{CapabilityChecker, ExecResult, ShellExecutor};
 pub use text_grep::{GrepMatch, GrepResult, TextGrep};
 
 #[cfg(test)]

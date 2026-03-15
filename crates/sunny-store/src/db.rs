@@ -107,6 +107,34 @@ impl Database {
             [],
         )?;
 
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS capability_requests (
+                id              TEXT PRIMARY KEY,
+                session_id      TEXT NOT NULL,
+                task_id         TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+                capability      TEXT NOT NULL,
+                requested_rhs   TEXT,
+                example_command TEXT,
+                reason          TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                scope           TEXT,
+                requested_at    TEXT NOT NULL,
+                resolved_at     TEXT,
+                resolved_by     TEXT
+            )",
+            [],
+        )?;
+
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cap_requests_session ON capability_requests(session_id, status)",
+            [],
+        )?;
+
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cap_requests_pending ON capability_requests(status) WHERE status = 'pending'",
+            [],
+        )?;
+
         Ok(())
     }
 }
@@ -125,13 +153,13 @@ mod tests {
 
         let count: i32 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sessions', 'messages', 'symbols')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sessions', 'messages', 'symbols', 'capability_requests')",
                 [],
                 |row| row.get(0),
             )
             .expect("should query table count");
 
-        assert_eq!(count, 3, "all 3 tables should be created");
+        assert_eq!(count, 4, "all 4 tables should be created");
     }
 
     #[test]

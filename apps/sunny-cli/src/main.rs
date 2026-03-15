@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use sunny_cli::commands::ChatArgs;
+use sunny_cli::commands::{ChatArgs, TasksArgs};
 
 #[derive(Parser, Debug)]
 #[command(name = "sunny")]
@@ -19,6 +19,8 @@ struct Cli {
 enum Command {
     /// Authenticate with Anthropic (Claude Max subscription required).
     Login,
+    /// Manage autonomous task records in the current workspace.
+    Tasks(TasksArgs),
 }
 
 #[tokio::main]
@@ -36,6 +38,7 @@ async fn main() {
 
     let result = match cli.command {
         Some(Command::Login) => sunny_cli::commands::login::run().await,
+        Some(Command::Tasks(args)) => sunny_cli::commands::tasks::run(args).await,
         None => sunny_cli::commands::chat::run(cli.chat).await,
     };
 
@@ -80,6 +83,16 @@ mod tests {
         assert!(
             matches!(cli.command, Some(Command::Login)),
             "login subcommand must be parsed as Command::Login"
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_tasks_subcommand() {
+        let cli = Cli::try_parse_from(["sunny", "tasks", "list"])
+            .expect("sunny tasks list should parse as subcommand");
+        assert!(
+            matches!(cli.command, Some(Command::Tasks(_))),
+            "tasks subcommand must be parsed as Command::Tasks"
         );
     }
 
