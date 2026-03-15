@@ -1,15 +1,20 @@
 //! Interactive REPL chat command (`sunny chat`).
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Args;
-use crossterm::{cursor, execute, style::Stylize, terminal};
+use crossterm::{
+    cursor, execute,
+    style::{Color, Print, ResetColor, SetForegroundColor, Stylize},
+    terminal, ExecutableCommand,
+};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use sunny_mind::{AnthropicProvider, LlmProvider, StreamEvent};
 use sunny_store::{Database, SessionStore};
+use sunny_tasks::worker::WorkerAction;
 use sunny_tasks::{
     CapabilityPolicyEntry, CapabilityScope, CapabilityStore, PolicyFile, TaskReadyEvent,
     TaskScheduler, TaskStore, UserConfig,
@@ -22,6 +27,8 @@ use sunny_boys::{
     AgentSession, ExecutionOutcome, GateDecision, HumanApprovalGate, SharedApprovalGate,
     TaskExecutor,
 };
+
+use crate::commands::task_events::TaskProgressEvent;
 
 /// Arguments for the `sunny chat` subcommand.
 #[derive(Args, Debug)]
@@ -162,6 +169,8 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
     let worker_config = UserConfig::load(Some(&workspace_root));
     let worker_max_concurrent = worker_config.tasks.max_concurrent;
     let worker_cancel = CancellationToken::new();
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<TaskProgressEvent>();
 
     {
         let (ready_tx, ready_rx_for_executor) =
@@ -214,6 +223,7 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
         let executor_cancel = worker_cancel.clone();
         let executor_model = args.model.clone();
         let executor_git_root = workspace_root.clone();
+        let progress_tx_for_executor = progress_tx.clone();
         std::thread::spawn(move || {
             let provider = match AnthropicProvider::new(&executor_model) {
                 Ok(provider) => provider,
@@ -252,6 +262,7 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                     let task_cancel = executor_cancel.child_token();
                     let provider = Arc::clone(&provider);
                     let git_root = executor_git_root.clone();
+                    let progress_tx = progress_tx_for_executor.clone();
 
                     tokio::task::spawn_local(async move {
                         let _permit = permit;
@@ -268,24 +279,64 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                         };
 
                         let executor = TaskExecutor::new(provider);
+                        let task_id = event.task.id.clone();
+                        let title = event.task.title.clone();
                         let outcome = executor
                             .execute(event.task.clone(), git_root, task_cancel)
                             .await;
 
                         match outcome {
-                            ExecutionOutcome::Completed { .. }
-                            | ExecutionOutcome::Failed { .. }
-                            | ExecutionOutcome::Cancelled => {
+                            ExecutionOutcome::Completed { summary } => {
+                                let _ = progress_tx.send(TaskProgressEvent::Completed {
+                                    task_id: task_id.clone(),
+                                    title: title.clone(),
+                                    summary,
+                                });
                                 let _ = sunny_tasks::worker::check_parent_requeue(
                                     &task_store,
-                                    &event.task.id,
+                                    &task_id,
+                                );
+                            }
+                            ExecutionOutcome::Failed { error } => {
+                                let _ = progress_tx.send(TaskProgressEvent::Failed {
+                                    task_id: task_id.clone(),
+                                    title: title.clone(),
+                                    error,
+                                });
+                                let _ = sunny_tasks::worker::check_parent_requeue(
+                                    &task_store,
+                                    &task_id,
+                                );
+                            }
+                            ExecutionOutcome::Cancelled => {
+                                let _ = sunny_tasks::worker::check_parent_requeue(
+                                    &task_store,
+                                    &task_id,
                                 );
                             }
                             ExecutionOutcome::NoTerminalAction => {
-                                let _ = sunny_tasks::worker::handle_no_terminal_action(
+                                let children_count = task_store
+                                    .list_children(&task_id)
+                                    .map(|children| children.len())
+                                    .unwrap_or(0);
+
+                                match sunny_tasks::worker::handle_no_terminal_action(
                                     &task_store,
-                                    &event.task.id,
-                                );
+                                    &task_id,
+                                ) {
+                                    Ok(WorkerAction::Suspended) => {
+                                        let _ = progress_tx.send(TaskProgressEvent::Suspended {
+                                            task_id,
+                                            title,
+                                            children_count,
+                                        });
+                                    }
+                                    Ok(WorkerAction::RequeuedImmediately) => {
+                                        let _ = progress_tx
+                                            .send(TaskProgressEvent::Requeued { task_id, title });
+                                    }
+                                    Ok(WorkerAction::Failed(_)) | Err(_) => {}
+                                }
                             }
                             _ => {}
                         }
@@ -516,6 +567,10 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                 if let Err(e) = result {
                     eprintln!("Error: {e}");
                 }
+
+                while let Ok(event) = progress_rx.try_recv() {
+                    render_task_event(&event);
+                }
             }
             Err(ReadlineError::Interrupted) => {
                 // Ctrl+C — cancel current request (if running), continue REPL.
@@ -575,6 +630,85 @@ fn handle_stream_event(
     }
 
     Ok(())
+}
+
+fn render_task_event(event: &TaskProgressEvent) {
+    if std::io::stderr().is_terminal() {
+        let mut stderr = std::io::stderr();
+        let (color, line) = match event {
+            TaskProgressEvent::Started { title, .. } => {
+                (Color::DarkGrey, format!("[task] started: {title}\n"))
+            }
+            TaskProgressEvent::Completed { title, summary, .. } => (
+                Color::Green,
+                format!("[task] completed: {title} - {summary}\n"),
+            ),
+            TaskProgressEvent::Failed { title, error, .. } => {
+                (Color::Red, format!("[task] failed: {title} - {error}\n"))
+            }
+            TaskProgressEvent::Suspended {
+                title,
+                children_count,
+                ..
+            } => (
+                Color::Yellow,
+                format!("[task] suspended: {title} (awaiting {children_count} children)\n"),
+            ),
+            TaskProgressEvent::Requeued { title, .. } => {
+                (Color::Cyan, format!("[task] resumed: {title}\n"))
+            }
+        };
+
+        let _ = stderr
+            .execute(SetForegroundColor(color))
+            .and_then(|stderr| stderr.execute(Print(line)))
+            .and_then(|stderr| stderr.execute(ResetColor));
+    } else {
+        match event {
+            TaskProgressEvent::Started { task_id, title } => {
+                tracing::info!(task_id = %task_id, title = %title, event = "task.started")
+            }
+            TaskProgressEvent::Completed {
+                task_id,
+                title,
+                summary,
+            } => {
+                tracing::info!(
+                    task_id = %task_id,
+                    title = %title,
+                    summary = %summary,
+                    event = "task.completed"
+                )
+            }
+            TaskProgressEvent::Failed {
+                task_id,
+                title,
+                error,
+            } => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    title = %title,
+                    error = %error,
+                    event = "task.failed"
+                )
+            }
+            TaskProgressEvent::Suspended {
+                task_id,
+                title,
+                children_count,
+            } => {
+                tracing::info!(
+                    task_id = %task_id,
+                    title = %title,
+                    children_count = %children_count,
+                    event = "task.suspended"
+                )
+            }
+            TaskProgressEvent::Requeued { task_id, title } => {
+                tracing::info!(task_id = %task_id, title = %title, event = "task.requeued")
+            }
+        }
+    }
 }
 
 fn should_rerender_markdown(response_text: &str, stream_completed: bool) -> bool {
