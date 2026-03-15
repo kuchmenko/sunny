@@ -107,6 +107,15 @@ impl TaskExecutor {
         #[allow(clippy::arc_with_non_send_sync)]
         let store = Arc::new(SessionStore::new(db));
 
+        // Create the session row BEFORE mark_running so the FK constraint on
+        // tasks.session_id → sessions.id is satisfied. mark_started() will call
+        // mark_running() which sets session_id on the task row.
+        let working_dir = git_root.to_string_lossy().to_string();
+        let model = self.provider.model_id().to_string();
+        if let Err(error) = store.create_session_with_id(&session_id, &working_dir, Some(&model)) {
+            warn!(session_id = %session_id, error = %error, "failed to pre-create session row before mark_running");
+        }
+
         if let Err(error) = task_session.mark_started(&session_id) {
             warn!(task_id = %task.id, error = %error, "failed to mark task started");
         }

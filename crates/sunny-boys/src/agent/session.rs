@@ -106,8 +106,15 @@ impl AgentSession {
              - task_complete: Mark your current task as complete (only when executing a task).\n\
              - task_fail: Mark your current task as failed (only when executing a task).\n\
              \n\
-             When a task is complex, decompose it into smaller subtasks. Subtasks execute automatically in the background.\n\
-             After creating subtasks, you can continue working on other things. The system will execute them.",
+             When given a complex task, act as a composer:\n\
+             1. Read 2-3 files to understand the structure (no more).\n\
+             2. Create focused subtasks immediately using task_create.\n\
+             3. Each subtask should have a clear description and acceptance criteria.\n\
+             4. Assign a category based on complexity:\n\
+                - \"quick\": Simple, mechanical work. File reads, grep, small edits, formatting.\n\
+                - \"standard\": Normal implementation work. Writing functions, tests, moderate logic.\n\
+                - \"deep\": Complex reasoning. Architecture decisions, multi-file refactoring, debugging.\n\
+             Do NOT try to do everything yourself. Delegate early, delegate often.",
         );
 
         let messages = vec![ChatMessage {
@@ -244,7 +251,7 @@ impl AgentSession {
             Some(self.session_id.clone()),
             self.approval_gate.clone(),
         );
-        let max_iterations = if self.task_id.is_some() { 50 } else { 15 };
+        let max_iterations = 1000;
         let loop_runner = StreamingToolLoop::new(
             Arc::clone(&self.provider),
             build_tool_policy(),
@@ -1187,6 +1194,30 @@ mod tests {
         assert!(
             content.contains("Task Management"),
             "system prompt should have Task Management section"
+        );
+        assert!(
+            content.contains("composer"),
+            "system prompt should mention composer delegation pattern"
+        );
+        assert!(
+            content.contains("\"quick\""),
+            "system prompt should describe quick category"
+        );
+        assert!(
+            content.contains("\"standard\""),
+            "system prompt should describe standard category"
+        );
+        assert!(
+            content.contains("\"deep\""),
+            "system prompt should describe deep category"
+        );
+        assert!(
+            !content.contains("claude-"),
+            "system prompt must not mention model names (claude-*)"
+        );
+        assert!(
+            !content.contains("gpt-"),
+            "system prompt must not mention model names (gpt-*)"
         );
     }
 }
