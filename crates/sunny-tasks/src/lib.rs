@@ -8,6 +8,7 @@ pub mod session;
 pub mod store;
 pub mod system_prompt;
 pub mod verifier;
+pub mod worker;
 pub mod workspace;
 
 pub use capability_store::CapabilityStore;
