@@ -95,6 +95,21 @@ impl AgentSession {
             }
         }
 
+        // Task management guidance for chat mode.
+        // (Task execution sessions use TaskSession::build_system_prompt() instead.)
+        system_prompt.push_str(
+            "\n\n# Task Management\n\n\
+             You have access to a task management system for delegating and decomposing complex work:\n\
+             - task_create: Create subtasks for parallel or sequential work. Each subtask gets its own agent session.\n\
+             - task_list: See all tasks and their statuses.\n\
+             - task_get: Get detailed info about a specific task.\n\
+             - task_complete: Mark your current task as complete (only when executing a task).\n\
+             - task_fail: Mark your current task as failed (only when executing a task).\n\
+             \n\
+             When a task is complex, decompose it into smaller subtasks. Subtasks execute automatically in the background.\n\
+             After creating subtasks, you can continue working on other things. The system will execute them.",
+        );
+
         let messages = vec![ChatMessage {
             role: ChatRole::System,
             content: system_prompt,
@@ -1148,5 +1163,30 @@ mod tests {
             "Not enough messages to compact (need more than 5 turns)."
         );
         assert_eq!(session.messages, before);
+    }
+
+    #[tokio::test]
+    async fn test_chat_session_system_prompt_contains_task_guidance() {
+        let dir = tempdir().expect("should create temp dir");
+        let session = make_session_in(&dir);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].role, ChatRole::System);
+        let content = &session.messages[0].content;
+        assert!(
+            content.contains("task_create"),
+            "system prompt should mention task_create"
+        );
+        assert!(
+            content.contains("task_list"),
+            "system prompt should mention task_list"
+        );
+        assert!(
+            content.contains("task_get"),
+            "system prompt should mention task_get"
+        );
+        assert!(
+            content.contains("Task Management"),
+            "system prompt should have Task Management section"
+        );
     }
 }
