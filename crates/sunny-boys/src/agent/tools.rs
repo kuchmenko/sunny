@@ -82,7 +82,7 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "shell_exec".to_string(),
-            description: "Execute a shell command in the workspace directory. Use for running builds, tests, linters, or other tools. Commands are subject to a safety denylist.".to_string(),
+            description: "Execute a shell command in the workspace directory. Use for builds, tests, linters, and inspection. Allowed commands: cargo, rustfmt, rustup, rustc, git, npm, npx, yarn, pnpm, node, python, python3, pip, pip3, uv, poetry, make, cmake, ls, cat, head, tail, wc, echo, pwd, grep, rg, ag, fd, jq, which, type, date, env, stat, du, df. Shell composition operators (; && || | $() backticks) are not permitted — run one command at a time.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
