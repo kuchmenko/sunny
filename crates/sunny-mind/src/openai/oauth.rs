@@ -122,6 +122,23 @@ pub async fn run_oauth_flow(client: &reqwest::Client) -> Result<OpenAiCredential
     Ok(creds)
 }
 
+/// CLI-oriented flow: wait for the browser callback, exchange code, save credentials.
+///
+/// Use [`build_login_context`] first to get the URL to display in the browser.
+/// Then call this function which waits on port 1455 and completes the exchange.
+///
+/// # Errors
+/// Returns `LlmError::AuthFailed` if the callback or token exchange fails.
+pub async fn complete_oauth_from_context(
+    client: &reqwest::Client,
+    ctx: &LoginContext,
+) -> Result<OpenAiCredentials, LlmError> {
+    let code = wait_for_callback(ctx.state.clone()).await?;
+    let creds = exchange_code(client, ctx, &code).await?;
+    save_credentials(&creds)?;
+    Ok(creds)
+}
+
 /// Exchange the auth code for OpenAI tokens + API key.
 pub async fn exchange_code(
     client: &reqwest::Client,
