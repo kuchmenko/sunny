@@ -19,10 +19,11 @@ pub(crate) mod timeouts;
 pub mod tool_loop;
 
 pub use agent::{
-    AgentError, AgentSession, AlwaysAllowGate, AlwaysDenyGate, ExecutionOutcome, GateDecision,
-    HumanApprovalGate, ProviderRegistry, SharedApprovalGate, TaskExecutor,
+    AgentError, AgentSession, AlwaysAllowGate, AlwaysDenyGate, CliApprovalGate, ExecutionOutcome,
+    GateDecision, HumanApprovalGate, InterviewRunner, ProviderRegistry, SharedApprovalGate,
+    TaskExecutor,
 };
-pub use git_tools::{GitDiff, GitLog, GitStatus};
+pub use git_tools::{GitBranch, GitCheckout, GitCommit, GitDiff, GitLog, GitStatus};
 pub use streaming_tool_loop::{StreamingToolLoop, StreamingToolMetrics, StreamingToolResult};
 pub use tool_loop::{ToolCallError, ToolCallLoop, ToolCallMetrics, ToolCallResult};
 

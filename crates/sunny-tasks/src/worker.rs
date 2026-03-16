@@ -215,6 +215,7 @@ mod tests {
                  CREATE TABLE IF NOT EXISTS tasks (
                     id                  TEXT PRIMARY KEY,
                     workspace_id        TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                    root_session_id     TEXT NOT NULL DEFAULT '',
                     parent_id           TEXT REFERENCES tasks(id) ON DELETE SET NULL,
                     title               TEXT NOT NULL,
                     description         TEXT NOT NULL DEFAULT '',
@@ -301,6 +302,7 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("create task")

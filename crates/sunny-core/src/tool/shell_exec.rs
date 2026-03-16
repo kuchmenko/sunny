@@ -10,6 +10,9 @@ use crate::events::{
 };
 use crate::tool::ToolError;
 
+/// Capabilities that can never be granted (hard policy).
+const HARD_BLOCKED_CAPABILITIES: &[&str] = &["write_outside_workspace", "shell_arbitrary"];
+
 /// Checks whether a named capability is active for the current session/task.
 pub trait CapabilityChecker: Send + Sync {
     /// Returns true if the capability is granted for the given pattern.
@@ -19,6 +22,11 @@ pub trait CapabilityChecker: Send + Sync {
 
     /// Returns a human-readable hint for the agent on how to request this capability.
     fn denied_hint(&self, capability: &str, pattern: Option<&str>) -> String;
+
+    /// Returns true if the capability is hard-blocked and can never be granted.
+    fn is_hard_blocked(&self, capability: &str) -> bool {
+        HARD_BLOCKED_CAPABILITIES.contains(&capability)
+    }
 }
 
 /// Default command timeout in seconds.
@@ -30,34 +38,8 @@ const MAX_OUTPUT_BYTES: usize = 102_400; // 100 KiB
 /// Truncation marker appended when output is cut.
 const TRUNCATION_MARKER: &str = "\n[OUTPUT TRUNCATED]";
 
-/// Commands permitted to execute via `shell_exec`.
-///
-/// Only the **first whitespace-delimited token** of the command is matched,
-/// so `"cargo"` permits `cargo build`, `cargo test`, etc. while still
-/// rejecting an unknown token like `cargobuild`.
-///
-/// Commands not starting with an allowed token are rejected with
-/// [`ToolError::CommandDenied`] before any process is spawned.
-const ALLOWLIST: &[&str] = &[
-    // Rust toolchain
-    "cargo", "rustfmt", "rustup", "rustc",
-    // Version control (broad operations not covered by git_log/diff/status tools)
-    "git", // JavaScript / Node
-    "npm", "npx", "yarn", "pnpm", "node", // Python / packaging
-    "python", "python3", "pip", "pip3", "uv", "poetry", // Build systems
-    "make", "cmake",
-    // Read-only file and text inspection
-    // (`find` is excluded — use fs_scan / grep_files tools instead)
-    "ls", "cat", "head", "tail", "wc", "echo", "pwd", "grep", "rg", "ag", "fd", "jq",
-    // Environment introspection
-    "which", "type", "date", "env", "stat", "du", "df",
-];
-
 /// Shell composition and substitution operators that are always rejected,
-/// regardless of the command prefix.
-///
-/// These prevent chaining an allowlisted prefix with an arbitrary second
-/// command: `cargo build; rm -rf ~` starts with `"cargo"` but is dangerous.
+/// unless `shell_pipes` capability is granted.
 const BLOCKED_OPERATORS: &[&str] = &[
     ";",  // sequential execution
     "&&", // conditional AND
@@ -68,10 +50,6 @@ const BLOCKED_OPERATORS: &[&str] = &[
     "\n", // newline-separated commands
 ];
 
-/// Pipe targets that are always permitted without any capability check.
-/// These are pure output formatters - they have zero side effects regardless
-/// of what command precedes them, and they are already in ALLOWLIST.
-const ALWAYS_ALLOWED_PIPE_RHS: &[&str] = &["tail", "head", "grep", "wc"];
 /// Environment variables injected into every spawned command.
 ///
 /// Prevents interactive prompts that would hang the timeout silently:
@@ -137,7 +115,7 @@ impl ShellExecutor {
     ///
     /// - `timeout_secs`: override default 30s timeout (`None` = use default)
     /// - Output is captured and truncated at 100 KiB per stream
-    /// - Commands are validated against an allowlist by first token
+    /// - Commands require `shell_exec` capability when a checker is configured
     pub async fn execute(
         &self,
         command: &str,
@@ -145,75 +123,48 @@ impl ShellExecutor {
     ) -> Result<ExecResult, ToolError> {
         info!(name: EVENT_TOOL_EXEC_START, tool_name = "shell_exec", command = command);
 
-        // Reject shell composition/substitution operators first.
-        // Checked before the allowlist so the error message is specific.
-        let cmd_trimmed = command.trim();
-        for op in BLOCKED_OPERATORS {
-            if !cmd_trimmed.contains(op) {
-                continue;
+        // Check hard-blocked capabilities first (before any other validation).
+        if let Some(ref checker) = self.checker {
+            if checker.is_hard_blocked("shell_arbitrary") {
+                let err = ToolError::CommandDenied {
+                    command: command.to_string(),
+                    reason: "hard-blocked capability: shell_arbitrary".to_string(),
+                };
+                info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "shell_exec", outcome = OUTCOME_ERROR, error_kind = "CommandDenied", error_message = %err);
+                return Err(err);
             }
+        }
 
-            if op == &"|" {
-                let rhs = cmd_trimmed
-                    .split('|')
-                    .nth(1)
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("");
-
-                // Always-allowed output shapers need no capability approval
-                if ALWAYS_ALLOWED_PIPE_RHS.contains(&rhs) && ALLOWLIST.contains(&rhs) {
-                    continue;
-                }
-
-                if let Some(ref checker) = self.checker {
-                    if checker.is_granted("shell_pipes", Some(rhs)) {
-                        if ALLOWLIST.contains(&rhs) {
-                            continue;
-                        }
-
-                        let err = ToolError::CommandDenied {
-                            command: command.to_string(),
-                            reason: format!("pipe target '{rhs}' is not in the command allowlist"),
-                        };
-                        info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "shell_exec", outcome = OUTCOME_ERROR, error_kind = "CommandDenied", error_message = %err);
-                        return Err(err);
-                    }
-
-                    let hint = checker.denied_hint("shell_pipes", Some(rhs));
-                    let err = ToolError::CommandDenied {
-                        command: command.to_string(),
-                        reason: hint,
-                    };
-                    info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "shell_exec", outcome = OUTCOME_ERROR, error_kind = "CommandDenied", error_message = %err);
-                    return Err(err);
-                }
+        // Reject shell composition/substitution operators unless shell_pipes
+        // capability is granted.
+        let cmd_trimmed = command.trim();
+        let has_pipes_cap = self
+            .checker
+            .as_ref()
+            .is_some_and(|checker| checker.is_granted("shell_pipes", None));
+        for op in BLOCKED_OPERATORS {
+            if has_pipes_cap || !cmd_trimmed.contains(op) {
+                continue;
             }
 
             let err = ToolError::CommandDenied {
                 command: command.to_string(),
-                reason: format!(
-                    "shell operator '{op}' is not permitted; use a single command without chaining"
-                ),
+                reason: format!("shell operator '{op}' requires shell_pipes capability"),
             };
             info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "shell_exec", outcome = OUTCOME_ERROR, error_kind = "CommandDenied", error_message = %err);
             return Err(err);
         }
 
-        // Validate the first token against the allowlist.
-        let first_token = cmd_trimmed.split_whitespace().next().unwrap_or("");
-        if !ALLOWLIST.contains(&first_token) {
-            let err = ToolError::CommandDenied {
-                command: command.to_string(),
-                reason: format!(
-                    "'{}' is not in the command allowlist; permitted commands: {}",
-                    first_token,
-                    ALLOWLIST.join(", ")
-                ),
-            };
-            info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "shell_exec", outcome = OUTCOME_ERROR, error_kind = "CommandDenied", error_message = %err);
-            return Err(err);
+        if let Some(checker) = &self.checker {
+            let binary_name = cmd_trimmed.split_whitespace().next().unwrap_or(command);
+            if !checker.is_granted("shell_exec", Some(binary_name)) {
+                let err = ToolError::CommandDenied {
+                    command: command.to_string(),
+                    reason: checker.denied_hint("shell_exec", Some(binary_name)),
+                };
+                info!(name: EVENT_TOOL_EXEC_ERROR, tool_name = "shell_exec", outcome = OUTCOME_ERROR, error_kind = "CommandDenied", error_message = %err);
+                return Err(err);
+            }
         }
 
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
@@ -272,10 +223,7 @@ impl ShellExecutor {
         }
     }
 
-    /// Execute `command` bypassing shell operator restrictions.
-    ///
-    /// Identical to `execute()` except that `BLOCKED_OPERATORS` are not checked.
-    /// The command allowlist still applies - only the first token is validated.
+    /// Execute `command` bypassing all policy checks.
     /// Use only after explicit human approval has been obtained.
     pub async fn execute_approved(
         &self,
@@ -283,21 +231,6 @@ impl ShellExecutor {
         timeout_secs: Option<u64>,
     ) -> Result<ExecResult, ToolError> {
         info!(name: EVENT_TOOL_EXEC_START, tool_name = "shell_exec_approved", command = command);
-
-        let cmd_trimmed = command.trim();
-
-        // Allowlist still applies - we approved the operator, not arbitrary commands
-        let first_token = cmd_trimmed.split_whitespace().next().unwrap_or("");
-        if !ALLOWLIST.contains(&first_token) {
-            let err = ToolError::CommandDenied {
-                command: command.to_string(),
-                reason: format!(
-                    "'{}' is not in the command allowlist even with approval",
-                    first_token
-                ),
-            };
-            return Err(err);
-        }
 
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
         let child = tokio::process::Command::new("sh")
@@ -348,21 +281,18 @@ mod tests {
     use super::*;
 
     struct MockCapabilityChecker {
-        grant_shell_pipes_tail: bool,
-        grant_all_shell_pipes: bool,
+        grant_shell_exec: bool,
+        grant_shell_pipes: bool,
+        hard_blocked_capabilities: Vec<String>,
     }
 
     impl CapabilityChecker for MockCapabilityChecker {
-        fn is_granted(&self, capability: &str, pattern: Option<&str>) -> bool {
-            if capability != "shell_pipes" {
-                return false;
+        fn is_granted(&self, capability: &str, _pattern: Option<&str>) -> bool {
+            match capability {
+                "shell_exec" => self.grant_shell_exec,
+                "shell_pipes" => self.grant_shell_pipes,
+                _ => false,
             }
-
-            if self.grant_all_shell_pipes {
-                return true;
-            }
-
-            pattern == Some("tail") && self.grant_shell_pipes_tail
         }
 
         fn denied_hint(&self, capability: &str, pattern: Option<&str>) -> String {
@@ -370,6 +300,11 @@ mod tests {
                 "capability '{capability}' denied for pattern '{}'",
                 pattern.unwrap_or_default()
             )
+        }
+
+        fn is_hard_blocked(&self, capability: &str) -> bool {
+            self.hard_blocked_capabilities
+                .contains(&capability.to_string())
         }
     }
 
@@ -385,10 +320,27 @@ mod tests {
         let result = exec
             .execute("echo hello", None)
             .await
-            .expect("echo is on the allowlist");
+            .expect("echo should execute without capability checker");
         assert!(result.stdout.contains("hello"));
         assert_eq!(result.exit_code, 0);
         assert!(!result.timed_out);
+    }
+
+    #[tokio::test]
+    async fn test_shell_arbitrary_command_with_capability() {
+        let dir = tempfile::tempdir().expect("test: create temp dir");
+        let checker = Arc::new(MockCapabilityChecker {
+            grant_shell_exec: true,
+            grant_shell_pipes: false,
+            hard_blocked_capabilities: vec![],
+        });
+        let exec = ShellExecutor::with_capabilities(dir.path().to_path_buf(), checker);
+
+        let result = exec
+            .execute("echo hello", None)
+            .await
+            .expect("shell_exec capability should allow arbitrary command");
+        assert!(result.stdout.contains("hello"));
     }
 
     #[tokio::test]
@@ -404,35 +356,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shell_executor_rejects_command_not_on_allowlist() {
-        let (_dir, exec) = setup();
-        // `sudo` is not on the allowlist
-        let result = exec.execute("sudo rm -rf /", None).await;
+    async fn test_shell_denied_without_capability() {
+        let dir = tempfile::tempdir().expect("test: create temp dir");
+        let checker = Arc::new(MockCapabilityChecker {
+            grant_shell_exec: false,
+            grant_shell_pipes: false,
+            hard_blocked_capabilities: vec![],
+        });
+        let exec = ShellExecutor::with_capabilities(dir.path().to_path_buf(), checker);
+
+        let result = exec.execute("ls", None).await;
         assert!(result.is_err());
         let err = result.expect_err("test: expected CommandDenied");
         assert!(matches!(err, ToolError::CommandDenied { .. }));
         if let ToolError::CommandDenied { reason, .. } = err {
             assert!(
-                reason.contains("sudo"),
-                "reason should name the rejected token"
+                reason.contains("shell_exec"),
+                "reason should indicate shell_exec capability denial"
             );
         }
     }
 
     #[tokio::test]
-    async fn test_shell_executor_rejects_empty_command() {
-        let (_dir, exec) = setup();
-        let result = exec.execute("", None).await;
-        assert!(matches!(
-            result.expect_err("test: expected CommandDenied"),
-            ToolError::CommandDenied { .. }
-        ));
-    }
-
-    #[tokio::test]
     async fn test_shell_executor_blocks_semicolon_chaining() {
         let (_dir, exec) = setup();
-        // Allowlisted prefix + dangerous chained command
         let result = exec.execute("cargo build; rm -rf ~", None).await;
         assert!(result.is_err());
         let err = result.expect_err("test: expected CommandDenied");
@@ -457,8 +404,9 @@ mod tests {
     async fn test_shell_executor_pipe_allowed_with_capability() {
         let dir = tempfile::tempdir().expect("test: create temp dir");
         let checker = Arc::new(MockCapabilityChecker {
-            grant_shell_pipes_tail: false,
-            grant_all_shell_pipes: true,
+            grant_shell_exec: true,
+            grant_shell_pipes: true,
+            hard_blocked_capabilities: vec![],
         });
         let exec = ShellExecutor::with_capabilities(dir.path().to_path_buf(), checker);
 
@@ -472,14 +420,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shell_executor_allows_pipe_to_always_allowed_rhs() {
-        let (_dir, exec) = setup();
-        // echo "hello" | wc -l is always allowed (wc is in ALWAYS_ALLOWED_PIPE_RHS)
-        let result = exec.execute("echo hello | wc -l", None).await;
-        assert!(
-            result.is_ok(),
-            "pipe to wc should be allowed without capability: {result:?}"
-        );
+    async fn test_shell_pipes_with_capability() {
+        let dir = tempfile::tempdir().expect("test: create temp dir");
+        let checker = Arc::new(MockCapabilityChecker {
+            grant_shell_exec: true,
+            grant_shell_pipes: true,
+            hard_blocked_capabilities: vec![],
+        });
+        let exec = ShellExecutor::with_capabilities(dir.path().to_path_buf(), checker);
+
+        let result = exec
+            .execute("echo hello | grep hello", None)
+            .await
+            .expect("shell_pipes capability should permit operators");
+        assert!(result.stdout.contains("hello"));
     }
 
     #[tokio::test]
@@ -491,28 +445,6 @@ mod tests {
             result.expect_err("test: expected CommandDenied"),
             ToolError::CommandDenied { .. }
         ));
-    }
-
-    #[tokio::test]
-    async fn test_shell_executor_pipe_denied_for_non_allowlisted_rhs() {
-        let dir = tempfile::tempdir().expect("test: create temp dir");
-        let checker = Arc::new(MockCapabilityChecker {
-            grant_shell_pipes_tail: true,
-            grant_all_shell_pipes: true,
-        });
-        let exec = ShellExecutor::with_capabilities(dir.path().to_path_buf(), checker);
-
-        let err = exec
-            .execute("echo hello | rm -rf /tmp/x", None)
-            .await
-            .expect_err("test: expected CommandDenied for non-allowlisted rhs");
-
-        match err {
-            ToolError::CommandDenied { reason, .. } => {
-                assert!(reason.contains("pipe target 'rm' is not in the command allowlist"));
-            }
-            other => panic!("unexpected error: {other}"),
-        }
     }
 
     #[tokio::test]
@@ -551,7 +483,6 @@ mod tests {
     #[tokio::test]
     async fn test_shell_executor_nonzero_exit_is_not_an_error() {
         let (_dir, exec) = setup();
-        // `ls /nonexistent` is allowed but exits nonzero — that is not a ToolError
         let result = exec
             .execute("ls /nonexistent_path_xyz", None)
             .await
@@ -568,7 +499,7 @@ mod tests {
                 None,
             )
             .await
-            .expect("echo is on the allowlist");
+            .expect("echo should execute without capability checker");
         assert!(result.stdout.contains("CI=true"), "CI should be set");
         assert!(
             result.stdout.contains("GIT_TERMINAL_PROMPT=0"),
@@ -592,11 +523,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shell_executor_execute_approved_still_enforces_allowlist() {
+    async fn test_shell_executor_execute_approved_skips_all_checks() {
         let (_dir, exec) = setup();
         let result = exec
             .execute_approved("curl https://example.com", None)
             .await;
-        assert!(matches!(result, Err(ToolError::CommandDenied { .. })));
+        assert!(result.is_ok(), "approved exec should bypass all checks");
+    }
+
+    #[tokio::test]
+    async fn test_shell_hard_blocked_command_rejected_before_approval() {
+        let dir = tempfile::tempdir().expect("test: create temp dir");
+        let checker = Arc::new(MockCapabilityChecker {
+            grant_shell_exec: true,
+            grant_shell_pipes: false,
+            hard_blocked_capabilities: vec!["shell_arbitrary".to_string()],
+        });
+        let exec = ShellExecutor::with_capabilities(dir.path().to_path_buf(), checker);
+
+        let result = exec.execute("echo hello", None).await;
+
+        assert!(result.is_err());
+        let err = result.expect_err("test: expected CommandDenied for hard-blocked");
+        match err {
+            ToolError::CommandDenied { reason, .. } => {
+                assert!(
+                    reason.contains("hard-blocked"),
+                    "reason should mention hard-block: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }

@@ -62,6 +62,15 @@ pub struct GitDiff;
 #[derive(Debug, Default)]
 pub struct GitStatus;
 
+#[derive(Debug, Default)]
+pub struct GitCommit;
+
+#[derive(Debug, Default)]
+pub struct GitBranch;
+
+#[derive(Debug, Default)]
+pub struct GitCheckout;
+
 impl GitLog {
     /// Run `git log --oneline -n {limit}` with optional extra flags.
     ///
@@ -115,6 +124,62 @@ impl GitStatus {
         cmd_args.extend(extra_refs);
 
         run_git(&cmd_args, root, "git_status")
+    }
+}
+
+impl GitCommit {
+    pub fn execute(
+        &self,
+        message: &str,
+        files: &[String],
+        root: &Path,
+    ) -> Result<String, ToolError> {
+        if !files.is_empty() {
+            let mut add_args = vec!["add"];
+            let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+            add_args.extend(file_refs);
+            run_git(&add_args, root, "git_commit")?;
+        }
+
+        let output = Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(root)
+            .output()
+            .map_err(|e| ToolError::ExecutionFailed {
+                source: Box::new(e),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ToolError::ExecutionFailed {
+                source: Box::new(std::io::Error::other(stderr.to_string())),
+            });
+        }
+
+        Ok(format!(
+            "Committed: {}",
+            truncate_output(String::from_utf8_lossy(&output.stdout).to_string())
+        ))
+    }
+}
+
+impl GitBranch {
+    pub fn execute(
+        &self,
+        name: &str,
+        base: Option<&str>,
+        root: &Path,
+    ) -> Result<String, ToolError> {
+        match base {
+            Some(base) => run_git(&["checkout", "-b", name, base], root, "git_branch"),
+            None => run_git(&["branch", name], root, "git_branch"),
+        }
+    }
+}
+
+impl GitCheckout {
+    pub fn execute(&self, target: &str, root: &Path) -> Result<String, ToolError> {
+        run_git(&["checkout", target], root, "git_checkout")
     }
 }
 

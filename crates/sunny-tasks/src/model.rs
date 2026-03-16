@@ -57,6 +57,7 @@ impl FromStr for TaskStatus {
 pub struct Task {
     pub id: String,
     pub workspace_id: String,
+    pub root_session_id: String,
     pub parent_id: Option<String>,
     pub title: String,
     pub description: String,
@@ -135,6 +136,7 @@ pub struct CreateTaskInput {
     pub dep_ids: Vec<String>,
     pub accept_criteria: Option<CreateAcceptCriteriaInput>,
     pub delegate_capabilities: Vec<String>,
+    pub root_session_id: String,
     pub metadata: Option<serde_json::Value>,
 }
 

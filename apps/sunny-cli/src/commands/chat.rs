@@ -17,7 +17,7 @@ use sunny_store::{Database, SessionStore};
 use sunny_tasks::worker::WorkerAction;
 use sunny_tasks::{
     CapabilityPolicyEntry, CapabilityScope, CapabilityStore, PolicyFile, TaskReadyEvent,
-    TaskScheduler, TaskStore, UserConfig,
+    TaskScheduler, TaskStatus, TaskStore, UserConfig,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -168,6 +168,7 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
 
     let worker_config = UserConfig::load(Some(&workspace_root));
     let worker_max_concurrent = worker_config.tasks.max_concurrent;
+    let scheduler_root_session_id = session.session_id().to_string();
     let worker_cancel = CancellationToken::new();
     let (progress_tx, mut progress_rx) =
         tokio::sync::mpsc::unbounded_channel::<TaskProgressEvent>();
@@ -178,6 +179,7 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
 
         let scheduler_cancel = worker_cancel.clone();
         let scheduler_git_root = workspace_root.clone();
+        let scheduler_root_session_id = scheduler_root_session_id.clone();
         std::thread::spawn(move || {
             let store = match TaskStore::open_default() {
                 Ok(store) => store,
@@ -202,9 +204,13 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
             }
 
             #[allow(clippy::arc_with_non_send_sync)]
-            let scheduler =
-                TaskScheduler::new(Arc::new(store), workspace.id, worker_max_concurrent)
-                    .with_ready_channel(ready_tx);
+            let scheduler = TaskScheduler::new(
+                Arc::new(store),
+                workspace.id,
+                worker_max_concurrent,
+                scheduler_root_session_id,
+            )
+            .with_ready_channel(ready_tx);
 
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -635,8 +641,74 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                     eprintln!("Error: {e}");
                 }
 
-                while let Ok(event) = progress_rx.try_recv() {
-                    render_task_event(&event);
+                let mut all_events = collect_and_render_events(&mut progress_rx);
+
+                let session_id = session.session_id().to_string();
+                let mut pending_count =
+                    count_pending_session_tasks(workspace_root.clone(), session_id.clone())
+                        .await
+                        .unwrap_or(0);
+
+                if pending_count > 0 {
+                    loop {
+                        if worker_cancel.is_cancelled() {
+                            break;
+                        }
+                        if pending_count == 0 {
+                            break;
+                        }
+
+                        let Some(event) = progress_rx.recv().await else {
+                            break;
+                        };
+                        render_task_event(&event);
+
+                        let is_terminal = matches!(
+                            event,
+                            TaskProgressEvent::Completed { .. } | TaskProgressEvent::Failed { .. }
+                        );
+                        all_events.push(event);
+
+                        if is_terminal {
+                            pending_count = count_pending_session_tasks(
+                                workspace_root.clone(),
+                                session_id.clone(),
+                            )
+                            .await
+                            .unwrap_or(0);
+                        }
+                    }
+                }
+
+                let already_reinvoked = false;
+                if !worker_cancel.is_cancelled() && !already_reinvoked {
+                    if let Some(results_msg) = build_results_message(&all_events) {
+                        let mut reinvoked_response = String::new();
+                        let mut reinvoked_lines = 0usize;
+                        let reinvoke_result = session
+                            .send(&results_msg, |event| {
+                                if let Err(err) = handle_stream_event(
+                                    event,
+                                    &mut reinvoked_response,
+                                    &mut reinvoked_lines,
+                                ) {
+                                    eprintln!("stream render error: {err}");
+                                }
+                            })
+                            .await;
+
+                        println!();
+
+                        if should_rerender_markdown(&reinvoked_response, reinvoke_result.is_ok()) {
+                            rerender_markdown_response(&reinvoked_response, reinvoked_lines)?;
+                        }
+
+                        if let Err(e) = reinvoke_result {
+                            eprintln!("Error: {e}");
+                        }
+
+                        all_events.extend(collect_and_render_events(&mut progress_rx));
+                    }
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -776,6 +848,71 @@ fn render_task_event(event: &TaskProgressEvent) {
             }
         }
     }
+}
+
+fn collect_and_render_events(
+    progress_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TaskProgressEvent>,
+) -> Vec<TaskProgressEvent> {
+    let mut events = Vec::new();
+    while let Ok(event) = progress_rx.try_recv() {
+        render_task_event(&event);
+        events.push(event);
+    }
+    events
+}
+
+fn build_results_message(events: &[TaskProgressEvent]) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut has_completed = false;
+    let mut has_terminal = false;
+
+    for event in events {
+        match event {
+            TaskProgressEvent::Completed { title, summary, .. } => {
+                has_completed = true;
+                has_terminal = true;
+                lines.push(format!("✓ {title}: {summary}"));
+            }
+            TaskProgressEvent::Failed { title, error, .. } => {
+                has_terminal = true;
+                lines.push(format!("✗ {title} (failed): {error}"));
+            }
+            _ => {}
+        }
+    }
+
+    if !has_terminal || !has_completed {
+        return None;
+    }
+
+    Some(format!(
+        "Your subtasks have completed. Here are the results:\n\n{}",
+        lines.join("\n")
+    ))
+}
+
+async fn count_pending_session_tasks(
+    workspace_root: PathBuf,
+    root_session_id: String,
+) -> anyhow::Result<usize> {
+    tokio::task::spawn_blocking(move || {
+        let store = TaskStore::open_default()?;
+        let git_root = workspace_root.to_string_lossy().to_string();
+        let workspace = store.find_or_create_workspace(&git_root)?;
+        let tasks = store.list_tasks(&workspace.id)?;
+
+        Ok(tasks
+            .into_iter()
+            .filter(|task| task.root_session_id == root_session_id)
+            .filter(|task| {
+                matches!(
+                    task.status,
+                    TaskStatus::Pending | TaskStatus::Running | TaskStatus::Suspended
+                )
+            })
+            .count())
+    })
+    .await?
 }
 
 fn should_rerender_markdown(response_text: &str, stream_completed: bool) -> bool {
@@ -943,25 +1080,37 @@ impl CliApprovalGate {
     }
 }
 
+#[async_trait::async_trait]
 impl HumanApprovalGate for CliApprovalGate {
-    fn on_blocked(&self, _tool_name: &str, command: &str, reason: &str) -> GateDecision {
+    async fn on_blocked(&self, _tool_name: &str, command: &str, reason: &str) -> GateDecision {
         if self.config.permissions.headless {
             return GateDecision::Deny;
         }
 
-        eprintln!();
-        eprintln!("Agent wants to run a restricted command:");
-        eprintln!("  {command}");
-        eprintln!("Blocked: {reason}");
-        eprint!("Allow? [y]es / [a]lways remember (workspace) / [n]o: ");
-        let _ = std::io::stderr().flush();
+        let command_text = command.to_string();
+        let reason_text = reason.to_string();
+        let response = match tokio::task::spawn_blocking(move || {
+            eprintln!();
+            eprintln!("Agent wants to run a restricted command:");
+            eprintln!("  {command_text}");
+            eprintln!("Blocked: {reason_text}");
+            eprint!("Allow? [y]es / [a]lways remember (workspace) / [n]o: ");
+            let _ = std::io::stderr().flush();
 
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_err() {
-            return GateDecision::Deny;
-        }
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                return None;
+            }
 
-        match line.trim() {
+            Some(line)
+        })
+        .await
+        {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => return GateDecision::Deny,
+        };
+
+        match response.trim() {
             "y" | "Y" => GateDecision::Allow,
             "a" | "A" => {
                 self.record_approval(command);
@@ -975,13 +1124,14 @@ impl HumanApprovalGate for CliApprovalGate {
 
 #[cfg(test)]
 mod tests {
+    use crate::commands::task_events::TaskProgressEvent;
     use clap::Parser;
     use sunny_mind::StreamEvent;
 
     use super::ChatArgs;
     use super::{
-        handle_stream_event, should_rerender_markdown, summarize_tool_arguments,
-        tool_call_complete_line, tool_call_start_line,
+        build_results_message, handle_stream_event, should_rerender_markdown,
+        summarize_tool_arguments, tool_call_complete_line, tool_call_start_line,
     };
 
     #[derive(Parser, Debug)]
@@ -1069,5 +1219,42 @@ mod tests {
             summarize_tool_arguments(arguments),
             "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz12345678"
         );
+    }
+
+    #[test]
+    fn test_build_results_message_with_completions() {
+        let events = vec![
+            TaskProgressEvent::Completed {
+                task_id: "task-1".to_string(),
+                title: "Write tests".to_string(),
+                summary: "Added regression coverage".to_string(),
+            },
+            TaskProgressEvent::Failed {
+                task_id: "task-2".to_string(),
+                title: "Run deploy".to_string(),
+                error: "permission denied".to_string(),
+            },
+        ];
+
+        let message = build_results_message(&events).expect("should build result message");
+        assert!(message.contains("Your subtasks have completed. Here are the results:"));
+        assert!(message.contains("✓ Write tests: Added regression coverage"));
+        assert!(message.contains("✗ Run deploy (failed): permission denied"));
+    }
+
+    #[test]
+    fn test_build_results_message_all_failed_returns_none() {
+        let events = vec![TaskProgressEvent::Failed {
+            task_id: "task-1".to_string(),
+            title: "Run deploy".to_string(),
+            error: "permission denied".to_string(),
+        }];
+
+        assert!(build_results_message(&events).is_none());
+    }
+
+    #[test]
+    fn test_build_results_message_empty_returns_none() {
+        assert!(build_results_message(&[]).is_none());
     }
 }

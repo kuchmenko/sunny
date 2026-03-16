@@ -85,12 +85,12 @@ impl TaskStore {
                 id, workspace_id, parent_id, title, description, status,
                 session_id, created_by, priority, created_at, updated_at,
                 started_at, completed_at, result_diff, result_summary, result_files,
-                result_verify, error, retry_count, max_retries, metadata
+                result_verify, error, retry_count, max_retries, metadata, root_session_id
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 NULL, ?7, ?8, ?9, ?10,
                 NULL, NULL, NULL, NULL, NULL,
-                NULL, NULL, 0, ?11, ?12
+                NULL, NULL, 0, ?11, ?12, ?13
             )",
             rusqlite::params![
                 task_id,
@@ -105,6 +105,7 @@ impl TaskStore {
                 now_str,
                 input.max_retries,
                 metadata_json,
+                input.root_session_id,
             ],
         )?;
 
@@ -129,7 +130,7 @@ impl TaskStore {
                     id, workspace_id, parent_id, title, description, status,
                     session_id, created_by, priority, created_at, updated_at,
                     started_at, completed_at, result_diff, result_summary, result_files,
-                    result_verify, error, retry_count, max_retries, metadata
+                    result_verify, error, retry_count, max_retries, metadata, root_session_id
                  FROM tasks WHERE id = ?1",
                 rusqlite::params![id],
                 row_to_task,
@@ -218,7 +219,7 @@ impl TaskStore {
                 id, workspace_id, parent_id, title, description, status,
                 session_id, created_by, priority, created_at, updated_at,
                 started_at, completed_at, result_diff, result_summary, result_files,
-                result_verify, error, retry_count, max_retries, metadata
+                result_verify, error, retry_count, max_retries, metadata, root_session_id
              FROM tasks
              WHERE workspace_id = ?1
              ORDER BY priority DESC, created_at ASC",
@@ -231,6 +232,7 @@ impl TaskStore {
     pub fn list_ready_tasks(
         &self,
         workspace_id: &str,
+        root_session_id: &str,
         limit: usize,
     ) -> Result<Vec<Task>, TaskError> {
         let mut stmt = self.db.connection().prepare(
@@ -238,9 +240,10 @@ impl TaskStore {
                 id, workspace_id, parent_id, title, description, status,
                 session_id, created_by, priority, created_at, updated_at,
                 started_at, completed_at, result_diff, result_summary, result_files,
-                result_verify, error, retry_count, max_retries, metadata
+                result_verify, error, retry_count, max_retries, metadata, root_session_id
              FROM tasks
              WHERE workspace_id = ?1
+               AND (root_session_id = ?2 OR root_session_id = '')
                AND status = 'pending'
                AND NOT EXISTS (
                  SELECT 1 FROM task_deps td
@@ -249,10 +252,13 @@ impl TaskStore {
                    AND dep.status != 'completed'
                )
              ORDER BY priority DESC, created_at ASC
-             LIMIT ?2",
+             LIMIT ?3",
         )?;
 
-        let rows = stmt.query_map(rusqlite::params![workspace_id, limit as i64], row_to_task)?;
+        let rows = stmt.query_map(
+            rusqlite::params![workspace_id, root_session_id, limit as i64],
+            row_to_task,
+        )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(TaskError::Db)
     }
 
@@ -262,7 +268,7 @@ impl TaskStore {
                 id, workspace_id, parent_id, title, description, status,
                 session_id, created_by, priority, created_at, updated_at,
                 started_at, completed_at, result_diff, result_summary, result_files,
-                result_verify, error, retry_count, max_retries, metadata
+                result_verify, error, retry_count, max_retries, metadata, root_session_id
              FROM tasks
              WHERE workspace_id = ?1 AND status = 'running'
              ORDER BY started_at ASC",
@@ -278,7 +284,7 @@ impl TaskStore {
                 id, workspace_id, parent_id, title, description, status,
                 session_id, created_by, priority, created_at, updated_at,
                 started_at, completed_at, result_diff, result_summary, result_files,
-                result_verify, error, retry_count, max_retries, metadata
+                result_verify, error, retry_count, max_retries, metadata, root_session_id
              FROM tasks
              WHERE parent_id = ?1
              ORDER BY created_at ASC",
@@ -318,7 +324,7 @@ impl TaskStore {
                 id, workspace_id, parent_id, title, description, status,
                 session_id, created_by, priority, created_at, updated_at,
                 started_at, completed_at, result_diff, result_summary, result_files,
-                result_verify, error, retry_count, max_retries, metadata
+                result_verify, error, retry_count, max_retries, metadata, root_session_id
              FROM tasks
              WHERE workspace_id = ?1 AND status = ?2
              ORDER BY created_at ASC",
@@ -624,6 +630,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
         id: row.get(0)?,
         workspace_id: row.get(1)?,
+        root_session_id: row.get(21)?,
         parent_id: row.get(2)?,
         title: row.get(3)?,
         description: row.get(4)?,
@@ -731,6 +738,7 @@ mod tests {
                 CREATE TABLE IF NOT EXISTS tasks (
                     id              TEXT PRIMARY KEY,
                     workspace_id    TEXT NOT NULL REFERENCES workspaces(id),
+                    root_session_id TEXT NOT NULL DEFAULT '',
                     parent_id       TEXT REFERENCES tasks(id),
                     title           TEXT NOT NULL,
                     description     TEXT NOT NULL,
@@ -816,6 +824,7 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create task")
@@ -871,6 +880,45 @@ mod tests {
     }
 
     #[test]
+    fn test_task_has_root_session_id() {
+        let (store, _dir) = make_store();
+        let workspace = make_workspace(&store);
+        let task = make_task(&store, &workspace.id, "task-a");
+
+        assert_eq!(task.root_session_id, "");
+    }
+
+    #[test]
+    fn test_create_task_stores_root_session_id() {
+        let (store, _dir) = make_store();
+        let workspace = make_workspace(&store);
+        let task = store
+            .create_task(CreateTaskInput {
+                workspace_id: workspace.id.clone(),
+                parent_id: None,
+                title: "task-with-root-session".to_string(),
+                description: "check root_session_id persistence".to_string(),
+                created_by: "human".to_string(),
+                priority: 0,
+                max_retries: 3,
+                dep_ids: vec![],
+                accept_criteria: None,
+                delegate_capabilities: vec![],
+                root_session_id: "chat-session-123".to_string(),
+                metadata: None,
+            })
+            .expect("should create task");
+
+        assert_eq!(task.root_session_id, "chat-session-123");
+
+        let loaded = store
+            .get_task(&task.id)
+            .expect("should load task")
+            .expect("task should exist");
+        assert_eq!(loaded.root_session_id, "chat-session-123");
+    }
+
+    #[test]
     fn test_list_ready_tasks_returns_only_pending_with_completed_deps() {
         let (store, _dir) = make_store();
         let workspace = make_workspace(&store);
@@ -891,6 +939,7 @@ mod tests {
                 dep_ids: vec![dep.id.clone()],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create task");
@@ -902,7 +951,7 @@ mod tests {
             .expect("should mark running");
 
         let ready_tasks = store
-            .list_ready_tasks(&workspace.id, 10)
+            .list_ready_tasks(&workspace.id, "", 10)
             .expect("should list ready tasks");
         assert_eq!(ready_tasks.len(), 1);
         assert_eq!(ready_tasks[0].id, ready.id);
@@ -926,12 +975,13 @@ mod tests {
                 dep_ids: vec![dep.id.clone()],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create blocked task");
 
         let ready_tasks = store
-            .list_ready_tasks(&workspace.id, 10)
+            .list_ready_tasks(&workspace.id, "", 10)
             .expect("should list ready tasks");
         assert!(ready_tasks.iter().all(|task| task.id != blocked.id));
     }
@@ -948,7 +998,7 @@ mod tests {
             .expect("should add dependency");
 
         let ready_tasks = store
-            .list_ready_tasks(&workspace.id, 10)
+            .list_ready_tasks(&workspace.id, "", 10)
             .expect("should list ready tasks");
         assert!(ready_tasks.iter().all(|t| t.id != task.id));
     }
@@ -1108,6 +1158,7 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create child1");
@@ -1123,6 +1174,7 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create child2");
@@ -1164,6 +1216,7 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create child");
@@ -1194,6 +1247,7 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create child1");
@@ -1209,6 +1263,7 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create child2");
@@ -1243,6 +1298,7 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create child1");
@@ -1258,6 +1314,7 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create child2");
@@ -1289,6 +1346,7 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create child");

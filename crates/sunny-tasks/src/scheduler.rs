@@ -18,16 +18,23 @@ pub struct TaskReadyEvent {
 pub struct TaskScheduler {
     store: Arc<TaskStore>,
     workspace_id: String,
+    root_session_id: String,
     poll_interval: Duration,
     max_concurrent: usize,
     ready_tx: Option<mpsc::UnboundedSender<TaskReadyEvent>>,
 }
 
 impl TaskScheduler {
-    pub fn new(store: Arc<TaskStore>, workspace_id: String, max_concurrent: usize) -> Self {
+    pub fn new(
+        store: Arc<TaskStore>,
+        workspace_id: String,
+        max_concurrent: usize,
+        root_session_id: String,
+    ) -> Self {
         Self {
             store,
             workspace_id,
+            root_session_id,
             poll_interval: Duration::from_secs(2),
             max_concurrent,
             ready_tx: None,
@@ -58,6 +65,7 @@ impl TaskScheduler {
     fn tick(&self) -> Result<(), crate::error::TaskError> {
         let store = Arc::clone(&self.store);
         let workspace_id = self.workspace_id.clone();
+        let root_session_id = self.root_session_id.clone();
         let max_concurrent = self.max_concurrent;
 
         let run_tick = || {
@@ -67,7 +75,7 @@ impl TaskScheduler {
                 return Ok(());
             }
 
-            let ready = store.list_ready_tasks(&workspace_id, slots)?;
+            let ready = store.list_ready_tasks(&workspace_id, &root_session_id, slots)?;
             for task in ready {
                 if let Ok(claims) = store.get_path_claims(&task.id) {
                     for claim in &claims {
@@ -137,6 +145,7 @@ mod tests {
                 CREATE TABLE IF NOT EXISTS tasks (
                     id              TEXT PRIMARY KEY,
                     workspace_id    TEXT NOT NULL REFERENCES workspaces(id),
+                    root_session_id TEXT NOT NULL DEFAULT '',
                     parent_id       TEXT REFERENCES tasks(id),
                     title           TEXT NOT NULL,
                     description     TEXT NOT NULL,
@@ -222,6 +231,31 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
+                metadata: None,
+            })
+            .expect("should create task")
+    }
+
+    fn make_task_for_root_session(
+        store: &TaskStore,
+        workspace_id: &str,
+        title: &str,
+        root_session_id: &str,
+    ) -> Task {
+        store
+            .create_task(CreateTaskInput {
+                workspace_id: workspace_id.to_string(),
+                parent_id: None,
+                title: title.to_string(),
+                description: format!("description for {title}"),
+                created_by: "human".to_string(),
+                priority: 0,
+                max_retries: 3,
+                dep_ids: vec![],
+                accept_criteria: None,
+                delegate_capabilities: vec![],
+                root_session_id: root_session_id.to_string(),
                 metadata: None,
             })
             .expect("should create task")
@@ -233,7 +267,7 @@ mod tests {
         let workspace = make_workspace(&store);
         let task = make_task(&store, &workspace.id, "task-a", 0);
 
-        let scheduler = TaskScheduler::new(Arc::clone(&store), workspace.id.clone(), 1);
+        let scheduler = TaskScheduler::new(Arc::clone(&store), workspace.id.clone(), 1, "".into());
         scheduler.tick().expect("tick should succeed");
 
         let saved = store
@@ -251,7 +285,7 @@ mod tests {
         make_task(&store, &workspace.id, "task-b", 2);
         make_task(&store, &workspace.id, "task-c", 1);
 
-        let scheduler = TaskScheduler::new(Arc::clone(&store), workspace.id.clone(), 2);
+        let scheduler = TaskScheduler::new(Arc::clone(&store), workspace.id.clone(), 2, "".into());
         scheduler.tick().expect("tick should succeed");
 
         let tasks = store
@@ -268,5 +302,69 @@ mod tests {
 
         assert_eq!(running_count, 2);
         assert_eq!(pending_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_only_runs_own_tasks() {
+        let (store, _dir) = make_store();
+        let workspace = make_workspace(&store);
+        let task_a = make_task_for_root_session(&store, &workspace.id, "task-a", "session-a");
+        let task_b = make_task_for_root_session(&store, &workspace.id, "task-b", "session-b");
+
+        let scheduler_a = TaskScheduler::new(
+            Arc::clone(&store),
+            workspace.id.clone(),
+            10,
+            "session-a".into(),
+        );
+        scheduler_a.tick().expect("tick should succeed");
+
+        let after_a = store.list_tasks(&workspace.id).expect("should list tasks");
+        let state_a = after_a
+            .iter()
+            .find(|task| task.id == task_a.id)
+            .expect("task-a should exist");
+        let state_b = after_a
+            .iter()
+            .find(|task| task.id == task_b.id)
+            .expect("task-b should exist");
+        assert_eq!(state_a.status, TaskStatus::Running);
+        assert_eq!(state_b.status, TaskStatus::Pending);
+
+        let scheduler_b = TaskScheduler::new(
+            Arc::clone(&store),
+            workspace.id.clone(),
+            10,
+            "session-b".into(),
+        );
+        scheduler_b.tick().expect("tick should succeed");
+
+        let after_b = store.list_tasks(&workspace.id).expect("should list tasks");
+        let state_b = after_b
+            .iter()
+            .find(|task| task.id == task_b.id)
+            .expect("task-b should exist");
+        assert_eq!(state_b.status, TaskStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_ignores_peer_session_tasks() {
+        let (store, _dir) = make_store();
+        let workspace = make_workspace(&store);
+        let peer_task = make_task_for_root_session(&store, &workspace.id, "peer-task", "session-a");
+
+        let scheduler = TaskScheduler::new(
+            Arc::clone(&store),
+            workspace.id.clone(),
+            10,
+            "session-b".into(),
+        );
+        scheduler.tick().expect("tick should succeed");
+
+        let saved = store
+            .get_task(&peer_task.id)
+            .expect("should load task")
+            .expect("task should exist");
+        assert_eq!(saved.status, TaskStatus::Pending);
     }
 }

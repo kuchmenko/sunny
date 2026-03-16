@@ -18,6 +18,8 @@ const BINARY_CHECK_LEN: usize = 8192;
 pub struct FileContent {
     pub path: PathBuf,
     pub content: String,
+    pub lines: Vec<String>,
+    pub line_count: usize,
     pub size_bytes: u64,
 }
 
@@ -142,9 +144,14 @@ impl FileReader {
             err
         })?;
 
+        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        let line_count = lines.len();
+
         let result = FileContent {
             path: path.to_path_buf(),
             content,
+            lines,
+            line_count,
             size_bytes: size,
         };
 
@@ -349,5 +356,23 @@ mod tests {
             "should include error_kind"
         );
         assert!(matches!(err, ToolError::PathNotFound { .. }));
+    }
+
+    #[test]
+    fn test_file_content_has_lines() {
+        let f = temp_file_with(b"line1\nline2\nline3", ".txt");
+        let reader = FileReader::default();
+        let result = reader.read(f.path()).expect("should read file");
+        assert_eq!(result.lines, vec!["line1", "line2", "line3"]);
+        assert_eq!(result.line_count, 3);
+    }
+
+    #[test]
+    fn test_file_content_line_count_matches() {
+        let f = temp_file_with(b"single line", ".txt");
+        let reader = FileReader::default();
+        let result = reader.read(f.path()).expect("should read file");
+        assert_eq!(result.line_count, result.lines.len());
+        assert_eq!(result.line_count, 1);
     }
 }

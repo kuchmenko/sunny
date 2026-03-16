@@ -20,6 +20,8 @@ pub struct GrepMatch {
     pub line_content: String,
     /// Byte offset of the match start within the line.
     pub match_start: usize,
+    pub context_before: Vec<String>,
+    pub context_after: Vec<String>,
 }
 
 /// Result of a grep search. Always succeeds — no `Result` wrapper needed.
@@ -88,6 +90,8 @@ impl TextGrep {
                     line_number: idx + 1,
                     line_content: line.to_string(),
                     match_start: pos,
+                    context_before: Vec::new(),
+                    context_after: Vec::new(),
                 });
             }
         }

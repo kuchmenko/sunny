@@ -214,6 +214,7 @@ mod tests {
                 CREATE TABLE IF NOT EXISTS tasks (
                     id              TEXT PRIMARY KEY,
                     workspace_id    TEXT NOT NULL REFERENCES workspaces(id),
+                    root_session_id TEXT NOT NULL DEFAULT '',
                     parent_id       TEXT REFERENCES tasks(id),
                     title           TEXT NOT NULL,
                     description     TEXT NOT NULL,
@@ -339,6 +340,7 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create task")
@@ -487,6 +489,7 @@ mod tests {
                 dep_ids: vec![],
                 accept_criteria: None,
                 delegate_capabilities: vec![],
+                root_session_id: String::new(),
                 metadata: None,
             })
             .expect("should create child task");

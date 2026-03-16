@@ -289,6 +289,7 @@ mod tests {
         Task {
             id: "task-1".to_string(),
             workspace_id: "workspace-1".to_string(),
+            root_session_id: String::new(),
             parent_id: None,
             title: title.to_string(),
             description: description.to_string(),

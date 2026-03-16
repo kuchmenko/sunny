@@ -1,22 +1,35 @@
 pub mod error;
+pub mod file_snapshot;
 pub mod fs_edit;
+pub mod fs_glob;
 pub mod fs_read;
 pub mod fs_scan;
 pub mod fs_write;
 pub mod grep_files;
+pub mod interview;
+pub mod lsp;
 pub mod path_guard;
 mod policy;
+mod registry;
 pub mod shell_exec;
 pub mod text_grep;
+pub mod tools;
 
 pub use error::ToolError;
+pub use file_snapshot::{FileSnapshot, FileSnapshotStore};
 pub use fs_edit::{EditResult, FileEditor};
+pub use fs_glob::FsGlobTool;
 pub use fs_read::{FileContent, FileReader};
 pub use fs_scan::FileScanner;
 pub use fs_write::{FileWriter, WriteResult};
 pub use grep_files::{GrepFileMatch, GrepFiles};
+pub use interview::{
+    InterviewAnswer, InterviewContext, InterviewOption, InterviewQuestion, QuestionType,
+};
+pub use lsp::LspClient;
 pub use path_guard::PathGuard;
 pub use policy::ToolPolicy;
+pub use registry::{Tool, ToolRegistry, ToolRegistryBuilder};
 pub use shell_exec::{CapabilityChecker, ExecResult, ShellExecutor};
 pub use text_grep::{GrepMatch, GrepResult, TextGrep};
 

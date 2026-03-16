@@ -160,9 +160,7 @@ mod tests {
 
     #[test]
     fn test_registry_execute_known_tool() {
-        let registry = ToolRegistry::builder()
-            .register(echo("greet"))
-            .build();
+        let registry = ToolRegistry::builder().register(echo("greet")).build();
 
         let result = registry
             .execute("greet", &serde_json::json!({"msg": "hi"}))
