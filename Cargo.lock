@@ -2541,6 +2541,7 @@ dependencies = [
  "serde_json",
  "sunny-core",
  "sunny-mind",
+ "sunny-plans",
  "sunny-store",
  "sunny-tasks",
  "tempfile",
@@ -2571,6 +2572,7 @@ dependencies = [
  "sunny-boys",
  "sunny-core",
  "sunny-mind",
+ "sunny-plans",
  "sunny-store",
  "sunny-tasks",
  "tempfile",
@@ -2633,6 +2635,22 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "sunny-plans"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sunny-mind",
+ "sunny-store",
+ "sunny-tasks",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

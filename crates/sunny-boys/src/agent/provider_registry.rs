@@ -81,6 +81,21 @@ impl ProviderRegistry {
         None
     }
 
+    pub fn resolve_for_role_effort(
+        &self,
+        _role_str: &str,
+        effort_str: &str,
+    ) -> (Option<Arc<dyn LlmProvider>>, Option<u32>) {
+        let thinking_budget = match effort_str {
+            "moderate" => Some(4000),
+            "high" => Some(16000),
+            "critical" => Some(32000),
+            _ => None,
+        };
+
+        (self.resolve_for_category(None), thinking_budget)
+    }
+
     /// Number of registered providers.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
@@ -227,5 +242,31 @@ mod tests {
     fn test_registry_empty_returns_none() {
         let registry = ProviderRegistry::new(make_default_config());
         assert!(registry.resolve_for_category(Some("quick")).is_none());
+    }
+
+    #[test]
+    fn test_resolve_for_role_effort_returns_thinking_budget() {
+        let mut registry = ProviderRegistry::new(make_default_config());
+        let sonnet = Arc::new(MockProvider::new("claude-sonnet-4-6"));
+        registry.register(Arc::clone(&sonnet) as Arc<dyn LlmProvider>);
+
+        let (provider, budget) = registry.resolve_for_role_effort("executor", "high");
+        assert!(provider.is_some());
+        assert_eq!(provider.unwrap().model_id(), "claude-sonnet-4-6");
+        assert_eq!(budget, Some(16000));
+
+        let (_, budget_low) = registry.resolve_for_role_effort("planner", "low");
+        assert_eq!(budget_low, None);
+    }
+
+    #[test]
+    fn test_resolve_for_role_effort_unknown_effort_uses_default_provider() {
+        let mut registry = ProviderRegistry::new(make_default_config());
+        let sonnet = Arc::new(MockProvider::new("claude-sonnet-4-6"));
+        registry.register(Arc::clone(&sonnet) as Arc<dyn LlmProvider>);
+
+        let (provider, budget) = registry.resolve_for_role_effort("verifier", "unknown");
+        assert_eq!(provider.unwrap().model_id(), "claude-sonnet-4-6");
+        assert_eq!(budget, None);
     }
 }

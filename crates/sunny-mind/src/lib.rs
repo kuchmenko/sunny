@@ -85,6 +85,7 @@ mod tests {
             temperature: None,
             tools: None,
             tool_choice: None,
+            thinking_budget: None,
         };
         assert_eq!(req.messages.len(), 1);
         assert!(req.max_tokens.is_none());
@@ -96,6 +97,7 @@ mod tests {
             temperature: Some(0.7),
             tools: None,
             tool_choice: None,
+            thinking_budget: None,
         };
         assert_eq!(req_with_opts.max_tokens, Some(1024));
         assert_eq!(req_with_opts.temperature, Some(0.7));
@@ -228,6 +230,7 @@ mod tests {
             temperature: Some(0.5),
             tools: None,
             tool_choice: None,
+            thinking_budget: None,
         };
         let req_json = serde_json::to_string(&req).expect("serialize LlmRequest");
         let req_de: LlmRequest = serde_json::from_str(&req_json).expect("deserialize LlmRequest");
@@ -258,6 +261,7 @@ mod tests {
                 }),
             }]),
             tool_choice: Some(ToolChoice::Required),
+            thinking_budget: None,
         };
 
         let actual = serde_json::to_value(&request).expect("serialize request with tools");
@@ -300,6 +304,7 @@ mod tests {
             temperature: None,
             tools: None,
             tool_choice: None,
+            thinking_budget: None,
         };
 
         let backward_actual =

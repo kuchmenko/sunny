@@ -242,6 +242,7 @@ impl AgentSession {
             temperature: None,
             tools: Some(build_tool_definitions()),
             tool_choice: Some(ToolChoice::Auto),
+            thinking_budget: None,
         };
 
         let tool_executor: Arc<ToolExecutor> = build_tool_executor_with_capabilities(
@@ -300,6 +301,7 @@ impl AgentSession {
                     temperature: Some(0.3),
                     tools: None,
                     tool_choice: None,
+                    thinking_budget: None,
                 };
 
                 let title = match provider.chat(title_request).await {
@@ -396,6 +398,7 @@ impl AgentSession {
             temperature: Some(0.3),
             tools: None,
             tool_choice: None,
+            thinking_budget: None,
         };
 
         let summary = match self.provider.chat(summary_request).await {

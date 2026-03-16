@@ -79,14 +79,16 @@ fn arb_llm_request() -> impl Strategy<Value = LlmRequest> {
         prop::option::of((0u16..1000).prop_map(|value| value as f32 / 1000.0)),
         prop::option::of(prop::collection::vec(arb_tool_definition(), 0..3)),
         prop::option::of(arb_tool_choice()),
+        prop::option::of(1u32..32_768),
     )
         .prop_map(
-            |(messages, max_tokens, temperature, tools, tool_choice)| LlmRequest {
+            |(messages, max_tokens, temperature, tools, tool_choice, thinking_budget)| LlmRequest {
                 messages,
                 max_tokens,
                 temperature,
                 tools,
                 tool_choice,
+                thinking_budget,
             },
         )
 }
@@ -143,6 +145,7 @@ fn test_request_minimal_contract() {
         temperature: None,
         tools: None,
         tool_choice: None,
+        thinking_budget: None,
     };
 
     let json = serde_json::to_string(&request).expect("should serialize");
@@ -197,6 +200,7 @@ fn test_request_full_contract() {
             }),
         }]),
         tool_choice: Some(ToolChoice::Auto),
+        thinking_budget: None,
     };
 
     let json = serde_json::to_string(&request).expect("should serialize");
@@ -455,6 +459,7 @@ fn test_contract_roundtrip() {
         temperature: Some(0.5),
         tools: None,
         tool_choice: None,
+        thinking_budget: None,
     };
     let json = serde_json::to_string(&request).expect("should serialize");
     let back: LlmRequest = serde_json::from_str(&json).expect("should deserialize");

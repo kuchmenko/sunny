@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::model::Task;
 use crate::model::TaskStatus;
@@ -47,6 +47,7 @@ impl TaskScheduler {
     }
 
     pub async fn run(self, cancel: CancellationToken) {
+        let mut last_error: Option<String> = None;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -54,8 +55,19 @@ impl TaskScheduler {
                     break;
                 }
                 _ = tokio::time::sleep(self.poll_interval) => {
-                    if let Err(error) = self.tick() {
-                        warn!(error = %error, "scheduler tick error");
+                    match self.tick() {
+                        Err(error) => {
+                            let msg = error.to_string();
+                            if last_error.as_deref() != Some(msg.as_str()) {
+                                error!(error = %error, "scheduler tick error");
+                                last_error = Some(msg);
+                            }
+                        }
+                        Ok(()) => {
+                            if last_error.take().is_some() {
+                                info!("scheduler: recovered from previous error");
+                            }
+                        }
                     }
                 }
             }

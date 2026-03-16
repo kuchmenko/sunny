@@ -424,6 +424,7 @@ mod tests {
             temperature: None,
             tools: None,
             tool_choice: None,
+            thinking_budget: None,
         };
 
         let body = provider.build_request_body(&req, false);
@@ -467,6 +468,7 @@ mod tests {
                 }),
             }]),
             tool_choice: None,
+            thinking_budget: None,
         };
 
         let body = provider.build_request_body(&req, false);
@@ -495,6 +497,7 @@ mod tests {
             temperature: None,
             tools: None,
             tool_choice: None,
+            thinking_budget: None,
         };
 
         let body = provider.build_request_body(&req, false);

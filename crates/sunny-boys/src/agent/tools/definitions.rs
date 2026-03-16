@@ -2,7 +2,7 @@ use serde_json;
 use sunny_mind::ToolDefinition;
 
 pub fn build_tool_definitions() -> Vec<ToolDefinition> {
-    vec![
+    let mut defs = vec![
         ToolDefinition {
             name: "fs_read".to_string(),
             description: "Read the contents of a file at the given path. Returns the file content as a string. For directories, use fs_scan instead.".to_string(),
@@ -568,5 +568,26 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["paths"]
             }),
         },
-    ]
+    ];
+
+    defs.extend(sunny_plans::tools::definitions::build_plan_tool_definitions());
+    defs.push(ToolDefinition {
+        name: "task_request_replan".to_string(),
+        description: "Request that the current plan be replanned when execution discovers new information or a blocking issue. Use this to record an agent-triggered replan reason against an existing plan.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "plan_id": {
+                    "type": "string",
+                    "description": "ID of the plan that should receive the replan request"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Explanation for why execution needs a replan"
+                }
+            },
+            "required": ["plan_id", "reason"]
+        }),
+    });
+    defs
 }

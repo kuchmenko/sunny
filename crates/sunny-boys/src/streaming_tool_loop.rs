@@ -431,6 +431,7 @@ mod tests {
             temperature: Some(0.2),
             tools: None,
             tool_choice: None,
+            thinking_budget: None,
         }
     }
 

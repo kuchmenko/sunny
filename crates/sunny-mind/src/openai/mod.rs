@@ -1,6 +1,6 @@
 //! OpenAI provider for sunny-mind.
 //!
-//! Implements the [`LlmProvider`] trait for the OpenAI API
+//! Implements the `crate::LlmProvider` trait for the OpenAI API
 //! (`api.openai.com/v1/chat/completions`).
 
 pub(crate) mod credentials;

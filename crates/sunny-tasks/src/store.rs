@@ -16,6 +16,10 @@ pub struct TaskStore {
 
 impl TaskStore {
     pub fn new(db: sunny_store::Database) -> Self {
+        // TODO: replace ensure_task_tables + ALTER TABLE migrations with a proper
+        // migration tool (e.g. refinery, sqlx migrate, or a custom version table).
+        // See: https://github.com/rust-db/refinery
+        ensure_task_tables(&db);
         Self { db }
     }
 
@@ -721,82 +725,89 @@ fn parse_optional_json_value(
         .transpose()
 }
 
+fn ensure_task_tables(db: &sunny_store::Database) {
+    db.connection()
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS workspaces (
+                id          TEXT PRIMARY KEY,
+                git_root    TEXT NOT NULL UNIQUE,
+                name        TEXT,
+                created_at  TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS tasks (
+                id              TEXT PRIMARY KEY,
+                workspace_id    TEXT NOT NULL REFERENCES workspaces(id),
+                root_session_id TEXT NOT NULL DEFAULT '',
+                parent_id       TEXT REFERENCES tasks(id),
+                title           TEXT NOT NULL,
+                description     TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                session_id      TEXT REFERENCES sessions(id),
+                created_by      TEXT NOT NULL,
+                priority        INTEGER DEFAULT 0,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                started_at      TEXT,
+                completed_at    TEXT,
+                result_diff     TEXT,
+                result_summary  TEXT,
+                result_files    TEXT,
+                result_verify   TEXT,
+                error           TEXT,
+                retry_count     INTEGER DEFAULT 0,
+                max_retries     INTEGER DEFAULT 3,
+                metadata        TEXT
+            );
+            CREATE TABLE IF NOT EXISTS task_deps (
+                task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                depends_on  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                PRIMARY KEY (task_id, depends_on)
+            );
+            CREATE TABLE IF NOT EXISTS accept_criteria (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id                 TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+                description             TEXT NOT NULL,
+                requires_human_approval INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS verify_commands (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                criteria_id         INTEGER NOT NULL REFERENCES accept_criteria(id) ON DELETE CASCADE,
+                command             TEXT NOT NULL,
+                expected_exit_code  INTEGER DEFAULT 0,
+                timeout_secs        INTEGER DEFAULT 60,
+                seq                 INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS human_questions (
+                id          TEXT PRIMARY KEY,
+                task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                question    TEXT NOT NULL,
+                context     TEXT,
+                options     TEXT,
+                answer      TEXT,
+                asked_at    TEXT NOT NULL,
+                answered_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS task_path_claims (
+                task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                path_pattern TEXT NOT NULL,
+                claim_type   TEXT NOT NULL,
+                PRIMARY KEY (task_id, path_pattern)
+            );"
+        )
+        .expect("should create task schema");
+
+    // TODO: replace with a proper migration tool (e.g. refinery, sqlx migrate, or a custom
+    // schema_versions table). This ALTER TABLE hack won't scale past a handful of columns.
+    let _ = db.connection().execute(
+        "ALTER TABLE tasks ADD COLUMN root_session_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sunny_store::Database;
-
-    fn ensure_task_tables(db: &Database) {
-        db.connection()
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS workspaces (
-                    id          TEXT PRIMARY KEY,
-                    git_root    TEXT NOT NULL UNIQUE,
-                    name        TEXT,
-                    created_at  TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id              TEXT PRIMARY KEY,
-                    workspace_id    TEXT NOT NULL REFERENCES workspaces(id),
-                    root_session_id TEXT NOT NULL DEFAULT '',
-                    parent_id       TEXT REFERENCES tasks(id),
-                    title           TEXT NOT NULL,
-                    description     TEXT NOT NULL,
-                    status          TEXT NOT NULL DEFAULT 'pending',
-                    session_id      TEXT REFERENCES sessions(id),
-                    created_by      TEXT NOT NULL,
-                    priority        INTEGER DEFAULT 0,
-                    created_at      TEXT NOT NULL,
-                    updated_at      TEXT NOT NULL,
-                    started_at      TEXT,
-                    completed_at    TEXT,
-                    result_diff     TEXT,
-                    result_summary  TEXT,
-                    result_files    TEXT,
-                    result_verify   TEXT,
-                    error           TEXT,
-                    retry_count     INTEGER DEFAULT 0,
-                    max_retries     INTEGER DEFAULT 3,
-                    metadata        TEXT
-                );
-                CREATE TABLE IF NOT EXISTS task_deps (
-                    task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    depends_on  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    PRIMARY KEY (task_id, depends_on)
-                );
-                CREATE TABLE IF NOT EXISTS accept_criteria (
-                    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id                 TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
-                    description             TEXT NOT NULL,
-                    requires_human_approval INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS verify_commands (
-                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                    criteria_id         INTEGER NOT NULL REFERENCES accept_criteria(id) ON DELETE CASCADE,
-                    command             TEXT NOT NULL,
-                    expected_exit_code  INTEGER DEFAULT 0,
-                    timeout_secs        INTEGER DEFAULT 60,
-                    seq                 INTEGER NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS human_questions (
-                    id          TEXT PRIMARY KEY,
-                    task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    question    TEXT NOT NULL,
-                    context     TEXT,
-                    options     TEXT,
-                    answer      TEXT,
-                    asked_at    TEXT NOT NULL,
-                    answered_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS task_path_claims (
-                    task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                    path_pattern TEXT NOT NULL,
-                    claim_type   TEXT NOT NULL,
-                    PRIMARY KEY (task_id, path_pattern)
-                );",
-            )
-            .expect("should create task schema");
-    }
 
     fn make_store() -> (TaskStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("should create temp dir");

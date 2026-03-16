@@ -46,6 +46,8 @@ pub struct LlmRequest {
     pub tools: Option<Vec<ToolDefinition>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
 }
 
 /// Tool metadata exposed to the provider wire protocol.

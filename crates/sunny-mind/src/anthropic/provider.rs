@@ -288,6 +288,10 @@ impl AnthropicProvider {
             body["tools"] = serde_json::Value::Array(tools_json);
         }
 
+        if let Some(budget) = req.thinking_budget {
+            body["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": budget});
+        }
+
         Ok(body)
     }
 
@@ -558,6 +562,69 @@ mod tests {
     }
 
     #[test]
+    fn test_build_request_body_includes_thinking_when_budget_is_set() {
+        let provider = AnthropicProvider {
+            credentials: Arc::new(RwLock::new(make_test_credentials("test-token"))),
+            client: reqwest::Client::new(),
+            model: "claude-sonnet-4-6".to_string(),
+        };
+
+        let req = LlmRequest {
+            messages: vec![crate::types::ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            thinking_budget: Some(4000),
+        };
+
+        let body = provider
+            .build_request_body(&req, &CredentialSource::ApiKey, false)
+            .expect("build_request_body should succeed");
+
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 4000})
+        );
+    }
+
+    #[test]
+    fn test_build_request_body_omits_thinking_when_budget_is_none() {
+        let provider = AnthropicProvider {
+            credentials: Arc::new(RwLock::new(make_test_credentials("test-token"))),
+            client: reqwest::Client::new(),
+            model: "claude-sonnet-4-6".to_string(),
+        };
+
+        let req = LlmRequest {
+            messages: vec![crate::types::ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            thinking_budget: None,
+        };
+
+        let body = provider
+            .build_request_body(&req, &CredentialSource::ApiKey, false)
+            .expect("build_request_body should succeed");
+
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
     fn test_prepare_messages_maps_tool_result_to_user_tool_result_block() {
         let provider = AnthropicProvider {
             credentials: Arc::new(RwLock::new(make_test_credentials("test-token"))),
@@ -586,6 +653,7 @@ mod tests {
             temperature: None,
             tools: None,
             tool_choice: None,
+            thinking_budget: None,
         };
 
         let mapped = provider
@@ -654,6 +722,7 @@ mod tests {
             temperature: None,
             tools: None,
             tool_choice: None,
+            thinking_budget: None,
         };
 
         let mapped = provider
@@ -702,6 +771,7 @@ mod tests {
             temperature: None,
             tools: None,
             tool_choice: None,
+            thinking_budget: None,
         };
 
         let system = provider

@@ -93,6 +93,24 @@ impl ModelsConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategoryConfig {
+    #[serde(default = "default_category_model")]
+    pub default_model: String,
+}
+
+fn default_category_model() -> String {
+    "claude-sonnet-4-6".into()
+}
+
+impl Default for CategoryConfig {
+    fn default() -> Self {
+        Self {
+            default_model: default_category_model(),
+        }
+    }
+}
+
 /// Full user configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserConfig {
@@ -103,6 +121,8 @@ pub struct UserConfig {
     /// Model routing configuration — maps categories to model strings.
     #[serde(default)]
     pub models: ModelsConfig,
+    #[serde(default)]
+    pub categories: CategoryConfig,
 }
 
 impl UserConfig {
@@ -121,7 +141,7 @@ impl UserConfig {
         dirs::home_dir().map(|h| h.join(".sunny").join("config.toml"))
     }
 
-    /// Path to workspace config: <root>/.sunny/config.toml
+    /// Path to workspace config: `root/.sunny/config.toml`
     pub fn workspace_path(root: &Path) -> PathBuf {
         root.join(".sunny").join("config.toml")
     }
@@ -178,6 +198,13 @@ impl UserConfig {
                     global.models.default
                 },
             },
+            categories: CategoryConfig {
+                default_model: if workspace.categories.default_model != default_category_model() {
+                    workspace.categories.default_model
+                } else {
+                    global.categories.default_model
+                },
+            },
         }
     }
 }
@@ -193,6 +220,7 @@ mod tests {
         assert!(!config.permissions.sync_policy_on_approve);
         assert!(!config.permissions.headless);
         assert_eq!(config.tasks.max_concurrent, 3);
+        assert_eq!(config.categories.default_model, "claude-sonnet-4-6");
     }
 
     #[test]
@@ -226,5 +254,35 @@ mod tests {
         .expect("write config");
         let config = UserConfig::load(Some(dir.path()));
         assert!(config.permissions.headless);
+    }
+
+    #[test]
+    fn test_user_config_load_categories_section() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".sunny")).expect("create .sunny");
+        std::fs::write(
+            dir.path().join(".sunny").join("config.toml"),
+            "[categories]\ndefault_model = \"gpt-5.4\"\n",
+        )
+        .expect("write config");
+
+        let config = UserConfig::load(Some(dir.path()));
+        assert_eq!(config.categories.default_model, "gpt-5.4");
+        assert_eq!(config.models.default, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn test_user_config_load_models_and_categories_sections() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".sunny")).expect("create .sunny");
+        std::fs::write(
+            dir.path().join(".sunny").join("config.toml"),
+            "[models]\ndeep = \"custom-deep\"\n[categories]\ndefault_model = \"custom-category\"\n",
+        )
+        .expect("write config");
+
+        let config = UserConfig::load(Some(dir.path()));
+        assert_eq!(config.models.deep, "custom-deep");
+        assert_eq!(config.categories.default_model, "custom-category");
     }
 }

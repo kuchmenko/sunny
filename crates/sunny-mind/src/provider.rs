@@ -93,6 +93,7 @@ mod tests {
             temperature: None,
             tools: None,
             tool_choice: None,
+            thinking_budget: None,
         };
 
         let mut stream = provider

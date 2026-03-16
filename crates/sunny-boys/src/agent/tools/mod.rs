@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn test_build_tool_definitions_count() {
         let defs = build_tool_definitions();
-        assert_eq!(defs.len(), 28, "expected 28 tool definitions");
+        assert_eq!(defs.len(), 40, "expected 40 tool definitions");
     }
 
     #[test]
@@ -125,6 +125,18 @@ mod tests {
             "task_fail",
             "task_ask_human",
             "task_claim_paths",
+            "plan_create",
+            "plan_add_task",
+            "plan_add_dependency",
+            "plan_remove_task",
+            "plan_query_state",
+            "plan_finalize",
+            "plan_replan",
+            "plan_record_decision",
+            "plan_add_constraint",
+            "plan_add_goal",
+            "plan_update_goal",
+            "task_request_replan",
         ];
         for name in &expected {
             assert!(names.contains(name), "missing tool: {name}");
@@ -176,6 +188,18 @@ mod tests {
             "task_fail",
             "task_ask_human",
             "task_claim_paths",
+            "plan_create",
+            "plan_add_task",
+            "plan_add_dependency",
+            "plan_remove_task",
+            "plan_query_state",
+            "plan_finalize",
+            "plan_replan",
+            "plan_record_decision",
+            "plan_add_constraint",
+            "plan_add_goal",
+            "plan_update_goal",
+            "task_request_replan",
         ];
         for name in &allowed {
             assert!(policy.is_allowed(name), "policy should allow {name}");

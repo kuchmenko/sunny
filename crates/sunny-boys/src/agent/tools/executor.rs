@@ -6,16 +6,20 @@ use crate::agent::{GateDecision, SharedApprovalGate};
 use crate::git_tools::{GitBranch, GitCheckout, GitCommit, GitDiff, GitLog, GitStatus};
 use crate::tool_loop::ToolExecutor;
 use sunny_core::tool::{
-    lsp::{LspDiagnosticsTool, LspFindReferencesTool, LspGotoDefinitionTool, LspRenameTool,
-        LspSymbolsTool},
+    lsp::{
+        LspDiagnosticsTool, LspFindReferencesTool, LspGotoDefinitionTool, LspRenameTool,
+        LspSymbolsTool,
+    },
     CapabilityChecker, FileEditor, FileReader, FileScanner, FileSnapshot, FileSnapshotStore,
     FileWriter, FsGlobTool, GrepFiles, InterviewOption, InterviewQuestion, LspClient, PathGuard,
     QuestionType, ShellExecutor, TextGrep, ToolError,
 };
-use tokio::sync::Mutex;
 use sunny_tasks::WorkspaceDetector;
+use tokio::sync::Mutex;
 
-use super::helpers::{build_active_capabilities, extract_str, tool_exec_err, TaskCapabilityChecker};
+use super::helpers::{
+    build_active_capabilities, extract_str, tool_exec_err, TaskCapabilityChecker,
+};
 use super::task_handlers::{
     handle_task_ask_human, handle_task_claim_paths, handle_task_complete, handle_task_create,
     handle_task_fail, handle_task_get, handle_task_list,
@@ -392,7 +396,9 @@ pub fn build_tool_executor_with_capabilities(
                     with_lsp_client(&lsp_client, &root, |client| {
                         tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(async {
-                                LspSymbolsTool::new(client).run(&path, query.as_deref()).await
+                                LspSymbolsTool::new(client)
+                                    .run(&path, query.as_deref())
+                                    .await
                             })
                         })
                     })
@@ -488,6 +494,146 @@ pub fn build_tool_executor_with_capabilities(
                 "task_fail" => handle_task_fail(&parsed, &task_id),
                 "task_ask_human" => handle_task_ask_human(&parsed, &task_id),
                 "task_claim_paths" => handle_task_claim_paths(&parsed, &task_id),
+                "plan_create" => {
+                    let store = sunny_plans::store::PlanStore::open_default().map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                    sunny_plans::tools::handlers::handle_plan_create(&store, &parsed).map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })
+                }
+                "plan_add_task" => {
+                    let store = sunny_plans::store::PlanStore::open_default().map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                    sunny_plans::tools::handlers::handle_plan_add_task(&store, &parsed).map_err(
+                        |e| ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        },
+                    )
+                }
+                "plan_add_dependency" => {
+                    let store = sunny_plans::store::PlanStore::open_default().map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                    sunny_plans::tools::handlers::handle_plan_add_dependency(&store, &parsed)
+                        .map_err(|e| ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        })
+                }
+                "plan_remove_task" => {
+                    let store = sunny_plans::store::PlanStore::open_default().map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                    sunny_plans::tools::handlers::handle_plan_remove_task(&store, &parsed).map_err(
+                        |e| ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        },
+                    )
+                }
+                "plan_query_state" => {
+                    let store = sunny_plans::store::PlanStore::open_default().map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                    sunny_plans::tools::handlers::handle_plan_query_state(&store, &parsed).map_err(
+                        |e| ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        },
+                    )
+                }
+                "plan_finalize" => {
+                    let store = sunny_plans::store::PlanStore::open_default().map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                    sunny_plans::tools::handlers::handle_plan_finalize(&store, &parsed).map_err(
+                        |e| ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        },
+                    )
+                }
+                "plan_replan" => {
+                    let store = sunny_plans::store::PlanStore::open_default().map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                    sunny_plans::tools::handlers::handle_plan_replan(&store, &parsed).map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })
+                }
+                "plan_record_decision" => {
+                    let store = sunny_plans::store::PlanStore::open_default().map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                    sunny_plans::tools::handlers::handle_plan_record_decision(&store, &parsed)
+                        .map_err(|e| ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        })
+                }
+                "plan_add_constraint" => {
+                    let store = sunny_plans::store::PlanStore::open_default().map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                    sunny_plans::tools::handlers::handle_plan_add_constraint(&store, &parsed)
+                        .map_err(|e| ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        })
+                }
+                "plan_add_goal" => {
+                    let store = sunny_plans::store::PlanStore::open_default().map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                    sunny_plans::tools::handlers::handle_plan_add_goal(&store, &parsed).map_err(
+                        |e| ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        },
+                    )
+                }
+                "plan_update_goal" => {
+                    let store = sunny_plans::store::PlanStore::open_default().map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                    sunny_plans::tools::handlers::handle_plan_update_goal(&store, &parsed).map_err(
+                        |e| ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        },
+                    )
+                }
+                "task_request_replan" => {
+                    let store = sunny_plans::store::PlanStore::open_default().map_err(|e| {
+                        ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+                    sunny_plans::tools::handlers::handle_task_request_replan(&store, &parsed)
+                        .map_err(|e| ToolError::ExecutionFailed {
+                            source: Box::new(e),
+                        })
+                }
                 _ => Err(ToolError::ExecutionFailed {
                     source: Box::new(std::io::Error::other(format!("unknown tool: {name}"))),
                 }),
@@ -509,9 +655,9 @@ fn ensure_capability(
 }
 
 fn extract_u32(value: &serde_json::Value, key: &str) -> Result<u32, ToolError> {
-    let raw = value[key].as_u64().ok_or_else(|| {
-        tool_exec_err(std::io::Error::other(format!("missing '{key}' argument")))
-    })?;
+    let raw = value[key]
+        .as_u64()
+        .ok_or_else(|| tool_exec_err(std::io::Error::other(format!("missing '{key}' argument"))))?;
     u32::try_from(raw).map_err(|_| {
         tool_exec_err(std::io::Error::other(format!(
             "'{key}' is too large for u32"
@@ -581,18 +727,20 @@ where
         tokio::runtime::Handle::current().block_on(async move {
             ensure_lsp_initialized(&slot, &root).await?;
             let guard = slot.lock().await;
-            let client = guard
-                .as_ref()
-                .ok_or_else(|| tool_exec_err(std::io::Error::other("LSP client not initialized")))?;
+            let client = guard.as_ref().ok_or_else(|| {
+                tool_exec_err(std::io::Error::other("LSP client not initialized"))
+            })?;
             f(client)
         })
     })
 }
 
-fn parse_interview_questions(parsed: &serde_json::Value) -> Result<Vec<InterviewQuestion>, ToolError> {
-    let entries = parsed["questions"].as_array().ok_or_else(|| {
-        tool_exec_err(std::io::Error::other("missing 'questions' argument"))
-    })?;
+fn parse_interview_questions(
+    parsed: &serde_json::Value,
+) -> Result<Vec<InterviewQuestion>, ToolError> {
+    let entries = parsed["questions"]
+        .as_array()
+        .ok_or_else(|| tool_exec_err(std::io::Error::other("missing 'questions' argument")))?;
 
     let mut questions = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -648,8 +796,8 @@ fn parse_question_type(question_type: Option<&str>) -> Result<QuestionType, Tool
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::tools::build_tool_definitions;
     use super::build_tool_executor_with_capabilities;
+    use crate::agent::tools::build_tool_definitions;
     use std::collections::HashSet;
     use std::thread;
     use std::time::Duration;
