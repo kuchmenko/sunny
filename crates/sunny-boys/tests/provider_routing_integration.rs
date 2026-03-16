@@ -13,7 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sunny_boys::ProviderRegistry;
 use sunny_mind::{
-    LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, StreamEvent, StreamResult,
+    LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, Provider, StreamEvent, StreamResult,
     TokenUsage,
 };
 use sunny_tasks::ModelsConfig;
@@ -34,8 +34,8 @@ impl MockProvider {
 
 #[async_trait]
 impl LlmProvider for MockProvider {
-    fn provider_id(&self) -> &str {
-        "mock"
+    fn provider(&self) -> Provider {
+        Provider::Anthropic
     }
 
     fn model_id(&self) -> &str {
@@ -51,7 +51,7 @@ impl LlmProvider for MockProvider {
                 total_tokens: 2,
             },
             finish_reason: "stop".to_string(),
-            provider_id: ProviderId("mock".to_string()),
+            provider: Provider::Anthropic,
             model_id: ModelId(self.model.clone()),
             tool_calls: None,
             reasoning_content: None,
@@ -223,8 +223,8 @@ fn test_system_prompt_has_composer_guidance() {
     struct NoopProvider;
     #[async_trait::async_trait]
     impl LlmProvider for NoopProvider {
-        fn provider_id(&self) -> &str {
-            "noop"
+        fn provider(&self) -> Provider {
+            Provider::Anthropic
         }
         fn model_id(&self) -> &str {
             "noop"
@@ -253,20 +253,24 @@ fn test_system_prompt_has_composer_guidance() {
 
     assert_eq!(session.messages()[0].role, ChatRole::System);
     assert!(
-        content.contains("composer"),
-        "system prompt must mention composer delegation pattern"
+        content.contains("# Tools"),
+        "system prompt must have Tools section"
     );
     assert!(
-        content.contains("\"quick\""),
-        "system prompt must describe quick category"
+        content.contains("executor"),
+        "system prompt must describe executor role"
     );
     assert!(
-        content.contains("\"standard\""),
-        "system prompt must describe standard category"
+        content.contains("investigator"),
+        "system prompt must describe investigator role"
     );
     assert!(
-        content.contains("\"deep\""),
-        "system prompt must describe deep category"
+        content.contains("low"),
+        "system prompt must describe low effort"
+    );
+    assert!(
+        content.contains("high"),
+        "system prompt must describe high effort"
     );
     assert!(
         !content.contains("claude-"),

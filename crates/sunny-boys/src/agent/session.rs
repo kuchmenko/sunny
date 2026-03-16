@@ -7,7 +7,8 @@ use std::{collections::HashMap, collections::HashSet};
 use crate::streaming_tool_loop::StreamingToolLoop;
 use crate::tool_loop::{ToolCallError, ToolExecutor};
 use sunny_mind::{
-    ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, StreamEvent, ToolChoice,
+    ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, Provider, StreamEvent, ToolChoice,
+    ToolDefinition, ToolGroup,
 };
 use sunny_store::{SavedSession, SessionStore, TokenBudget};
 use tokio_util::sync::CancellationToken;
@@ -41,6 +42,9 @@ pub enum AgentError {
 /// to [`StreamingToolLoop`].
 pub struct AgentSession {
     messages: Vec<ChatMessage>,
+    mode: Option<sunny_plans::model::PlanMode>,
+    tool_definitions: Vec<ToolDefinition>,
+    tool_policy: sunny_core::tool::ToolPolicy,
     budget: sunny_store::TokenBudget,
     provider: Arc<dyn LlmProvider>,
     root: PathBuf,
@@ -68,15 +72,21 @@ impl AgentSession {
         session_id: String,
         store: Arc<SessionStore>,
     ) -> Self {
-        let mut system_prompt = format!(
-            "You are Claude Code, Anthropic's official CLI for Claude.\n\n\
-             You are an expert software engineer working in the workspace at: {}.\n\n\
-             You have access to tools for reading, writing, editing files, executing shell \
-             commands, and searching code. Use them to help the user with coding tasks.\n\n\
-             Always think carefully before using tools. Prefer targeted tool calls over \
-             broad exploration.",
-            root.display()
-        );
+        // Provider-specific identity line.
+        let mut system_prompt = if provider.provider() == Provider::Anthropic {
+            format!(
+                "You are Claude Code, Anthropic's official CLI for Claude.\n\n\
+                 You are an expert software engineer working in the workspace at: {}.\n\n\
+                 Prefer targeted tool calls over broad exploration.",
+                root.display()
+            )
+        } else {
+            format!(
+                "You are an expert software engineer working in the workspace at: {}.\n\n\
+                 Prefer targeted tool calls over broad exploration.",
+                root.display()
+            )
+        };
 
         // Inject SUNNY.md context if available (capped at 12 000 chars total).
         if let Ok(context) = sunny_store::context_file::read_context_files(&root) {
@@ -95,27 +105,23 @@ impl AgentSession {
             }
         }
 
-        // Task management guidance for chat mode.
-        // (Task execution sessions use TaskSession::build_system_prompt() instead.)
+        // Dynamic tool section generated from actual loaded definitions.
+        let tool_definitions = build_tool_definitions();
+        system_prompt.push_str(&build_tool_section(&tool_definitions));
+
+        // Working style guidance.
+        system_prompt.push_str("\n\n# Working Style\n\n");
         system_prompt.push_str(
-            "\n\n# Task Management\n\n\
-             You have access to a task management system for delegating and decomposing complex work:\n\
-             - task_create: Create subtasks for parallel or sequential work. Each subtask gets its own agent session.\n\
-             - task_list: See all tasks and their statuses.\n\
-             - task_get: Get detailed info about a specific task.\n\
-             - task_complete: Mark your current task as complete (only when executing a task).\n\
-             - task_fail: Mark your current task as failed (only when executing a task).\n\
-             \n\
-             When given a complex task, act as a composer:\n\
-             1. Read 2-3 files to understand the structure (no more).\n\
-             2. Create focused subtasks immediately using task_create.\n\
-             3. Each subtask should have a clear description and acceptance criteria.\n\
-             4. Assign a category based on complexity:\n\
-                - \"quick\": Simple, mechanical work. File reads, grep, small edits, formatting.\n\
-                - \"standard\": Normal implementation work. Writing functions, tests, moderate logic.\n\
-                - \"deep\": Complex reasoning. Architecture decisions, multi-file refactoring, debugging.\n\
-             Do NOT try to do everything yourself. Delegate early, delegate often.",
+            "Prefer targeted reads over broad exploration -- the repo map is already loaded.\n",
         );
+        system_prompt
+            .push_str("Fix root causes, not symptoms. Never suppress type errors with casts.\n");
+        system_prompt.push_str(
+            "Delegate subtasks aggressively. When creating subtasks, assign role + effort:\n",
+        );
+        system_prompt.push_str("  role: executor | investigator | planner | verifier\n");
+        system_prompt.push_str("  effort: low | moderate | high | critical\n");
+        system_prompt.push_str("Higher effort = extended thinking budget. Use critical only for decisions that are hard to reverse.");
 
         let messages = vec![ChatMessage {
             role: ChatRole::System,
@@ -127,6 +133,9 @@ impl AgentSession {
 
         Self {
             messages,
+            mode: None,
+            tool_definitions: tool_definitions.clone(),
+            tool_policy: build_tool_policy(),
             budget: TokenBudget::new(200_000, provider.token_counter()),
             provider,
             root,
@@ -159,6 +168,9 @@ impl AgentSession {
         }
         Self {
             messages,
+            mode: None,
+            tool_definitions: build_tool_definitions(),
+            tool_policy: build_tool_policy(),
             budget: TokenBudget::new(200_000, provider.token_counter()),
             provider,
             root,
@@ -182,6 +194,59 @@ impl AgentSession {
     pub fn with_approval_gate(mut self, gate: crate::agent::approval::SharedApprovalGate) -> Self {
         self.approval_gate = Some(gate);
         self
+    }
+
+    pub fn set_mode(&mut self, mode: sunny_plans::model::PlanMode, plan_id: &str) {
+        use sunny_plans::planner_agent::build_planner_tool_names;
+
+        match mode {
+            sunny_plans::model::PlanMode::Smart => {
+                self.mode = Some(sunny_plans::model::PlanMode::Smart);
+
+                let smart_tool_names = build_planner_tool_names();
+                let smart_names_set: HashSet<&str> =
+                    smart_tool_names.iter().map(|name| name.as_str()).collect();
+                self.tool_definitions = build_tool_definitions()
+                    .into_iter()
+                    .filter(|definition| smart_names_set.contains(definition.name.as_str()))
+                    .collect();
+
+                let allowed: Vec<&str> =
+                    smart_tool_names.iter().map(|name| name.as_str()).collect();
+                self.tool_policy = sunny_core::tool::ToolPolicy::allow_list(&allowed);
+
+                let msg_text = format!(
+                    "[Mode Switch] You are now in Smart planning mode.\n\
+                     - Build plans exclusively using plan_* tools (plan_add_task, plan_add_dependency, plan_finalize, etc.)\n\
+                     - NEVER output plans as raw text or markdown -- ALL planning goes through plan tools\n\
+                     - Investigation tools (fs_read, fs_scan, grep, lsp_*) are available for codebase research\n\
+                     - Mutation tools (fs_write, fs_edit, shell_exec) are NOT available\n\
+                     - Active plan ID: {}",
+                    plan_id
+                );
+                self.messages.push(ChatMessage {
+                    role: ChatRole::User,
+                    content: msg_text,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+            sunny_plans::model::PlanMode::Quick => {
+                self.mode = None;
+                self.tool_definitions = build_tool_definitions();
+                self.tool_policy = build_tool_policy();
+
+                self.messages.push(ChatMessage {
+                    role: ChatRole::User,
+                    content: "[Mode Switch] Restored to Quick mode. All tools available."
+                        .to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
+        }
     }
 
     /// Return a clone of the cancellation token for external cancellation.
@@ -240,7 +305,7 @@ impl AgentSession {
             messages: self.messages.clone(),
             max_tokens: Some(8192),
             temperature: None,
-            tools: Some(build_tool_definitions()),
+            tools: Some(self.tool_definitions.clone()),
             tool_choice: Some(ToolChoice::Auto),
             thinking_budget: None,
         };
@@ -255,11 +320,12 @@ impl AgentSession {
         let max_iterations = 1000;
         let loop_runner = StreamingToolLoop::new(
             Arc::clone(&self.provider),
-            build_tool_policy(),
+            self.tool_policy.clone(),
             max_iterations,
             self.cancel.clone(),
         )
-        .with_dedup_tools(Self::dedup_eligible_tools());
+        .with_dedup_tools(Self::dedup_eligible_tools())
+        .with_tool_timeouts(Self::tool_timeout_overrides());
 
         let result = loop_runner.run(request, tool_executor, on_event).await?;
         let content = result.content.clone();
@@ -610,6 +676,44 @@ impl AgentSession {
         .map(|s| s.to_string())
         .collect()
     }
+
+    fn tool_timeout_overrides() -> std::collections::HashMap<String, std::time::Duration> {
+        // Human-interaction tools block until the user responds — no timeout.
+        [("interview".to_string(), std::time::Duration::MAX)]
+            .into_iter()
+            .collect()
+    }
+}
+
+/// Generate the `# Tools` section of the system prompt dynamically from loaded definitions.
+/// Groups tools by [`ToolGroup`], emitting one compact section per group.
+/// Tools with a `hint` field get an extra guidance line after the names.
+pub fn build_tool_section(definitions: &[ToolDefinition]) -> String {
+    const GROUPS: &[(ToolGroup, &str)] = &[
+        (ToolGroup::Navigation, "Code Navigation (read-only)"),
+        (ToolGroup::Mutation, "Code Mutation"),
+        (ToolGroup::Interaction, "User Interaction"),
+        (ToolGroup::Tasks, "Task System"),
+        (ToolGroup::Plans, "Plan System (/smart mode)"),
+    ];
+
+    let mut out = String::from("\n\n# Tools");
+    for (group, heading) in GROUPS {
+        let tools: Vec<&ToolDefinition> =
+            definitions.iter().filter(|d| d.group == *group).collect();
+        if tools.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n\n## {heading}\n"));
+        let names: Vec<&str> = tools.iter().map(|d| d.name.as_str()).collect();
+        out.push_str(&names.join(", "));
+        for tool in &tools {
+            if let Some(hint) = tool.hint {
+                out.push_str(&format!("\n{}: {}", tool.name, hint));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -620,7 +724,7 @@ mod tests {
 
     use async_trait::async_trait;
     use sunny_mind::{
-        LlmError, LlmRequest, LlmResponse, ModelId, ProviderId, StreamEvent, StreamResult,
+        LlmError, LlmRequest, LlmResponse, ModelId, Provider, StreamEvent, StreamResult,
         TokenUsage, ToolCall,
     };
     use sunny_store::Database;
@@ -641,8 +745,8 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for MockStreamProvider {
-        fn provider_id(&self) -> &str {
-            "mock"
+        fn provider(&self) -> Provider {
+            Provider::Anthropic
         }
 
         fn model_id(&self) -> &str {
@@ -658,7 +762,7 @@ mod tests {
                     total_tokens: 2,
                 },
                 finish_reason: "end_turn".to_string(),
-                provider_id: ProviderId("mock".to_string()),
+                provider: Provider::Anthropic,
                 model_id: ModelId("mock-stream".to_string()),
                 tool_calls: None,
                 reasoning_content: None,
@@ -945,6 +1049,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_set_mode_smart_filters_tools() {
+        let dir = tempdir().expect("should create temp dir");
+        let mut session = make_session_in(&dir);
+        let initial_count = session.tool_definitions.len();
+
+        session.set_mode(sunny_plans::model::PlanMode::Smart, "plan-123");
+
+        let names: Vec<&str> = session
+            .tool_definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"fs_write"),
+            "fs_write should be absent in Smart mode"
+        );
+        assert!(
+            !names.contains(&"shell_exec"),
+            "shell_exec should be absent in Smart mode"
+        );
+        assert!(
+            names.contains(&"fs_read"),
+            "fs_read should be present in Smart mode"
+        );
+        assert!(
+            session.tool_definitions.len() < initial_count,
+            "Smart mode should have fewer tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_mode_quick_restores_tools() {
+        let dir = tempdir().expect("should create temp dir");
+        let mut session = make_session_in(&dir);
+        let initial_count = session.tool_definitions.len();
+
+        session.set_mode(sunny_plans::model::PlanMode::Smart, "plan-123");
+        session.set_mode(sunny_plans::model::PlanMode::Quick, "plan-123");
+
+        assert_eq!(
+            session.tool_definitions.len(),
+            initial_count,
+            "Quick should restore all tools"
+        );
+        assert!(
+            session.tool_policy.is_allowed("fs_write"),
+            "Quick policy should allow fs_write"
+        );
+        assert!(session.mode.is_none(), "Quick mode should set mode to None");
+    }
+
+    #[tokio::test]
+    async fn test_set_mode_injects_message() {
+        let dir = tempdir().expect("should create temp dir");
+        let mut session = make_session_in(&dir);
+        let messages_before = session.messages.len();
+
+        session.set_mode(sunny_plans::model::PlanMode::Smart, "my-plan-id");
+
+        assert_eq!(
+            session.messages.len(),
+            messages_before + 1,
+            "set_mode should inject one message"
+        );
+        let last_message = session
+            .messages
+            .last()
+            .expect("mode switch message should exist");
+        assert!(
+            last_message.content.contains("Smart planning mode"),
+            "message should mention Smart mode"
+        );
+        assert!(
+            last_message.content.contains("my-plan-id"),
+            "message should contain plan_id"
+        );
+    }
+
     fn user_message(content: &str) -> ChatMessage {
         ChatMessage {
             role: ChatRole::User,
@@ -1195,24 +1378,28 @@ mod tests {
             "system prompt should mention task_get"
         );
         assert!(
-            content.contains("Task Management"),
-            "system prompt should have Task Management section"
+            content.contains("# Tools"),
+            "system prompt should have Tools section"
         );
         assert!(
-            content.contains("composer"),
-            "system prompt should mention composer delegation pattern"
+            content.contains("Working Style"),
+            "system prompt should have Working Style section"
         );
         assert!(
-            content.contains("\"quick\""),
-            "system prompt should describe quick category"
+            content.contains("executor"),
+            "system prompt should describe executor role"
         );
         assert!(
-            content.contains("\"standard\""),
-            "system prompt should describe standard category"
+            content.contains("investigator"),
+            "system prompt should describe investigator role"
         );
         assert!(
-            content.contains("\"deep\""),
-            "system prompt should describe deep category"
+            content.contains("low"),
+            "system prompt should describe low effort"
+        );
+        assert!(
+            content.contains("high"),
+            "system prompt should describe high effort"
         );
         assert!(
             !content.contains("claude-"),

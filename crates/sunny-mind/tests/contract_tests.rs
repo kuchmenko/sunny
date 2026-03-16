@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 use serde_json::json;
 use sunny_mind::{
-    ChatMessage, ChatRole, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage, ToolCall,
+    ChatMessage, ChatRole, LlmRequest, LlmResponse, ModelId, Provider, TokenUsage, ToolCall,
     ToolChoice, ToolDefinition,
 };
 
@@ -43,6 +43,8 @@ fn arb_tool_definition() -> impl Strategy<Value = ToolDefinition> {
                     field_name: { "type": "string" }
                 }
             }),
+            group: Default::default(),
+            hint: None,
         })
 }
 
@@ -109,7 +111,7 @@ fn arb_llm_response() -> impl Strategy<Value = LlmResponse> {
                 input_tokens,
                 output_tokens,
                 finish_reason,
-                provider_id,
+                _provider_id,
                 model_id,
                 tool_calls,
             )| {
@@ -121,7 +123,7 @@ fn arb_llm_response() -> impl Strategy<Value = LlmResponse> {
                         total_tokens: input_tokens + output_tokens,
                     },
                     finish_reason,
-                    provider_id: ProviderId(provider_id),
+                    provider: Provider::Anthropic,
                     model_id: ModelId(model_id),
                     tool_calls,
                     reasoning_content: None,
@@ -198,6 +200,8 @@ fn test_request_full_contract() {
                     "path": { "type": "string" }
                 }
             }),
+            group: Default::default(),
+            hint: None,
         }]),
         tool_choice: Some(ToolChoice::Auto),
         thinking_budget: None,
@@ -236,7 +240,7 @@ fn test_response_minimal_contract() {
             total_tokens: 15,
         },
         finish_reason: "stop".to_string(),
-        provider_id: ProviderId("kimi".to_string()),
+        provider: Provider::Anthropic,
         model_id: ModelId("moonshot-v1".to_string()),
         tool_calls: None,
         reasoning_content: None,
@@ -249,7 +253,7 @@ fn test_response_minimal_contract() {
     assert!(value.get("content").is_some());
     assert!(value.get("usage").is_some());
     assert!(value.get("finish_reason").is_some());
-    assert!(value.get("provider_id").is_some());
+    assert!(value.get("provider").is_some());
     assert!(value.get("model_id").is_some());
 
     // tool_calls should NOT be present when None
@@ -274,7 +278,7 @@ fn test_response_with_tool_calls_contract() {
             total_tokens: 45,
         },
         finish_reason: "tool_calls".to_string(),
-        provider_id: ProviderId("kimi".to_string()),
+        provider: Provider::Anthropic,
         model_id: ModelId("moonshot-v1".to_string()),
         tool_calls: Some(vec![ToolCall {
             id: "call_123".to_string(),
@@ -389,6 +393,8 @@ fn test_tool_definition_contract() {
             },
             "required": ["path"]
         }),
+        group: Default::default(),
+        hint: None,
     };
 
     let json = serde_json::to_string(&tool).expect("should serialize");
@@ -474,7 +480,7 @@ fn test_contract_roundtrip() {
             total_tokens: 15,
         },
         finish_reason: "stop".to_string(),
-        provider_id: ProviderId("test".to_string()),
+        provider: Provider::Anthropic,
         model_id: ModelId("test-model".to_string()),
         tool_calls: Some(vec![ToolCall {
             id: "call_1".to_string(),

@@ -1,7 +1,7 @@
 use crate::error::LlmError;
 use crate::stream::{StreamEvent, StreamResult};
 use crate::tokenizer::{CharHeuristicCounter, TokenCounter};
-use crate::types::{LlmRequest, LlmResponse};
+use crate::types::{LlmRequest, LlmResponse, Provider};
 
 // ADR: chat_stream() addition (class L — public API change)
 //
@@ -22,7 +22,7 @@ use crate::types::{LlmRequest, LlmResponse};
 /// and should support tool definitions/tool call responses when available.
 #[async_trait::async_trait]
 pub trait LlmProvider: Send + Sync {
-    fn provider_id(&self) -> &str;
+    fn provider(&self) -> Provider;
     fn model_id(&self) -> &str;
     async fn chat(&self, req: LlmRequest) -> Result<LlmResponse, LlmError>;
 
@@ -61,7 +61,7 @@ pub trait LlmProvider: Send + Sync {
 mod tests {
     use super::*;
     use crate::mock_provider::MockToolCallProvider;
-    use crate::types::{ChatMessage, ChatRole, ModelId, ProviderId, TokenUsage};
+    use crate::types::{ChatMessage, ChatRole, ModelId, Provider, TokenUsage};
 
     #[tokio::test]
     async fn test_default_chat_stream_wraps_chat() {
@@ -75,7 +75,7 @@ mod tests {
                 total_tokens: 7,
             },
             finish_reason: "stop".to_string(),
-            provider_id: ProviderId("mock".to_string()),
+            provider: Provider::Anthropic,
             model_id: ModelId("mock-tool-call".to_string()),
             tool_calls: None,
             reasoning_content: None,

@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 use crate::error::LlmError;
 use crate::provider::LlmProvider;
 use crate::stream::StreamResult;
-use crate::types::{ChatRole, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage};
+use crate::types::{ChatRole, LlmRequest, LlmResponse, ModelId, Provider, TokenUsage};
 
 use super::credentials::{
     load_credentials, refresh_oauth_token, save_credentials, OpenAiCredentials,
@@ -262,7 +262,7 @@ impl OpenAiProvider {
             content,
             usage,
             finish_reason,
-            provider_id: ProviderId(self.provider_id().to_string()),
+            provider: Provider::OpenAi,
             model_id: ModelId(model),
             tool_calls,
             reasoning_content: None,
@@ -272,8 +272,8 @@ impl OpenAiProvider {
 
 #[async_trait::async_trait]
 impl LlmProvider for OpenAiProvider {
-    fn provider_id(&self) -> &str {
-        "openai"
+    fn provider(&self) -> Provider {
+        Provider::OpenAi
     }
 
     fn model_id(&self) -> &str {
@@ -466,6 +466,8 @@ mod tests {
                     },
                     "required": ["path"]
                 }),
+                group: Default::default(),
+                hint: None,
             }]),
             tool_choice: None,
             thinking_budget: None,
@@ -579,7 +581,7 @@ mod tests {
     #[test]
     fn test_provider_trait_methods() {
         let provider = build_test_provider("sk-test", "gpt-5.4");
-        assert_eq!(provider.provider_id(), "openai");
+        assert_eq!(provider.provider(), Provider::OpenAi);
         assert_eq!(provider.model_id(), "gpt-5.4");
     }
 }

@@ -151,3 +151,53 @@ fn test_round_trip_quick_smart_quick_preserves_tasks() {
         .count();
     assert_eq!(mode_switch_events, 2);
 }
+
+#[test]
+fn test_switch_to_smart_works_from_draft() {
+    let (store, dir) = make_plan_store();
+    let workspace_id = make_workspace_id(&dir);
+    let store = Arc::new(store);
+    let orchestrator = PlanOrchestrator::new(Arc::clone(&store));
+
+    // Brand-new plan is Draft — mode switch must work without any activation.
+    let plan = orchestrator
+        .create_plan(&workspace_id, "draft switch", None, PlanMode::Quick, None)
+        .expect("should create plan");
+    assert_eq!(plan.status, PlanStatus::Draft);
+
+    orchestrator
+        .switch_to_smart(&plan.id)
+        .expect("should switch to smart from draft");
+
+    let updated = store
+        .get_plan(&plan.id)
+        .expect("should fetch plan")
+        .expect("plan should exist");
+    assert_eq!(updated.mode, PlanMode::Smart);
+    assert_eq!(updated.status, PlanStatus::Draft);
+}
+
+#[test]
+fn test_switch_to_smart_blocked_when_terminal() {
+    let (store, dir) = make_plan_store();
+    let workspace_id = make_workspace_id(&dir);
+    let store = Arc::new(store);
+    let orchestrator = PlanOrchestrator::new(Arc::clone(&store));
+
+    let plan = orchestrator
+        .create_plan(&workspace_id, "terminal", None, PlanMode::Quick, None)
+        .expect("should create plan");
+
+    // Drive plan to Completed state.
+    orchestrator.finalize_plan(&plan.id).expect("finalize");
+    orchestrator.activate_plan(&plan.id).expect("activate");
+    orchestrator
+        .complete_plan(&plan.id, "done")
+        .expect("complete");
+
+    let err = orchestrator.switch_to_smart(&plan.id).unwrap_err();
+    assert!(
+        err.to_string().contains("non-terminal"),
+        "error should mention non-terminal: {err}"
+    );
+}

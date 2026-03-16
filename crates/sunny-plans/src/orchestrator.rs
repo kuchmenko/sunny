@@ -29,8 +29,23 @@ impl PlanOrchestrator {
 
     pub fn finalize_plan(&self, plan_id: &str) -> Result<Plan, PlanError> {
         let plan = self.require_plan(plan_id)?;
-        ensure_status(&plan, PlanStatus::Draft)?;
 
+        // Allow finalize on Draft or Ready (idempotent)
+        if !matches!(plan.status, PlanStatus::Draft | PlanStatus::Ready) {
+            return Err(PlanError::InvalidStatus {
+                status: format!("expected Draft or Ready, got {}", plan.status),
+            });
+        }
+
+        // If already Ready, re-validate and return without new event
+        if plan.status == PlanStatus::Ready {
+            let state = self.store.get_plan_state(plan_id)?;
+            // Re-validate DAG
+            crate::tools::validate_dag(&state)?;
+            return self.require_plan(plan_id);
+        }
+
+        // Draft -> Ready transition
         self.store.update_plan_status(plan_id, PlanStatus::Ready)?;
         self.store.append_event(
             plan_id,
@@ -89,9 +104,12 @@ impl PlanOrchestrator {
 
     pub fn switch_to_smart(&self, plan_id: &str) -> Result<HandoffContext, PlanError> {
         let plan = self.require_plan(plan_id)?;
-        if !matches!(plan.status, PlanStatus::Active | PlanStatus::Ready) {
+        if matches!(plan.status, PlanStatus::Completed | PlanStatus::Failed) {
             return Err(PlanError::InvalidStatus {
-                status: format!("switch_to_smart requires active/ready, got {}", plan.status),
+                status: format!(
+                    "switch_to_smart requires non-terminal status, got {}",
+                    plan.status
+                ),
             });
         }
 

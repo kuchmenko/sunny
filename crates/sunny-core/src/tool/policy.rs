@@ -8,6 +8,7 @@ const READONLY_TOOLS: &[&str] = &["fs_read", "fs_scan", "text_grep"];
 /// allowlist. Callers should use [`ToolPolicy::is_allowed`] to decide whether a
 /// tool may execute and [`ToolPolicy::is_mutation`] to classify unknown tools as
 /// mutating by default.
+#[derive(Clone)]
 pub struct ToolPolicy {
     allowed_tools: HashSet<String>,
     denied_tools: HashSet<String>,
@@ -48,6 +49,19 @@ impl ToolPolicy {
     /// Alias for [`ToolPolicy::deny_list`].
     pub fn allow_all_except(denied: &[&str]) -> Self {
         Self::deny_list(denied)
+    }
+
+    /// Build an allow-list policy that permits only specified tools.
+    ///
+    /// All tools not in the allow list are blocked. This is useful for
+    /// permissive policies where you want to allow only specific safe tools
+    /// while blocking everything else.
+    pub fn allow_list(allowed: &[&str]) -> Self {
+        Self {
+            allowed_tools: allowed.iter().map(|s| s.to_string()).collect(),
+            denied_tools: HashSet::new(),
+            use_deny_list: false,
+        }
     }
 
     /// Return `true` when the tool name is explicitly present in the allowlist.
@@ -148,5 +162,27 @@ mod tests {
         assert!(policy.is_allowed("fs_read"));
         assert!(policy.is_allowed("exec"));
         assert!(policy.is_allowed("write"));
+    }
+
+    #[test]
+    fn test_allow_list_permits_listed_tool() {
+        let policy = ToolPolicy::allow_list(&["fs_read", "plan_create"]);
+        assert!(policy.is_allowed("fs_read"));
+        assert!(policy.is_allowed("plan_create"));
+    }
+
+    #[test]
+    fn test_allow_list_blocks_unlisted_tool() {
+        let policy = ToolPolicy::allow_list(&["fs_read"]);
+        assert!(!policy.is_allowed("fs_write"));
+        assert!(!policy.is_allowed("exec"));
+    }
+
+    #[test]
+    fn test_allow_list_empty_denies_all() {
+        let policy = ToolPolicy::allow_list(&[]);
+        assert!(!policy.is_allowed("fs_read"));
+        assert!(!policy.is_allowed("fs_scan"));
+        assert!(!policy.is_allowed("exec"));
     }
 }

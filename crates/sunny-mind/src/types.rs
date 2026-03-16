@@ -1,11 +1,29 @@
 use serde::{Deserialize, Serialize};
 
-/// Unique identifier for an LLM provider (e.g. "openai", "kimi").
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ProviderId(pub String);
+/// Known LLM providers. Exhaustive — all supported providers are listed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Anthropic,
+    OpenAi,
+}
 
-/// Unique identifier for a model within a provider (e.g. "gpt-4o", "moonshot-v1-8k").
+impl Provider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "anthropic",
+            Provider::OpenAi => "openai",
+        }
+    }
+}
+
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Unique identifier for a model within a provider (e.g. "gpt-4o", "claude-sonnet-4-6").
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ModelId(pub String);
@@ -35,6 +53,7 @@ pub struct ChatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
 }
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmRequest {
     pub messages: Vec<ChatMessage>,
@@ -52,13 +71,36 @@ pub struct LlmRequest {
 
 /// Tool metadata exposed to the provider wire protocol.
 ///
-/// `parameters` should contain a JSON Schema object that the target provider can
-/// forward to model tool/function-calling APIs.
+/// `parameters` must be a JSON Schema object forwarded to the provider API.
+/// `group` and `hint` are Sunny-internal: NOT sent to the provider (`#[serde(skip)]`).
+/// They drive dynamic system prompt generation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    /// Logical group for system prompt section placement (not sent to provider).
+    #[serde(skip, default)]
+    pub group: ToolGroup,
+    /// Short "when to use" hint for the system prompt (not sent to provider).
+    #[serde(skip)]
+    pub hint: Option<&'static str>,
+}
+
+/// Logical tool group for system prompt section placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ToolGroup {
+    /// Read-only: file reads, grep, LSP queries, git reads, symbol search.
+    #[default]
+    Navigation,
+    /// State-changing: file writes, shell, git writes, LSP rename.
+    Mutation,
+    /// Human-interaction: interview.
+    Interaction,
+    /// Task orchestration: task_create/list/get/complete/fail/claim/ask.
+    Tasks,
+    /// Plan management: plan_* and task_request_replan.
+    Plans,
 }
 
 /// A tool invocation requested by a provider.
@@ -122,7 +164,7 @@ pub struct LlmResponse {
     pub content: String,
     pub usage: TokenUsage,
     pub finish_reason: String,
-    pub provider_id: ProviderId,
+    pub provider: Provider,
     pub model_id: ModelId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -131,9 +173,10 @@ pub struct LlmResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
 }
+
 /// Policy for routing requests across LLM providers.
 ///
-/// TODO: Add `Fallback(Vec<ProviderId>)` variant for failover routing
+/// TODO: Add `Fallback(Vec<Provider>)` variant for failover routing
 /// TODO: Add `CostOptimized { budget_limit: f64 }` variant for cost-aware routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProviderRoutingPolicy {

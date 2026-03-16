@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sunny_boys::agent::AgentSession;
 use sunny_mind::{
-    ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId, StreamEvent,
+    ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, Provider, StreamEvent,
     StreamResult, TokenUsage,
 };
 use sunny_store::{Database, SessionStore};
@@ -31,8 +31,8 @@ impl MockStreamProvider {
 
 #[async_trait]
 impl LlmProvider for MockStreamProvider {
-    fn provider_id(&self) -> &str {
-        "mock"
+    fn provider(&self) -> Provider {
+        Provider::Anthropic
     }
 
     fn model_id(&self) -> &str {
@@ -48,7 +48,7 @@ impl LlmProvider for MockStreamProvider {
                 total_tokens: 2,
             },
             finish_reason: "stop".to_string(),
-            provider_id: ProviderId("mock".to_string()),
+            provider: Provider::Anthropic,
             model_id: ModelId("mock-stream".to_string()),
             tool_calls: None,
             reasoning_content: None,

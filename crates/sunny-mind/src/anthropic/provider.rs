@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 use crate::error::LlmError;
 use crate::provider::LlmProvider;
 use crate::stream::StreamResult;
-use crate::types::{ChatRole, LlmRequest, LlmResponse, ModelId, ProviderId, TokenUsage, ToolCall};
+use crate::types::{ChatRole, LlmRequest, LlmResponse, ModelId, Provider, TokenUsage, ToolCall};
 
 use super::credentials::{
     load_credentials, refresh_oauth_token, save_credentials, AnthropicCredentials, CredentialSource,
@@ -375,7 +375,7 @@ impl AnthropicProvider {
             content: text_parts.join(""),
             usage,
             finish_reason,
-            provider_id: ProviderId(self.provider_id().to_string()),
+            provider: Provider::Anthropic,
             model_id: ModelId(model),
             tool_calls: if tool_calls.is_empty() {
                 None
@@ -389,8 +389,8 @@ impl AnthropicProvider {
 
 #[async_trait::async_trait]
 impl LlmProvider for AnthropicProvider {
-    fn provider_id(&self) -> &str {
-        "anthropic"
+    fn provider(&self) -> Provider {
+        Provider::Anthropic
     }
 
     fn model_id(&self) -> &str {
@@ -788,7 +788,7 @@ mod tests {
             client: reqwest::Client::new(),
             model: "claude-sonnet-4-6".to_string(),
         };
-        assert_eq!(provider.provider_id(), "anthropic");
+        assert_eq!(provider.provider(), Provider::Anthropic);
         assert_eq!(provider.model_id(), "claude-sonnet-4-6");
     }
 

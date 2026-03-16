@@ -49,6 +49,8 @@ pub struct StreamingToolLoop<P: LlmProvider + ?Sized> {
     tool_timeout: Duration,
     provider_timeout: Duration,
     dedup_tools: HashSet<String>,
+    /// Per-tool timeout overrides. Tools not listed use `tool_timeout`.
+    tool_timeouts: HashMap<String, Duration>,
 }
 
 impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
@@ -66,11 +68,18 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
             tool_timeout: tool_call_timeout(),
             provider_timeout: tool_provider_timeout(),
             dedup_tools: HashSet::new(),
+            tool_timeouts: HashMap::new(),
         }
     }
 
     pub fn with_dedup_tools(mut self, tools: HashSet<String>) -> Self {
         self.dedup_tools = tools;
+        self
+    }
+
+    /// Register per-tool timeout overrides (e.g. `Duration::MAX` for human-interaction tools).
+    pub fn with_tool_timeouts(mut self, timeouts: HashMap<String, Duration>) -> Self {
+        self.tool_timeouts = timeouts;
         self
     }
 
@@ -259,7 +268,12 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                         continue;
                     }
                 }
-                let tool_result = timeout(self.tool_timeout, async move {
+                let effective_timeout = self
+                    .tool_timeouts
+                    .get(&call_name)
+                    .copied()
+                    .unwrap_or(self.tool_timeout);
+                let tool_result = timeout(effective_timeout, async move {
                     tokio::task::spawn_blocking(move || {
                         executor(&call_id, &call_name, &call_arguments, depth)
                     })
@@ -356,8 +370,8 @@ mod tests {
 
     use sunny_core::tool::{ToolError, ToolPolicy};
     use sunny_mind::{
-        ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, StreamEvent, StreamResult,
-        TokenUsage,
+        ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, Provider, StreamEvent,
+        StreamResult, TokenUsage,
     };
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
@@ -385,8 +399,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LlmProvider for MockStreamProvider {
-        fn provider_id(&self) -> &str {
-            "mock"
+        fn provider(&self) -> Provider {
+            Provider::Anthropic
         }
 
         fn model_id(&self) -> &str {
@@ -755,8 +769,8 @@ mod tests {
 
         #[async_trait::async_trait]
         impl LlmProvider for SlowStreamProvider {
-            fn provider_id(&self) -> &str {
-                "slow"
+            fn provider(&self) -> Provider {
+                Provider::Anthropic
             }
 
             fn model_id(&self) -> &str {

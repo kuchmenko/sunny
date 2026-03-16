@@ -146,6 +146,8 @@ mod tests {
                 name: self.tool_name.to_string(),
                 description: format!("echo tool: {}", self.tool_name),
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
+                group: Default::default(),
+                hint: None,
             }
         }
 

@@ -76,6 +76,8 @@ impl Tool for FsReadTool {
                 },
                 "required": ["path"]
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -143,6 +145,8 @@ impl Tool for FsScanTool {
                 },
                 "required": ["path"]
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -201,6 +205,8 @@ impl Tool for FsWriteTool {
                 },
                 "required": ["path", "content"]
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -260,6 +266,8 @@ impl Tool for FsEditTool {
                 },
                 "required": ["path", "old_string", "new_string"]
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -316,6 +324,8 @@ impl Tool for ShellExecTool {
                 },
                 "required": ["command"]
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -387,6 +397,8 @@ impl Tool for TextGrepTool {
                 },
                 "required": ["path", "pattern"]
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -453,6 +465,8 @@ impl Tool for GrepFilesTool {
                 },
                 "required": ["path", "pattern"]
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -517,6 +531,8 @@ impl Tool for GitLogTool {
                     }
                 }
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -561,6 +577,8 @@ impl Tool for GitDiffTool {
                     }
                 }
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -604,6 +622,8 @@ impl Tool for GitStatusTool {
                     }
                 }
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -662,6 +682,8 @@ impl Tool for GitCommitTool {
                 },
                 "required": ["message"]
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -737,6 +759,8 @@ impl Tool for GitBranchTool {
                 },
                 "required": ["name"]
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -797,6 +821,8 @@ impl Tool for GitCheckoutTool {
                 },
                 "required": ["target"]
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 
@@ -1107,6 +1133,8 @@ impl Tool for CodebaseSearchTool {
                 },
                 "required": ["query"]
             }),
+            group: Default::default(),
+            hint: None,
         }
     }
 

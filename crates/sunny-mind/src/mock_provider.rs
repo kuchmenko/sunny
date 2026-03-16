@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 
 use crate::error::LlmError;
 use crate::provider::LlmProvider;
-use crate::types::{LlmRequest, LlmResponse};
+use crate::types::{LlmRequest, LlmResponse, Provider};
 
 /// Mock LLM provider for testing tool_call loops.
 ///
@@ -24,8 +24,8 @@ impl MockToolCallProvider {
 
 #[async_trait::async_trait]
 impl LlmProvider for MockToolCallProvider {
-    fn provider_id(&self) -> &str {
-        "mock"
+    fn provider(&self) -> Provider {
+        Provider::Anthropic
     }
 
     fn model_id(&self) -> &str {
@@ -43,7 +43,7 @@ impl LlmProvider for MockToolCallProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ModelId, ProviderId, TokenUsage, ToolCall};
+    use crate::types::{ModelId, Provider, TokenUsage, ToolCall};
 
     fn make_response(content: &str, finish_reason: &str) -> LlmResponse {
         LlmResponse {
@@ -54,7 +54,7 @@ mod tests {
                 total_tokens: 15,
             },
             finish_reason: finish_reason.to_string(),
-            provider_id: ProviderId("mock".to_string()),
+            provider: Provider::Anthropic,
             model_id: ModelId("mock-tool-call".to_string()),
             tool_calls: None,
             reasoning_content: None,

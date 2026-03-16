@@ -1,5 +1,5 @@
 use serde_json;
-use sunny_mind::ToolDefinition;
+use sunny_mind::{ToolDefinition, ToolGroup};
 
 pub fn build_plan_tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -25,6 +25,8 @@ pub fn build_plan_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["name", "mode"]
             }),
+            group: ToolGroup::Plans,
+            hint: None,
         },
         ToolDefinition {
             name: "plan_add_task".to_string(),
@@ -54,6 +56,8 @@ pub fn build_plan_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["plan_id", "task_id", "title"]
             }),
+            group: ToolGroup::Plans,
+            hint: None,
         },
         ToolDefinition {
             name: "plan_add_dependency".to_string(),
@@ -76,6 +80,8 @@ pub fn build_plan_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["plan_id", "from_task", "to_task"]
             }),
+            group: ToolGroup::Plans,
+            hint: None,
         },
         ToolDefinition {
             name: "plan_remove_task".to_string(),
@@ -99,6 +105,8 @@ pub fn build_plan_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["plan_id", "task_id", "strategy"]
             }),
+            group: ToolGroup::Plans,
+            hint: None,
         },
         ToolDefinition {
             name: "plan_query_state".to_string(),
@@ -113,6 +121,8 @@ pub fn build_plan_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["plan_id"]
             }),
+            group: ToolGroup::Plans,
+            hint: None,
         },
         ToolDefinition {
             name: "plan_finalize".to_string(),
@@ -127,6 +137,8 @@ pub fn build_plan_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["plan_id"]
             }),
+            group: ToolGroup::Plans,
+            hint: None,
         },
         ToolDefinition {
             name: "plan_replan".to_string(),
@@ -152,6 +164,8 @@ pub fn build_plan_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["plan_id", "changes"]
             }),
+            group: ToolGroup::Plans,
+            hint: None,
         },
         ToolDefinition {
             name: "plan_record_decision".to_string(),
@@ -192,6 +206,8 @@ pub fn build_plan_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["plan_id", "decision"]
             }),
+            group: ToolGroup::Plans,
+            hint: None,
         },
         ToolDefinition {
             name: "plan_add_constraint".to_string(),
@@ -219,6 +235,8 @@ pub fn build_plan_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["plan_id", "constraint_type", "description"]
             }),
+            group: ToolGroup::Plans,
+            hint: None,
         },
         ToolDefinition {
             name: "plan_add_goal".to_string(),
@@ -242,6 +260,8 @@ pub fn build_plan_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["plan_id", "description", "priority"]
             }),
+            group: ToolGroup::Plans,
+            hint: None,
         },
         ToolDefinition {
             name: "plan_update_goal".to_string(),
@@ -261,6 +281,8 @@ pub fn build_plan_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["goal_id", "status"]
             }),
+            group: ToolGroup::Plans,
+            hint: None,
         },
     ]
 }

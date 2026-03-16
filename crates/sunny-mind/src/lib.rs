@@ -30,8 +30,9 @@ pub use provider::LlmProvider;
 pub use stream::{StreamEvent, StreamResult};
 pub use tokenizer::{CharHeuristicCounter, TiktokenCounter, TokenCounter};
 pub use types::{
-    ChatMessage, ChatRole, LlmRequest, LlmResponse, ModelId, ProviderEconomics, ProviderId,
+    ChatMessage, ChatRole, LlmRequest, LlmResponse, ModelId, Provider, ProviderEconomics,
     ProviderRoutingPolicy, TokenUsage, ToolCall, ToolCallResult, ToolChoice, ToolDefinition,
+    ToolGroup,
 };
 
 #[cfg(test)]
@@ -113,14 +114,14 @@ mod tests {
                 total_tokens: 30,
             },
             finish_reason: "stop".to_string(),
-            provider_id: ProviderId("test-provider".to_string()),
+            provider: Provider::Anthropic,
             model_id: ModelId("test-model".to_string()),
             tool_calls: None,
             reasoning_content: None,
         };
         assert_eq!(res.content, "Generated text");
         assert_eq!(res.finish_reason, "stop");
-        assert_eq!(res.provider_id, ProviderId("test-provider".to_string()));
+        assert_eq!(res.provider, Provider::Anthropic);
         assert_eq!(res.model_id, ModelId("test-model".to_string()));
         assert_eq!(res.usage.input_tokens, 10);
         assert_eq!(res.usage.output_tokens, 20);
@@ -259,6 +260,8 @@ mod tests {
                     },
                     "required": ["query"]
                 }),
+                group: Default::default(),
+                hint: None,
             }]),
             tool_choice: Some(ToolChoice::Required),
             thinking_budget: None,
@@ -326,7 +329,7 @@ mod tests {
                 total_tokens: 18,
             },
             finish_reason: "tool_calls".to_string(),
-            provider_id: ProviderId("test-provider".to_string()),
+            provider: Provider::Anthropic,
             model_id: ModelId("test-model".to_string()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_123".to_string(),
@@ -346,7 +349,7 @@ mod tests {
                 "total_tokens": 18
             },
             "finish_reason": "tool_calls",
-            "provider_id": "test-provider",
+            "provider": "anthropic",
             "model_id": "test-model",
             "tool_calls": [{
                 "id": "call_123",
@@ -370,6 +373,8 @@ mod tests {
                 },
                 "required": ["query"]
             }),
+            group: Default::default(),
+            hint: None,
         };
 
         let json = serde_json::to_string(&definition).expect("serialize ToolDefinition");

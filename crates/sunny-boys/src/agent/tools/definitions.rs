@@ -1,5 +1,5 @@
 use serde_json;
-use sunny_mind::ToolDefinition;
+use sunny_mind::{ToolDefinition, ToolGroup};
 
 pub fn build_tool_definitions() -> Vec<ToolDefinition> {
     let mut defs = vec![
@@ -16,6 +16,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path"]
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "fs_scan".to_string(),
@@ -30,6 +32,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path"]
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "fs_write".to_string(),
@@ -48,6 +52,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path", "content"]
             }),
+            group: ToolGroup::Mutation,
+            hint: None,
         },
         ToolDefinition {
             name: "fs_edit".to_string(),
@@ -82,6 +88,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path", "old_string", "new_string"]
             }),
+            group: ToolGroup::Mutation,
+            hint: None,
         },
         ToolDefinition {
             name: "fs_glob".to_string(),
@@ -100,6 +108,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["pattern"]
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "shell_exec".to_string(),
@@ -118,6 +128,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["command"]
             }),
+            group: ToolGroup::Mutation,
+            hint: None,
         },
         ToolDefinition {
             name: "text_grep".to_string(),
@@ -136,6 +148,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path", "pattern"]
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "grep_files".to_string(),
@@ -158,6 +172,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path", "pattern"]
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "git_log".to_string(),
@@ -171,6 +187,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 }
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "git_diff".to_string(),
@@ -184,6 +202,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 }
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "git_status".to_string(),
@@ -197,6 +217,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 }
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "git_commit".to_string(),
@@ -216,6 +238,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["message"]
             }),
+            group: ToolGroup::Mutation,
+            hint: None,
         },
         ToolDefinition {
             name: "git_branch".to_string(),
@@ -234,6 +258,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["name"]
             }),
+            group: ToolGroup::Mutation,
+            hint: None,
         },
         ToolDefinition {
             name: "git_checkout".to_string(),
@@ -248,6 +274,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["target"]
             }),
+            group: ToolGroup::Mutation,
+            hint: None,
         },
         ToolDefinition {
             name: "lsp_goto_definition".to_string(),
@@ -270,6 +298,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path", "line", "character"]
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "lsp_find_references".to_string(),
@@ -292,6 +322,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path", "line", "character"]
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "lsp_diagnostics".to_string(),
@@ -311,6 +343,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path"]
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "lsp_symbols".to_string(),
@@ -329,6 +363,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path"]
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "lsp_rename".to_string(),
@@ -355,6 +391,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path", "line", "character", "new_name"]
             }),
+            group: ToolGroup::Mutation,
+            hint: None,
         },
         ToolDefinition {
             name: "interview".to_string(),
@@ -391,6 +429,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["questions"]
             }),
+            group: ToolGroup::Interaction,
+            hint: Some("Use when requirements are ambiguous, decisions have lasting consequences, or multiple valid approaches exist. Do NOT ask for information the repo map already provides."),
         },
         ToolDefinition {
             name: "codebase_search".to_string(),
@@ -412,6 +452,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["query"]
             }),
+            group: Default::default(),
+            hint: None,
         },
         ToolDefinition {
             name: "task_create".to_string(),
@@ -462,14 +504,21 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                         "items": { "type": "string" },
                         "description": "Capabilities to grant to the subtask (format: 'shell_pipes:tail,grep'). Agent must already hold each capability it delegates."
                     },
-                    "category": {
+                    "role": {
                         "type": "string",
-                        "enum": ["quick", "standard", "deep"],
-                        "description": "Task complexity category. quick = simple mechanical work, standard = normal implementation, deep = complex reasoning. Determines which model runs the task."
+                        "enum": ["executor", "investigator", "planner", "verifier"],
+                        "description": "Agent role: executor=writes/runs, investigator=reads/searches, planner=builds plans, verifier=checks/tests."
+                    },
+                    "effort": {
+                        "type": "string",
+                        "enum": ["low", "moderate", "high", "critical"],
+                        "description": "Thinking effort: low=mechanical, moderate=normal, high=complex, critical=must-be-correct (security/data integrity)."
                     }
                 },
                 "required": ["title", "description"]
             }),
+            group: ToolGroup::Tasks,
+            hint: None,
         },
         ToolDefinition {
             name: "task_list".to_string(),
@@ -483,6 +532,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 }
             }),
+            group: ToolGroup::Tasks,
+            hint: None,
         },
         ToolDefinition {
             name: "task_get".to_string(),
@@ -497,6 +548,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["id"]
             }),
+            group: ToolGroup::Tasks,
+            hint: None,
         },
         ToolDefinition {
             name: "task_complete".to_string(),
@@ -511,6 +564,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["summary"]
             }),
+            group: ToolGroup::Tasks,
+            hint: None,
         },
         ToolDefinition {
             name: "task_fail".to_string(),
@@ -525,6 +580,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["error"]
             }),
+            group: ToolGroup::Tasks,
+            hint: None,
         },
         ToolDefinition {
             name: "task_ask_human".to_string(),
@@ -548,6 +605,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["question"]
             }),
+            group: ToolGroup::Tasks,
+            hint: None,
         },
         ToolDefinition {
             name: "task_claim_paths".to_string(),
@@ -567,6 +626,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["paths"]
             }),
+            group: ToolGroup::Tasks,
+            hint: None,
         },
     ];
 
@@ -588,6 +649,8 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
             },
             "required": ["plan_id", "reason"]
         }),
+        group: ToolGroup::Plans,
+        hint: None,
     });
     defs
 }

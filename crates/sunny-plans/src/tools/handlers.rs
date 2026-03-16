@@ -191,11 +191,25 @@ pub fn handle_plan_finalize(store: &PlanStore, args: &Value) -> Result<String, P
                 id: plan_id.to_string(),
             })?;
 
-        if plan.status != PlanStatus::Draft {
-            return Ok(json!({
-                "error": "invalid_status",
-                "message": "plan must be in Draft status"
-            }));
+        match plan.status {
+            PlanStatus::Ready => {
+                // Idempotent: re-validate DAG, return success without new event
+                let state = store.get_plan_state(plan_id)?;
+                validate_dag(&state)?;
+                return Ok(json!({
+                    "plan_id": plan_id,
+                    "status": "ready"
+                }));
+            }
+            PlanStatus::Draft => {
+                // Fall through to existing Draft→Ready logic
+            }
+            _ => {
+                return Ok(json!({
+                    "error": "invalid_status",
+                    "message": format!("plan must be in Draft or Ready status, got {}", plan.status)
+                }));
+            }
         }
 
         let state = store.get_plan_state(plan_id)?;
@@ -549,7 +563,7 @@ fn collect_dependents(root_task_id: &str, graph: &DependencyGraph) -> BTreeSet<S
     visited
 }
 
-fn validate_dag(state: &PlanState) -> Result<(), PlanError> {
+pub fn validate_dag(state: &PlanState) -> Result<(), PlanError> {
     let graph = build_graph(state);
 
     let mut orphan_references = Vec::new();

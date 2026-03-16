@@ -25,6 +25,8 @@ pub struct ToolCallLoop<P: LlmProvider + ?Sized> {
     provider_timeout: Duration,
     /// Tool names eligible for dedup caching within a single `run()` invocation.
     dedup_tools: HashSet<String>,
+    /// Per-tool timeout overrides. Tools not listed use `tool_timeout`.
+    tool_timeouts: HashMap<String, Duration>,
 }
 
 /// Errors that can terminate a [`ToolCallLoop`] run.
@@ -126,12 +128,19 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
             tool_timeout: tool_call_timeout(),
             provider_timeout: tool_provider_timeout(),
             dedup_tools: HashSet::new(),
+            tool_timeouts: HashMap::new(),
         }
     }
 
     /// Configure which tool names are eligible for dedup caching within a single `run()` invocation.
     pub fn with_dedup_tools(mut self, tools: HashSet<String>) -> Self {
         self.dedup_tools = tools;
+        self
+    }
+
+    /// Register per-tool timeout overrides (e.g. `Duration::MAX` for human-interaction tools).
+    pub fn with_tool_timeouts(mut self, timeouts: HashMap<String, Duration>) -> Self {
+        self.tool_timeouts = timeouts;
         self
     }
 
@@ -236,7 +245,12 @@ impl<P: LlmProvider + ?Sized> ToolCallLoop<P> {
                             continue;
                         }
                     }
-                    let tool_result = timeout(self.tool_timeout, async move {
+                    let effective_timeout = self
+                        .tool_timeouts
+                        .get(&call_name)
+                        .copied()
+                        .unwrap_or(self.tool_timeout);
+                    let tool_result = timeout(effective_timeout, async move {
                         tokio::task::spawn_blocking(move || {
                             executor(&call_id, &call_name_for_closure, &call_arguments_for_closure, depth)
                         })
@@ -344,7 +358,7 @@ mod tests {
 
     use sunny_core::tool::{ToolError, ToolPolicy};
     use sunny_mind::{
-        ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, ProviderId,
+        ChatMessage, ChatRole, LlmError, LlmProvider, LlmRequest, LlmResponse, ModelId, Provider,
         TokenUsage, ToolCall,
     };
 
@@ -370,8 +384,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LlmProvider for MockProvider {
-        fn provider_id(&self) -> &str {
-            "mock"
+        fn provider(&self) -> Provider {
+            Provider::Anthropic
         }
 
         fn model_id(&self) -> &str {
@@ -417,7 +431,7 @@ mod tests {
                 total_tokens: 15,
             },
             finish_reason: "stop".to_string(),
-            provider_id: ProviderId("mock".to_string()),
+            provider: Provider::Anthropic,
             model_id: ModelId("mock-model".to_string()),
             tool_calls,
             reasoning_content: None,
@@ -660,8 +674,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LlmProvider for SlowProvider {
-        fn provider_id(&self) -> &str {
-            "slow"
+        fn provider(&self) -> Provider {
+            Provider::Anthropic
         }
 
         fn model_id(&self) -> &str {

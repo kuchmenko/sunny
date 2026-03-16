@@ -44,10 +44,8 @@ impl InterviewRunner {
             QuestionType::Confirm => prompt_confirm(question),
         })
         .await
-        .map_err(|error| {
-            prompt_error(std::io::Error::other(format!(
-                "blocking task join error: {error}"
-            )))
+        .map_err(|error| ToolError::ExecutionFailed {
+            source: Box::new(std::io::Error::other(error.to_string())),
         })?
     }
 }
@@ -58,6 +56,29 @@ impl Default for InterviewRunner {
     }
 }
 
+fn cancelled_answer(question_id: String) -> InterviewAnswer {
+    InterviewAnswer {
+        question_id,
+        value: "cancelled".to_string(),
+        selected_options: Vec::new(),
+    }
+}
+
+fn map_inquire_error(
+    question_id: String,
+    error: inquire::InquireError,
+) -> Result<InterviewAnswer, ToolError> {
+    match error {
+        // ESC or Ctrl+C — graceful early exit, not an error.
+        inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted => {
+            Ok(cancelled_answer(question_id))
+        }
+        other => Err(ToolError::ExecutionFailed {
+            source: Box::new(std::io::Error::other(other.to_string())),
+        }),
+    }
+}
+
 fn prompt_single_choice(question: InterviewQuestion) -> Result<InterviewAnswer, ToolError> {
     let prompt = prompt_message(&question);
     let options = question
@@ -65,15 +86,14 @@ fn prompt_single_choice(question: InterviewQuestion) -> Result<InterviewAnswer, 
         .iter()
         .map(|option| option.label.clone())
         .collect::<Vec<_>>();
-    let selected = inquire::Select::new(&prompt, options)
-        .prompt()
-        .map_err(prompt_error)?;
-
-    Ok(InterviewAnswer {
-        question_id: question.id,
-        value: selected.clone(),
-        selected_options: vec![selected],
-    })
+    match inquire::Select::new(&prompt, options).prompt() {
+        Ok(selected) => Ok(InterviewAnswer {
+            question_id: question.id,
+            value: selected.clone(),
+            selected_options: vec![selected],
+        }),
+        Err(e) => map_inquire_error(question.id, e),
+    }
 }
 
 fn prompt_multi_choice(question: InterviewQuestion) -> Result<InterviewAnswer, ToolError> {
@@ -83,54 +103,44 @@ fn prompt_multi_choice(question: InterviewQuestion) -> Result<InterviewAnswer, T
         .iter()
         .map(|option| option.label.clone())
         .collect::<Vec<_>>();
-    let selected = inquire::MultiSelect::new(&prompt, options)
-        .prompt()
-        .map_err(prompt_error)?;
-
-    Ok(InterviewAnswer {
-        question_id: question.id,
-        value: selected.join(", "),
-        selected_options: selected,
-    })
+    match inquire::MultiSelect::new(&prompt, options).prompt() {
+        Ok(selected) => Ok(InterviewAnswer {
+            question_id: question.id,
+            value: selected.join(", "),
+            selected_options: selected,
+        }),
+        Err(e) => map_inquire_error(question.id, e),
+    }
 }
 
 fn prompt_free_text(question: InterviewQuestion) -> Result<InterviewAnswer, ToolError> {
     let prompt = prompt_message(&question);
-    let value = inquire::Text::new(&prompt).prompt().map_err(prompt_error)?;
-
-    Ok(InterviewAnswer {
-        question_id: question.id,
-        value,
-        selected_options: Vec::new(),
-    })
+    match inquire::Text::new(&prompt).prompt() {
+        Ok(value) => Ok(InterviewAnswer {
+            question_id: question.id,
+            value,
+            selected_options: Vec::new(),
+        }),
+        Err(e) => map_inquire_error(question.id, e),
+    }
 }
 
 fn prompt_confirm(question: InterviewQuestion) -> Result<InterviewAnswer, ToolError> {
     let prompt = prompt_message(&question);
-    let confirmed = inquire::Confirm::new(&prompt)
-        .prompt()
-        .map_err(prompt_error)?;
-
-    Ok(InterviewAnswer {
-        question_id: question.id,
-        value: confirmed.to_string(),
-        selected_options: Vec::new(),
-    })
+    match inquire::Confirm::new(&prompt).prompt() {
+        Ok(confirmed) => Ok(InterviewAnswer {
+            question_id: question.id,
+            value: confirmed.to_string(),
+            selected_options: Vec::new(),
+        }),
+        Err(e) => map_inquire_error(question.id, e),
+    }
 }
 
 fn prompt_message(question: &InterviewQuestion) -> String {
     match &question.header {
         Some(header) if !header.trim().is_empty() => format!("{header}\n\n{}", question.text),
         _ => question.text.clone(),
-    }
-}
-
-fn prompt_error<E>(error: E) -> ToolError
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    ToolError::ExecutionFailed {
-        source: Box::new(std::io::Error::other(error.to_string())),
     }
 }
 

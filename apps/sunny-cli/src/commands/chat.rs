@@ -611,52 +611,69 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
                         }
                         "/quick" => {
                             let workspace_id = workspace_root.to_string_lossy().to_string();
-                            match tokio::task::spawn_blocking(move || -> Result<String, String> {
-                                let db = sunny_store::Database::open_default()
-                                    .map_err(|e| format!("failed to open db: {e}"))?;
-                                #[allow(clippy::arc_with_non_send_sync)]
-                                let store =
-                                    std::sync::Arc::new(sunny_plans::store::PlanStore::new(db));
+                            match tokio::task::spawn_blocking(
+                                move || -> Result<(String, bool), String> {
+                                    let db = sunny_store::Database::open_default()
+                                        .map_err(|e| format!("failed to open db: {e}"))?;
+                                    #[allow(clippy::arc_with_non_send_sync)]
+                                    let store =
+                                        std::sync::Arc::new(sunny_plans::store::PlanStore::new(db));
 
-                                let orchestrator =
-                                    sunny_plans::orchestrator::PlanOrchestrator::new(store);
-                                // Ensure we have a plan first
-                                let plan = orchestrator
-                                    .ensure_plan(&workspace_id, "cli")
-                                    .map_err(|e| format!("failed to ensure plan: {e}"))?;
-                                if plan.mode == sunny_plans::model::PlanMode::Quick {
-                                    return Ok("Already in Quick mode.".to_string());
-                                }
-                                orchestrator
-                                    .switch_to_quick(&plan.id)
-                                    .map_err(|e| format!("mode switch failed: {e}"))?;
-                                Ok("Switched to Quick mode.".to_string())
-                            })
+                                    let orchestrator =
+                                        sunny_plans::orchestrator::PlanOrchestrator::new(store);
+                                    let plan = orchestrator
+                                        .ensure_plan(&workspace_id, "cli")
+                                        .map_err(|e| format!("failed to ensure plan: {e}"))?;
+                                    if plan.mode == sunny_plans::model::PlanMode::Quick {
+                                        return Ok((plan.id, false));
+                                    }
+                                    orchestrator
+                                        .switch_to_quick(&plan.id)
+                                        .map_err(|e| format!("mode switch failed: {e}"))?;
+                                    Ok((plan.id, true))
+                                },
+                            )
                             .await
                             {
-                                Ok(Ok(msg)) => println!("{msg}"),
+                                Ok(Ok((plan_id, true))) => {
+                                    session.set_mode(sunny_plans::model::PlanMode::Quick, &plan_id);
+                                    println!("Switched to Quick mode.");
+                                }
+                                Ok(Ok((_, false))) => println!("Already in Quick mode."),
                                 Ok(Err(e)) => eprintln!("Error: {e}"),
                                 Err(e) => eprintln!("Error: task panicked: {e}"),
                             }
                         }
                         "/smart" => {
                             let workspace_id = workspace_root.to_string_lossy().to_string();
-                            match tokio::task::spawn_blocking(move || -> Result<String, String> {
-                                let db = sunny_store::Database::open_default()
-                                    .map_err(|e| format!("failed to open db: {e}"))?;
-                                #[allow(clippy::arc_with_non_send_sync)]
-                                let store = std::sync::Arc::new(sunny_plans::store::PlanStore::new(db));
-                                let orchestrator = sunny_plans::orchestrator::PlanOrchestrator::new(store);
-                                let plan = orchestrator.ensure_plan(&workspace_id, "cli")
-                                    .map_err(|e| format!("failed to ensure plan: {e}"))?;
-                                if plan.mode == sunny_plans::model::PlanMode::Smart {
-                                    return Ok("Already in Smart mode.".to_string());
+                            match tokio::task::spawn_blocking(
+                                move || -> Result<(String, bool), String> {
+                                    let db = sunny_store::Database::open_default()
+                                        .map_err(|e| format!("failed to open db: {e}"))?;
+                                    #[allow(clippy::arc_with_non_send_sync)]
+                                    let store =
+                                        std::sync::Arc::new(sunny_plans::store::PlanStore::new(db));
+                                    let orchestrator =
+                                        sunny_plans::orchestrator::PlanOrchestrator::new(store);
+                                    let plan = orchestrator
+                                        .ensure_plan(&workspace_id, "cli")
+                                        .map_err(|e| format!("failed to ensure plan: {e}"))?;
+                                    if plan.mode == sunny_plans::model::PlanMode::Smart {
+                                        return Ok((plan.id, false));
+                                    }
+                                    orchestrator
+                                        .switch_to_smart(&plan.id)
+                                        .map_err(|e| format!("mode switch failed: {e}"))?;
+                                    Ok((plan.id, true))
+                                },
+                            )
+                            .await
+                            {
+                                Ok(Ok((plan_id, true))) => {
+                                    session.set_mode(sunny_plans::model::PlanMode::Smart, &plan_id);
+                                    println!("Switched to Smart mode.");
                                 }
-                                orchestrator.switch_to_smart(&plan.id)
-                                    .map_err(|e| format!("mode switch failed: {e}"))?;
-                                Ok("Switched to Smart mode. Plan is in Draft — use plan tools to build the DAG, then /finalize.".to_string())
-                            }).await {
-                                Ok(Ok(msg)) => println!("{msg}"),
+                                Ok(Ok((_, false))) => println!("Already in Smart mode."),
                                 Ok(Err(e)) => eprintln!("Error: {e}"),
                                 Err(e) => eprintln!("Error: task panicked: {e}"),
                             }

@@ -5,6 +5,7 @@ use crate::events::PlanEvent;
 use crate::model::{Constraint, Decision, Goal};
 use crate::store::{PlanState, PlanStore};
 
+#[derive(Debug, Clone)]
 pub struct HandoffContext {
     pub structured: String,
     pub summary: String,

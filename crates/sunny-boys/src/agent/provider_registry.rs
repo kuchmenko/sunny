@@ -115,8 +115,7 @@ mod tests {
 
     use async_trait::async_trait;
     use sunny_mind::{
-        LlmError, LlmRequest, LlmResponse, ModelId, ProviderId, StreamEvent, StreamResult,
-        TokenUsage,
+        LlmError, LlmRequest, LlmResponse, ModelId, Provider, StreamEvent, StreamResult, TokenUsage,
     };
     use tokio::sync::Mutex;
 
@@ -138,8 +137,8 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for MockProvider {
-        fn provider_id(&self) -> &str {
-            "mock"
+        fn provider(&self) -> Provider {
+            Provider::Anthropic
         }
         fn model_id(&self) -> &str {
             &self.model
@@ -153,7 +152,7 @@ mod tests {
                     total_tokens: 2,
                 },
                 finish_reason: "stop".to_string(),
-                provider_id: ProviderId("mock".to_string()),
+                provider: Provider::Anthropic,
                 model_id: ModelId(self.model.clone()),
                 tool_calls: None,
                 reasoning_content: None,

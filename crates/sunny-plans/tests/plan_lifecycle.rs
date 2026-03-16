@@ -213,3 +213,81 @@ fn test_plan_dependency_cycle_detection() {
         .expect_err("y->x should create cycle");
     assert!(matches!(err, PlanError::CycleDetected));
 }
+
+#[test]
+fn test_plan_finalize_from_ready_succeeds() {
+    let (store, dir) = make_plan_store();
+    let workspace_id = make_workspace_id(&dir);
+    let store = Arc::new(store);
+    let orchestrator = PlanOrchestrator::new(Arc::clone(&store));
+
+    let plan = orchestrator
+        .create_plan(&workspace_id, "test plan", None, PlanMode::Quick, None)
+        .expect("should create plan");
+
+    let task_a = Uuid::new_v4().to_string();
+    store
+        .add_task_to_plan(&plan.id, &task_a, "Task A", &[])
+        .expect("should add task A");
+
+    // First finalize: Draft -> Ready
+    let finalized = orchestrator
+        .finalize_plan(&plan.id)
+        .expect("should finalize plan from Draft");
+    assert_eq!(finalized.status, PlanStatus::Ready);
+
+    // Get event count after first finalize
+    let state_after_first = store
+        .get_plan_state(&plan.id)
+        .expect("should load plan state");
+    let event_count_after_first = state_after_first.events.len();
+
+    // Second finalize: Ready -> Ready (idempotent)
+    let finalized_again = orchestrator
+        .finalize_plan(&plan.id)
+        .expect("should finalize plan from Ready");
+    assert_eq!(finalized_again.status, PlanStatus::Ready);
+
+    // Verify no new event was appended
+    let state_after_second = store
+        .get_plan_state(&plan.id)
+        .expect("should load plan state");
+    let event_count_after_second = state_after_second.events.len();
+    assert_eq!(
+        event_count_after_first, event_count_after_second,
+        "finalize on Ready should not append new event"
+    );
+}
+
+#[test]
+fn test_plan_finalize_from_active_fails() {
+    let (store, dir) = make_plan_store();
+    let workspace_id = make_workspace_id(&dir);
+    let store = Arc::new(store);
+    let orchestrator = PlanOrchestrator::new(Arc::clone(&store));
+
+    let plan = orchestrator
+        .create_plan(&workspace_id, "test plan", None, PlanMode::Quick, None)
+        .expect("should create plan");
+
+    let task_a = Uuid::new_v4().to_string();
+    store
+        .add_task_to_plan(&plan.id, &task_a, "Task A", &[])
+        .expect("should add task A");
+
+    // Finalize to Ready
+    orchestrator
+        .finalize_plan(&plan.id)
+        .expect("should finalize plan");
+
+    // Activate to Active
+    orchestrator
+        .activate_plan(&plan.id)
+        .expect("should activate plan");
+
+    // Try to finalize from Active - should fail
+    let err = orchestrator
+        .finalize_plan(&plan.id)
+        .expect_err("finalize from Active should fail");
+    assert!(matches!(err, PlanError::InvalidStatus { .. }));
+}
