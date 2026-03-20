@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::agent::interview::InterviewRunner;
+use crate::agent::interview::{InterviewPresenter, InterviewRunner};
 use crate::agent::{GateDecision, SharedApprovalGate};
 use crate::git_tools::{GitBranch, GitCheckout, GitCommit, GitDiff, GitLog, GitStatus};
 use crate::tool_loop::ToolExecutor;
@@ -34,6 +34,7 @@ pub fn build_tool_executor_with_capabilities(
     task_id: Option<String>,
     session_id: Option<String>,
     approval_gate: Option<SharedApprovalGate>,
+    interview_presenter: Option<Arc<dyn InterviewPresenter>>,
 ) -> Arc<ToolExecutor> {
     let task_id = task_id.unwrap_or_default();
     let session_id = session_id.unwrap_or_default();
@@ -420,10 +421,13 @@ pub fn build_tool_executor_with_capabilities(
                 }
                 "interview" => {
                     let questions = parse_interview_questions(&parsed)?;
-                    let runner = Arc::clone(&interview_runner);
+                    let presenter: Arc<dyn InterviewPresenter> = match &interview_presenter {
+                        Some(p) => Arc::clone(p),
+                        None => Arc::clone(&interview_runner) as Arc<dyn InterviewPresenter>,
+                    };
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async move {
-                            let answers = runner.present(questions).await?;
+                            let answers = presenter.present(questions).await?;
                             serde_json::to_string(&answers).map_err(tool_exec_err)
                         })
                     })
@@ -770,6 +774,7 @@ fn parse_interview_questions(
         questions.push(InterviewQuestion {
             id: id.to_string(),
             text: text.to_string(),
+            description: entry["description"].as_str().map(str::to_string),
             question_type,
             options,
             header,
@@ -839,7 +844,7 @@ mod tests {
         let file = dir.path().join("tracked.txt");
         std::fs::write(&file, "initial\nvalue\n").expect("test: seed tracked file");
         let executor =
-            build_tool_executor_with_capabilities(dir.path().to_path_buf(), None, None, None, None);
+            build_tool_executor_with_capabilities(dir.path().to_path_buf(), None, None, None, None, None);
 
         run_tool(
             &executor,
@@ -872,7 +877,7 @@ mod tests {
         let file = dir.path().join("tracked.txt");
         std::fs::write(&file, "initial\nvalue\n").expect("test: seed tracked file");
         let executor =
-            build_tool_executor_with_capabilities(dir.path().to_path_buf(), None, None, None, None);
+            build_tool_executor_with_capabilities(dir.path().to_path_buf(), None, None, None, None, None);
 
         run_tool(
             &executor,
@@ -908,7 +913,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("test: create temp dir");
         let file = dir.path().join("new.txt");
         let executor =
-            build_tool_executor_with_capabilities(dir.path().to_path_buf(), None, None, None, None);
+            build_tool_executor_with_capabilities(dir.path().to_path_buf(), None, None, None, None, None);
 
         let output = run_tool(
             &executor,

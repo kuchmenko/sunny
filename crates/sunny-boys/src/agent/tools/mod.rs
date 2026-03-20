@@ -21,7 +21,7 @@ pub fn build_tool_executor(
     task_id: Option<String>,
     session_id: Option<String>,
 ) -> Arc<ToolExecutor> {
-    build_tool_executor_with_capabilities(root, None, task_id, session_id, None)
+    build_tool_executor_with_capabilities(root, None, task_id, session_id, None, None)
 }
 
 /// Build the tool policy allowing all registered tools.
@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn test_build_tool_definitions_count() {
         let defs = build_tool_definitions();
-        assert_eq!(defs.len(), 40, "expected 40 tool definitions");
+        assert_eq!(defs.len(), 29, "expected 29 tool definitions (no plan_* tools in Quick mode)");
     }
 
     #[test]
@@ -125,6 +125,13 @@ mod tests {
             "task_fail",
             "task_ask_human",
             "task_claim_paths",
+            "task_request_replan",
+        ];
+        for name in &expected {
+            assert!(names.contains(name), "missing tool: {name}");
+        }
+        // plan_* tools must NOT be present in Quick (base) mode
+        let absent = [
             "plan_create",
             "plan_add_task",
             "plan_add_dependency",
@@ -136,10 +143,9 @@ mod tests {
             "plan_add_constraint",
             "plan_add_goal",
             "plan_update_goal",
-            "task_request_replan",
         ];
-        for name in &expected {
-            assert!(names.contains(name), "missing tool: {name}");
+        for name in &absent {
+            assert!(!names.contains(name), "plan tool should not be in Quick mode: {name}");
         }
     }
 

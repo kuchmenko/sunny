@@ -5,6 +5,18 @@ use sunny_core::tool::{
 };
 use tokio::sync::Mutex;
 
+/// Trait for presenting interview questions to the user.
+///
+/// Implementors can deliver questions via CLI prompts (`InterviewRunner`) or
+/// through a TUI overlay (`TuiInterviewPresenter`).
+#[async_trait::async_trait]
+pub trait InterviewPresenter: Send + Sync {
+    async fn present(
+        &self,
+        questions: Vec<InterviewQuestion>,
+    ) -> Result<Vec<InterviewAnswer>, ToolError>;
+}
+
 pub struct InterviewRunner {
     context: Arc<Mutex<InterviewContext>>,
 }
@@ -20,7 +32,7 @@ impl InterviewRunner {
         Arc::clone(&self.context)
     }
 
-    pub async fn present(
+    pub async fn run(
         &self,
         questions: Vec<InterviewQuestion>,
     ) -> Result<Vec<InterviewAnswer>, ToolError> {
@@ -53,6 +65,16 @@ impl InterviewRunner {
 impl Default for InterviewRunner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl InterviewPresenter for InterviewRunner {
+    async fn present(
+        &self,
+        questions: Vec<InterviewQuestion>,
+    ) -> Result<Vec<InterviewAnswer>, ToolError> {
+        self.run(questions).await
     }
 }
 

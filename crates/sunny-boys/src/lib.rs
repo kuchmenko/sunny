@@ -20,8 +20,8 @@ pub mod tool_loop;
 
 pub use agent::{
     AgentError, AgentSession, AlwaysAllowGate, AlwaysDenyGate, CliApprovalGate, ExecutionOutcome,
-    GateDecision, HumanApprovalGate, InterviewRunner, ProviderRegistry, SharedApprovalGate,
-    TaskExecutor,
+    GateDecision, HumanApprovalGate, InterviewPresenter, InterviewRunner, ProviderRegistry,
+    SharedApprovalGate, TaskExecutor,
 };
 pub use git_tools::{GitBranch, GitCheckout, GitCommit, GitDiff, GitLog, GitStatus};
 pub use streaming_tool_loop::{StreamingToolLoop, StreamingToolMetrics, StreamingToolResult};

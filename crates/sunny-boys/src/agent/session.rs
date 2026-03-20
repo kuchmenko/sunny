@@ -14,6 +14,7 @@ use sunny_store::{SavedSession, SessionStore, TokenBudget};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use super::interview::InterviewPresenter;
 use super::tools::{
     build_tool_definitions, build_tool_executor_with_capabilities, build_tool_policy,
 };
@@ -54,10 +55,17 @@ pub struct AgentSession {
     store: Arc<SessionStore>,
     task_id: Option<String>,
     approval_gate: Option<crate::agent::approval::SharedApprovalGate>,
+    interview_presenter: Option<Arc<dyn InterviewPresenter>>,
     is_new_session: bool,
     /// Whether to generate a title after the first exchange.
     /// True for new sessions, false for resumed sessions.
     generate_title: bool,
+    /// Workspace context (path, project files, repo map, tool section, working style).
+    /// Injected as a preamble into the first user message so it reaches the model
+    /// even when the system prompt is restricted (e.g. Anthropic OAuth sessions).
+    workspace_context: String,
+    /// True once workspace_context has been prepended to a user message.
+    context_injected: bool,
 }
 
 impl AgentSession {
@@ -72,14 +80,9 @@ impl AgentSession {
         session_id: String,
         store: Arc<SessionStore>,
     ) -> Self {
-        // Provider-specific identity line.
-        let mut system_prompt = if provider.provider() == Provider::Anthropic {
-            format!(
-                "You are Claude Code, Anthropic's official CLI for Claude.\n\n\
-                 You are an expert software engineer working in the workspace at: {}.\n\n\
-                 Prefer targeted tool calls over broad exploration.",
-                root.display()
-            )
+        // Provider-specific identity line (system prompt).
+        let system_prompt = if provider.provider() == Provider::Anthropic {
+            "You are Claude Code, Anthropic's official CLI for Claude.".to_string()
         } else {
             format!(
                 "You are an expert software engineer working in the workspace at: {}.\n\n\
@@ -88,40 +91,49 @@ impl AgentSession {
             )
         };
 
+        // Workspace context — injected as a preamble into the first user message.
+        // This keeps it out of the system prompt so OAuth sessions (which enforce
+        // system == exact identity string) still receive the context.
+        let mut workspace_context = format!(
+            "You are an expert software engineer working in the workspace at: {}.\n\n\
+             Prefer targeted tool calls over broad exploration.",
+            root.display()
+        );
+
         // Inject SUNNY.md context if available (capped at 12 000 chars total).
         if let Ok(context) = sunny_store::context_file::read_context_files(&root) {
             if !context.is_empty() {
                 let truncated: String = context.chars().take(12_000).collect();
-                system_prompt.push_str("\n\n# Project Context\n\n");
-                system_prompt.push_str(&truncated);
+                workspace_context.push_str("\n\n# Project Context\n\n");
+                workspace_context.push_str(&truncated);
             }
         }
 
         // Generate and inject repository map for structural awareness.
         if let Ok(repo_map) = sunny_store::generate_repo_map(&root, 20_000) {
             if !repo_map.is_empty() {
-                system_prompt.push_str("\n\n# Repository Map\n\n");
-                system_prompt.push_str(&repo_map);
+                workspace_context.push_str("\n\n# Repository Map\n\n");
+                workspace_context.push_str(&repo_map);
             }
         }
 
         // Dynamic tool section generated from actual loaded definitions.
         let tool_definitions = build_tool_definitions();
-        system_prompt.push_str(&build_tool_section(&tool_definitions));
+        workspace_context.push_str(&build_tool_section(&tool_definitions));
 
         // Working style guidance.
-        system_prompt.push_str("\n\n# Working Style\n\n");
-        system_prompt.push_str(
+        workspace_context.push_str("\n\n# Working Style\n\n");
+        workspace_context.push_str(
             "Prefer targeted reads over broad exploration -- the repo map is already loaded.\n",
         );
-        system_prompt
+        workspace_context
             .push_str("Fix root causes, not symptoms. Never suppress type errors with casts.\n");
-        system_prompt.push_str(
+        workspace_context.push_str(
             "Delegate subtasks aggressively. When creating subtasks, assign role + effort:\n",
         );
-        system_prompt.push_str("  role: executor | investigator | planner | verifier\n");
-        system_prompt.push_str("  effort: low | moderate | high | critical\n");
-        system_prompt.push_str("Higher effort = extended thinking budget. Use critical only for decisions that are hard to reverse.");
+        workspace_context.push_str("  role: executor | investigator | planner | verifier\n");
+        workspace_context.push_str("  effort: low | moderate | high | critical\n");
+        workspace_context.push_str("Higher effort = extended thinking budget. Use critical only for decisions that are hard to reverse.");
 
         let messages = vec![ChatMessage {
             role: ChatRole::System,
@@ -144,8 +156,11 @@ impl AgentSession {
             store,
             task_id: None,
             approval_gate: None,
+            interview_presenter: None,
             is_new_session: true,
             generate_title: true,
+            workspace_context,
+            context_injected: false,
         }
     }
 
@@ -179,8 +194,12 @@ impl AgentSession {
             store,
             task_id: None,
             approval_gate: None,
+            interview_presenter: None,
             is_new_session: false,
             generate_title: false,
+            // Resumed sessions already have context in their message history.
+            workspace_context: String::new(),
+            context_injected: true,
         }
     }
 
@@ -196,6 +215,11 @@ impl AgentSession {
         self
     }
 
+    pub fn with_interview_presenter(mut self, presenter: Arc<dyn InterviewPresenter>) -> Self {
+        self.interview_presenter = Some(presenter);
+        self
+    }
+
     pub fn set_mode(&mut self, mode: sunny_plans::model::PlanMode, plan_id: &str) {
         use sunny_plans::planner_agent::build_planner_tool_names;
 
@@ -206,7 +230,9 @@ impl AgentSession {
                 let smart_tool_names = build_planner_tool_names();
                 let smart_names_set: HashSet<&str> =
                     smart_tool_names.iter().map(|name| name.as_str()).collect();
-                self.tool_definitions = build_tool_definitions()
+                let mut all_defs = build_tool_definitions();
+                all_defs.extend(sunny_plans::tools::definitions::build_plan_tool_definitions());
+                self.tool_definitions = all_defs
                     .into_iter()
                     .filter(|definition| smart_names_set.contains(definition.name.as_str()))
                     .collect();
@@ -221,7 +247,7 @@ impl AgentSession {
                      - NEVER output plans as raw text or markdown -- ALL planning goes through plan tools\n\
                      - Investigation tools (fs_read, fs_scan, grep, lsp_*) are available for codebase research\n\
                      - Mutation tools (fs_write, fs_edit, shell_exec) are NOT available\n\
-                     - Active plan ID: {}",
+                     - Active plan ID: {}\n\n---\n\n",
                     plan_id
                 );
                 self.messages.push(ChatMessage {
@@ -239,7 +265,7 @@ impl AgentSession {
 
                 self.messages.push(ChatMessage {
                     role: ChatRole::User,
-                    content: "[Mode Switch] Restored to Quick mode. All tools available."
+                    content: "[Mode Switch] Quick mode: full execution tools, task coordination, and deviation signalling available.\n\n---\n\n"
                         .to_string(),
                     tool_calls: None,
                     tool_call_id: None,
@@ -291,9 +317,19 @@ impl AgentSession {
     where
         F: FnMut(StreamEvent) + Send,
     {
+        // Prepend workspace context to the first user message so the model receives
+        // it even when the system prompt is restricted (e.g. Anthropic OAuth sessions
+        // which enforce system == exact identity string).
+        let content = if !self.context_injected && !self.workspace_context.is_empty() {
+            self.context_injected = true;
+            format!("{}\n\n---\n\n{}", self.workspace_context, user_input)
+        } else {
+            user_input.to_string()
+        };
+
         self.messages.push(ChatMessage {
             role: ChatRole::User,
-            content: user_input.to_string(),
+            content,
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -316,6 +352,7 @@ impl AgentSession {
             self.task_id.clone(),
             Some(self.session_id.clone()),
             self.approval_gate.clone(),
+            self.interview_presenter.clone(),
         );
         let max_iterations = 1000;
         let loop_runner = StreamingToolLoop::new(
@@ -327,7 +364,15 @@ impl AgentSession {
         .with_dedup_tools(Self::dedup_eligible_tools())
         .with_tool_timeouts(Self::tool_timeout_overrides());
 
-        let result = loop_runner.run(request, tool_executor, on_event).await?;
+        let result = match loop_runner.run(request, tool_executor, on_event).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Roll back the user message so the next send() doesn't produce
+                // two consecutive User messages, which Anthropic rejects with 400.
+                self.messages.pop();
+                return Err(e.into());
+            }
+        };
         let content = result.content.clone();
 
         // Extend message history with full tool chain from this exchange.
@@ -1075,6 +1120,10 @@ mod tests {
             "fs_read should be present in Smart mode"
         );
         assert!(
+            names.contains(&"plan_add_task"),
+            "plan_add_task must be present in Smart mode"
+        );
+        assert!(
             session.tool_definitions.len() < initial_count,
             "Smart mode should have fewer tools"
         );
@@ -1099,6 +1148,13 @@ mod tests {
             "Quick policy should allow fs_write"
         );
         assert!(session.mode.is_none(), "Quick mode should set mode to None");
+        assert!(
+            !session
+                .tool_definitions
+                .iter()
+                .any(|d| d.name == "plan_add_task"),
+            "plan tools must be absent in Quick mode"
+        );
     }
 
     #[tokio::test]

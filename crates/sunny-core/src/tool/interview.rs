@@ -23,6 +23,7 @@ pub struct InterviewOption {
 pub struct InterviewQuestion {
     pub id: String,
     pub text: String,
+    pub description: Option<String>,
     pub question_type: QuestionType,
     pub options: Vec<InterviewOption>,
     pub header: Option<String>,

@@ -147,6 +147,7 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                 };
 
                 let mut iteration_content = String::new();
+                let mut iteration_thinking = String::new();
                 let mut pending_tool_calls = Vec::new();
                 let mut started_tool_calls: HashMap<String, String> = HashMap::new();
 
@@ -163,6 +164,7 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                             on_event(StreamEvent::ContentDelta { text });
                         }
                         StreamEvent::ThinkingDelta { text } => {
+                            iteration_thinking.push_str(&text);
                             on_event(StreamEvent::ThinkingDelta { text });
                         }
                         StreamEvent::ToolCallStart { id, name } => {
@@ -204,7 +206,7 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                     }
                 }
 
-                Ok::<_, ToolCallError>((iteration_content, pending_tool_calls))
+                Ok::<_, ToolCallError>((iteration_content, iteration_thinking, pending_tool_calls))
             }
             .instrument(info_span!(
                 "streaming_tool_call_iteration",
@@ -214,7 +216,7 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
             ))
             .await?;
 
-            let (iteration_content, pending_tool_calls) = iteration_result;
+            let (iteration_content, iteration_thinking, pending_tool_calls) = iteration_result;
 
             if pending_tool_calls.is_empty() {
                 let final_assistant_message = ChatMessage {
@@ -222,7 +224,11 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                     content: content.clone(),
                     tool_calls: None,
                     tool_call_id: None,
-                    reasoning_content: None,
+                    reasoning_content: if iteration_thinking.is_empty() {
+                        None
+                    } else {
+                        Some(iteration_thinking)
+                    },
                 };
                 result_messages.push(final_assistant_message);
 
@@ -335,7 +341,11 @@ impl<P: LlmProvider + ?Sized> StreamingToolLoop<P> {
                 content: iteration_content,
                 tool_calls: Some(pending_tool_calls),
                 tool_call_id: None,
-                reasoning_content: None,
+                reasoning_content: if iteration_thinking.is_empty() {
+                    None
+                } else {
+                    Some(iteration_thinking)
+                },
             };
             current_request
                 .messages
@@ -482,6 +492,12 @@ mod tests {
 
     fn mk_done() -> StreamEvent {
         StreamEvent::Done
+    }
+
+    fn mk_thinking(text: &str) -> StreamEvent {
+        StreamEvent::ThinkingDelta {
+            text: text.to_string(),
+        }
     }
 
     fn mk_cancel_token() -> CancellationToken {
@@ -1076,5 +1092,41 @@ mod tests {
         assert_eq!(result.content, "first second done");
         assert_eq!(result.metrics.total_tool_calls, 2);
         assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // --- Fix 5a: thinking accumulated into reasoning_content ---
+
+    #[tokio::test]
+    async fn test_streaming_tool_loop_accumulates_thinking_into_reasoning_content() {
+        let provider = Arc::new(MockStreamProvider::new(vec![vec![
+            Ok(mk_thinking("step one... ")),
+            Ok(mk_thinking("step two...")),
+            Ok(mk_content("final answer")),
+            Ok(mk_done()),
+        ]]));
+        let loop_runner = StreamingToolLoop::new(
+            provider.clone(),
+            ToolPolicy::default_ask(),
+            3,
+            mk_cancel_token(),
+        );
+
+        let result = loop_runner
+            .run(
+                mk_request(),
+                Arc::new(|_, _, _, _| Ok("unused".to_string())),
+                |_| {},
+            )
+            .await
+            .expect("stream should complete without tools");
+
+        assert_eq!(result.content, "final answer");
+        assert_eq!(result.messages.len(), 1);
+        let msg = &result.messages[0];
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("step one... step two..."),
+            "thinking deltas must be accumulated into reasoning_content"
+        );
     }
 }

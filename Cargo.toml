@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sunny-core", "crates/sunny-mind", "crates/sunny-boys", "crates/sunny-store", "crates/sunny-tasks", "crates/sunny-plans", "apps/sunny-cli", "apps/sunny-gui"]
+members = ["crates/sunny-core", "crates/sunny-mind", "crates/sunny-boys", "crates/sunny-store", "crates/sunny-tasks", "crates/sunny-plans", "apps/sunny-cli", "apps/sunny-gui", "apps/sunny-tui"]
 resolver = "2"
 
 [workspace.package]

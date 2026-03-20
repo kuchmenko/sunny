@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 use crate::error::LlmError;
 use crate::provider::LlmProvider;
 use crate::stream::StreamResult;
-use crate::types::{ChatRole, LlmRequest, LlmResponse, ModelId, Provider, TokenUsage, ToolCall};
+use crate::types::{ChatRole, LlmRequest, LlmResponse, ModelId, Provider, TokenUsage, ToolCall, ToolChoice};
 
 use super::credentials::{
     load_credentials, refresh_oauth_token, save_credentials, AnthropicCredentials, CredentialSource,
@@ -15,8 +15,16 @@ use super::credentials::{
 use super::stream_parser::StreamParser;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_BETA_HEADER: &str =
-    "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
+// oauth-2025-04-20 enables Bearer token auth on the Anthropic API.
+// claude-code-20250219 is required for Claude Code OAuth feature access; must be sent explicitly
+// by custom OAuth integrations (it is NOT auto-injected in non-CLI environments).
+const ANTHROPIC_BETA_OAUTH: &str = "oauth-2025-04-20,claude-code-20250219";
+// API key sessions need no special betas for basic usage.
+const ANTHROPIC_BETA_APIKEY: &str = "";
+// fine-grained-tool-streaming-2025-05-14 is now GA — no beta header required.
+// Additional betas appended only when extended thinking is enabled in the request.
+// extended-thinking-2025-01-10 was specific to claude-3-7-sonnet; 4.x uses interleaved only.
+const ANTHROPIC_BETA_THINKING: &str = "interleaved-thinking-2025-05-14";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const CLAUDE_CODE_SYSTEM_MESSAGE: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -110,6 +118,7 @@ impl AnthropicProvider {
         &self,
         token: &str,
         source: &CredentialSource,
+        thinking_enabled: bool,
     ) -> Result<reqwest::header::HeaderMap, LlmError> {
         use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 
@@ -119,11 +128,27 @@ impl AnthropicProvider {
             "anthropic-version",
             HeaderValue::from_static(ANTHROPIC_VERSION),
         );
-        headers.insert(
-            "anthropic-beta",
-            HeaderValue::from_static(ANTHROPIC_BETA_HEADER),
-        );
-
+        let base_beta = match source {
+            CredentialSource::OAuthFile => ANTHROPIC_BETA_OAUTH,
+            CredentialSource::ApiKey => ANTHROPIC_BETA_APIKEY,
+        };
+        // Append thinking betas only when thinking is actually enabled in the request.
+        let beta_value = if thinking_enabled && !base_beta.is_empty() {
+            format!("{base_beta},{ANTHROPIC_BETA_THINKING}")
+        } else if thinking_enabled {
+            ANTHROPIC_BETA_THINKING.to_string()
+        } else {
+            base_beta.to_string()
+        };
+        // Only insert the header if we have something to send.
+        if !beta_value.is_empty() {
+            headers.insert(
+                "anthropic-beta",
+                HeaderValue::from_str(&beta_value).map_err(|e| LlmError::AuthFailed {
+                    message: format!("invalid beta header value: {e}"),
+                })?,
+            );
+        }
         match source {
             CredentialSource::OAuthFile => {
                 let bearer = format!("Bearer {token}");
@@ -194,6 +219,16 @@ impl AnthropicProvider {
                     if let Some(tool_calls) = &msg.tool_calls {
                         let mut content_blocks = Vec::new();
 
+                        // Echo back thinking block if present — must come before text and tool_use.
+                        if let Some(thinking) = &msg.reasoning_content {
+                            if !thinking.is_empty() {
+                                content_blocks.push(serde_json::json!({
+                                    "type": "thinking",
+                                    "thinking": thinking,
+                                }));
+                            }
+                        }
+
                         if !msg.content.is_empty() {
                             content_blocks.push(serde_json::json!({
                                 "type": "text",
@@ -224,10 +259,30 @@ impl AnthropicProvider {
                             "content": content_blocks,
                         }));
                     } else {
-                        messages_json.push(serde_json::json!({
-                            "role": "assistant",
-                            "content": msg.content,
-                        }));
+                        // Echo back thinking for plain assistant messages (no tool calls).
+                        if let Some(thinking) = &msg.reasoning_content {
+                            if !thinking.is_empty() {
+                                let mut content_blocks =
+                                    vec![serde_json::json!({"type": "thinking", "thinking": thinking})];
+                                if !msg.content.is_empty() {
+                                    content_blocks.push(serde_json::json!({"type": "text", "text": msg.content}));
+                                }
+                                messages_json.push(serde_json::json!({
+                                    "role": "assistant",
+                                    "content": content_blocks,
+                                }));
+                            } else {
+                                messages_json.push(serde_json::json!({
+                                    "role": "assistant",
+                                    "content": msg.content,
+                                }));
+                            }
+                        } else {
+                            messages_json.push(serde_json::json!({
+                                "role": "assistant",
+                                "content": msg.content,
+                            }));
+                        }
                     }
                     i += 1;
                 }
@@ -245,10 +300,9 @@ impl AnthropicProvider {
             .map(|m| m.content.clone());
 
         match source {
-            CredentialSource::OAuthFile => Some(match explicit_system {
-                Some(message) => format!("{CLAUDE_CODE_SYSTEM_MESSAGE}\n\n{message}"),
-                None => CLAUDE_CODE_SYSTEM_MESSAGE.to_string(),
-            }),
+            // OAuth sessions: API enforces system == exact identity string.
+            // Any extra content causes 400. Workspace context is injected via user-message preamble.
+            CredentialSource::OAuthFile => Some(CLAUDE_CODE_SYSTEM_MESSAGE.to_string()),
             CredentialSource::ApiKey => explicit_system,
         }
     }
@@ -259,9 +313,17 @@ impl AnthropicProvider {
         source: &CredentialSource,
         stream: bool,
     ) -> Result<serde_json::Value, LlmError> {
+        // Anthropic requires max_tokens >= thinking_budget when thinking is enabled.
+        let max_tokens = match (req.max_tokens, req.thinking_budget) {
+            (Some(mt), Some(budget)) => mt.max(budget),
+            (Some(mt), None) => mt,
+            (None, Some(budget)) => budget.max(8192),
+            (None, None) => 8192,
+        };
+
         let mut body = serde_json::json!({
             "model": self.model,
-            "max_tokens": req.max_tokens.unwrap_or(8192),
+            "max_tokens": max_tokens,
             "messages": self.prepare_messages(req)?,
             "stream": stream,
         });
@@ -270,8 +332,11 @@ impl AnthropicProvider {
             body["system"] = serde_json::Value::String(system);
         }
 
+        // Anthropic rejects temperature + thinking together.
         if let Some(temperature) = req.temperature {
-            body["temperature"] = serde_json::json!(temperature);
+            if req.thinking_budget.is_none() {
+                body["temperature"] = serde_json::json!(temperature);
+            }
         }
 
         if let Some(tools) = &req.tools {
@@ -286,6 +351,19 @@ impl AnthropicProvider {
                 })
                 .collect::<Vec<_>>();
             body["tools"] = serde_json::Value::Array(tools_json);
+
+            // Only send tool_choice when tools are present (Anthropic rejects it without tools).
+            if let Some(tool_choice) = &req.tool_choice {
+                let choice_json = match tool_choice {
+                    ToolChoice::Auto => serde_json::json!({"type": "auto"}),
+                    ToolChoice::None => serde_json::json!({"type": "none"}),
+                    ToolChoice::Required => serde_json::json!({"type": "any"}),
+                    ToolChoice::Specific(name) => {
+                        serde_json::json!({"type": "tool", "name": name})
+                    }
+                };
+                body["tool_choice"] = choice_json;
+            }
         }
 
         if let Some(budget) = req.thinking_budget {
@@ -332,6 +410,7 @@ impl AnthropicProvider {
 
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        let mut reasoning_text = String::new();
 
         if let Some(content_blocks) = json.get("content").and_then(|v| v.as_array()) {
             for block in content_blocks {
@@ -340,6 +419,13 @@ impl AnthropicProvider {
                     "text" => {
                         if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                             text_parts.push(text.to_string());
+                        }
+                    }
+                    "thinking" => {
+                        if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
+                            if !thinking.is_empty() {
+                                reasoning_text.push_str(thinking);
+                            }
                         }
                     }
                     "tool_use" => {
@@ -382,7 +468,11 @@ impl AnthropicProvider {
             } else {
                 Some(tool_calls)
             },
-            reasoning_content: None,
+            reasoning_content: if reasoning_text.is_empty() {
+                None
+            } else {
+                Some(reasoning_text)
+            },
         }
     }
 }
@@ -399,7 +489,7 @@ impl LlmProvider for AnthropicProvider {
 
     async fn chat(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
         let (token, source) = self.get_access_token().await?;
-        let headers = self.build_headers(&token, &source)?;
+        let headers = self.build_headers(&token, &source, req.thinking_budget.is_some())?;
         let body = self.build_request_body(&req, &source, false)?;
 
         debug!(provider = "anthropic", model = %self.model, "sending chat request");
@@ -439,10 +529,18 @@ impl LlmProvider for AnthropicProvider {
         use tokio_stream::StreamExt;
 
         let (token, source) = self.get_access_token().await?;
-        let headers = self.build_headers(&token, &source)?;
+        let headers = self.build_headers(&token, &source, req.thinking_budget.is_some())?;
         let body = self.build_request_body(&req, &source, true)?;
 
-        debug!(provider = "anthropic", model = %self.model, "sending streaming chat request");
+        debug!(
+            provider = "anthropic",
+            model = %self.model,
+            messages = body["messages"].as_array().map(|a| a.len()).unwrap_or(0),
+            has_system = body.get("system").is_some(),
+            has_tools = body.get("tools").is_some(),
+            "sending streaming chat request"
+        );
+        tracing::trace!(body = %body, "full request body"); // set RUST_LOG=trace to inspect raw requests
 
         let response = self
             .client
@@ -457,9 +555,19 @@ impl LlmProvider for AnthropicProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let err_body = response.text().await.unwrap_or_default();
+            warn!(
+                provider = "anthropic",
+                status = %status,
+                tools = body.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0),
+                system_len = body.get("system").and_then(|s| s.as_str()).map(|s| s.len()).unwrap_or(0),
+                messages = body.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0),
+                max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                has_tool_choice = body.get("tool_choice").is_some(),
+                "Anthropic API error"
+            );
             return Err(LlmError::InvalidResponse {
-                message: format!("Anthropic streaming API error {status}: {body}"),
+                message: format!("Anthropic streaming API error {status}: {err_body}"),
             });
         }
 
@@ -882,5 +990,245 @@ mod tests {
             err.contains("sunny login"),
             "error must mention 'sunny login', got: {err}"
         );
+    }
+
+    // --- Fix 1: tool_choice serialization ---
+
+    fn make_tool_req_with_choice(choice: Option<crate::types::ToolChoice>) -> LlmRequest {
+        LlmRequest {
+            messages: vec![crate::types::ChatMessage {
+                role: ChatRole::User,
+                content: "do stuff".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: Some(vec![crate::types::ToolDefinition {
+                name: "fs_read".to_string(),
+                description: "read a file".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                group: crate::types::ToolGroup::default(),
+                hint: None,
+            }]),
+            tool_choice: choice,
+            thinking_budget: None,
+        }
+    }
+
+    #[test]
+    fn test_build_request_body_includes_tool_choice_auto() {
+        let provider = AnthropicProvider {
+            credentials: Arc::new(RwLock::new(make_test_credentials("test-token"))),
+            client: reqwest::Client::new(),
+            model: "claude-sonnet-4-6".to_string(),
+        };
+        let req = make_tool_req_with_choice(Some(crate::types::ToolChoice::Auto));
+        let body = provider
+            .build_request_body(&req, &CredentialSource::ApiKey, false)
+            .unwrap();
+        assert_eq!(body["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn test_build_request_body_includes_tool_choice_required() {
+        let provider = AnthropicProvider {
+            credentials: Arc::new(RwLock::new(make_test_credentials("test-token"))),
+            client: reqwest::Client::new(),
+            model: "claude-sonnet-4-6".to_string(),
+        };
+        let req = make_tool_req_with_choice(Some(crate::types::ToolChoice::Required));
+        let body = provider
+            .build_request_body(&req, &CredentialSource::ApiKey, false)
+            .unwrap();
+        // Required maps to Anthropic's "any" type.
+        assert_eq!(body["tool_choice"]["type"], "any");
+    }
+
+    #[test]
+    fn test_build_request_body_includes_tool_choice_specific() {
+        let provider = AnthropicProvider {
+            credentials: Arc::new(RwLock::new(make_test_credentials("test-token"))),
+            client: reqwest::Client::new(),
+            model: "claude-sonnet-4-6".to_string(),
+        };
+        let req =
+            make_tool_req_with_choice(Some(crate::types::ToolChoice::Specific("fs_read".to_string())));
+        let body = provider
+            .build_request_body(&req, &CredentialSource::ApiKey, false)
+            .unwrap();
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "fs_read");
+    }
+
+    #[test]
+    fn test_build_request_body_omits_tool_choice_when_no_tools() {
+        let provider = AnthropicProvider {
+            credentials: Arc::new(RwLock::new(make_test_credentials("test-token"))),
+            client: reqwest::Client::new(),
+            model: "claude-sonnet-4-6".to_string(),
+        };
+        // No tools — tool_choice must be omitted even when set.
+        let req = LlmRequest {
+            messages: vec![crate::types::ChatMessage {
+                role: ChatRole::User,
+                content: "hi".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            tool_choice: Some(crate::types::ToolChoice::Auto),
+            thinking_budget: None,
+        };
+        let body = provider
+            .build_request_body(&req, &CredentialSource::ApiKey, false)
+            .unwrap();
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    // --- Fix 2: thinking beta constant ---
+
+    #[test]
+    fn test_build_headers_thinking_beta_no_legacy_extended_thinking() {
+        assert!(
+            !ANTHROPIC_BETA_THINKING.contains("extended-thinking-2025-01-10"),
+            "legacy extended-thinking-2025-01-10 must not be present (claude-3-7-sonnet only)"
+        );
+        assert!(
+            ANTHROPIC_BETA_THINKING.contains("interleaved-thinking-2025-05-14"),
+            "interleaved-thinking-2025-05-14 must be present"
+        );
+    }
+
+    // --- Fix 3: temperature stripped when thinking is enabled ---
+
+    #[test]
+    fn test_build_request_body_strips_temperature_when_thinking_enabled() {
+        let provider = AnthropicProvider {
+            credentials: Arc::new(RwLock::new(make_test_credentials("test-token"))),
+            client: reqwest::Client::new(),
+            model: "claude-sonnet-4-6".to_string(),
+        };
+        let req = LlmRequest {
+            messages: vec![crate::types::ChatMessage {
+                role: ChatRole::User,
+                content: "hi".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            max_tokens: None,
+            temperature: Some(0.7),
+            tools: None,
+            tool_choice: None,
+            thinking_budget: Some(4000),
+        };
+        let body = provider
+            .build_request_body(&req, &CredentialSource::ApiKey, false)
+            .unwrap();
+        assert!(
+            body.get("temperature").is_none(),
+            "temperature must be omitted when thinking_budget is set"
+        );
+    }
+
+    // --- Fix 4: max_tokens auto-expanded to cover thinking_budget ---
+
+    #[test]
+    fn test_build_request_body_expands_max_tokens_to_cover_thinking_budget() {
+        let provider = AnthropicProvider {
+            credentials: Arc::new(RwLock::new(make_test_credentials("test-token"))),
+            client: reqwest::Client::new(),
+            model: "claude-sonnet-4-6".to_string(),
+        };
+        // max_tokens (2000) < thinking_budget (4000): must be expanded to 4000.
+        let req = LlmRequest {
+            messages: vec![crate::types::ChatMessage {
+                role: ChatRole::User,
+                content: "hi".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            max_tokens: Some(2000),
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            thinking_budget: Some(4000),
+        };
+        let body = provider
+            .build_request_body(&req, &CredentialSource::ApiKey, false)
+            .unwrap();
+        assert_eq!(body["max_tokens"], 4000);
+    }
+
+    // --- Fix 5c: reasoning_content extracted from chat response ---
+
+    #[test]
+    fn test_parse_response_extracts_thinking_block() {
+        let provider = AnthropicProvider {
+            credentials: Arc::new(RwLock::new(make_test_credentials("test-token"))),
+            client: reqwest::Client::new(),
+            model: "claude-sonnet-4-6".to_string(),
+        };
+        let json = serde_json::json!({
+            "id": "msg_think",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 30},
+            "content": [
+                {"type": "thinking", "thinking": "Let me reason about this..."},
+                {"type": "text", "text": "The answer is 42."}
+            ]
+        });
+        let response = provider.parse_response(json);
+        assert_eq!(response.content, "The answer is 42.");
+        assert_eq!(
+            response.reasoning_content.as_deref(),
+            Some("Let me reason about this...")
+        );
+    }
+
+    // --- Fix 6: no duplicate system message for OAuth when already prefixed ---
+
+    #[test]
+    fn test_extract_system_oauth_no_duplicate_if_already_prefixed() {
+        let provider = AnthropicProvider {
+            credentials: Arc::new(RwLock::new(make_test_credentials("test-token"))),
+            client: reqwest::Client::new(),
+            model: "claude-sonnet-4-6".to_string(),
+        };
+        // System message already starts with CLAUDE_CODE_SYSTEM_MESSAGE — must not be doubled.
+        let already_prefixed = format!("{CLAUDE_CODE_SYSTEM_MESSAGE}\n\nExtra context.");
+        let req = LlmRequest {
+            messages: vec![crate::types::ChatMessage {
+                role: ChatRole::System,
+                content: already_prefixed.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            thinking_budget: None,
+        };
+        let system = provider
+            .extract_system(&req, &CredentialSource::OAuthFile)
+            .expect("system must be set");
+        assert_eq!(
+            system, already_prefixed,
+            "system must not be double-prefixed"
+        );
+        // Confirm it doesn't appear twice.
+        let occurrences = system.matches(CLAUDE_CODE_SYSTEM_MESSAGE).count();
+        assert_eq!(occurrences, 1, "CLAUDE_CODE_SYSTEM_MESSAGE must appear exactly once");
     }
 }

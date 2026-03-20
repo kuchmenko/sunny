@@ -631,10 +631,9 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
         },
     ];
 
-    defs.extend(sunny_plans::tools::definitions::build_plan_tool_definitions());
     defs.push(ToolDefinition {
         name: "task_request_replan".to_string(),
-        description: "Request that the current plan be replanned when execution discovers new information or a blocking issue. Use this to record an agent-triggered replan reason against an existing plan.".to_string(),
+        description: "Signal the orchestrator that execution encountered an unexpected deviation and the plan should be re-evaluated.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -649,7 +648,7 @@ pub fn build_tool_definitions() -> Vec<ToolDefinition> {
             },
             "required": ["plan_id", "reason"]
         }),
-        group: ToolGroup::Plans,
+        group: ToolGroup::Tasks,
         hint: None,
     });
     defs

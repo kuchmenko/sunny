@@ -47,7 +47,7 @@ async fn test_stale_read_full_cycle() {
     std::fs::write(&file, "initial\nvalue\n").expect("test: seed file");
 
     let executor =
-        build_tool_executor_with_capabilities(root.path().to_path_buf(), None, None, None, None);
+        build_tool_executor_with_capabilities(root.path().to_path_buf(), None, None, None, None, None);
 
     let first_read = run_tool(
         &executor,
@@ -115,7 +115,7 @@ async fn test_edit_line_hint_disambiguation() {
     std::fs::write(&file, content).expect("test: seed duplicate blocks");
 
     let executor =
-        build_tool_executor_with_capabilities(root.path().to_path_buf(), None, None, None, None);
+        build_tool_executor_with_capabilities(root.path().to_path_buf(), None, None, None, None, None);
 
     run_tool(
         &executor,
@@ -160,6 +160,7 @@ async fn test_shell_capability_enforcement() {
         None,
         None,
         None,
+        None,
     );
 
     let result = run_tool(
@@ -178,6 +179,7 @@ async fn test_git_commit_capability_check() {
     let executor = build_tool_executor_with_capabilities(
         root.path().to_path_buf(),
         Some(checker),
+        None,
         None,
         None,
         None,
@@ -231,7 +233,7 @@ async fn test_fs_glob_finds_files() {
     std::fs::write(root.path().join("notes.txt"), "notes\n").expect("test: write notes.txt");
 
     let executor =
-        build_tool_executor_with_capabilities(root.path().to_path_buf(), None, None, None, None);
+        build_tool_executor_with_capabilities(root.path().to_path_buf(), None, None, None, None, None);
     let output = run_tool(
         &executor,
         "fs_glob",
