@@ -130,6 +130,35 @@ async fn exchange_code_with_verifier(
     }
 
     let token: TokenResponse = response.json().await?;
+    credentials_from_token(token)
+}
+
+pub async fn refresh_oauth_credentials(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<OAuthCredentials> {
+    let response = client
+        .post(format!("{OPENAI_ISSUER}/oauth/token"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", CLIENT_ID),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        bail!("token refresh failed ({status}): {text}");
+    }
+
+    let token: TokenResponse = response.json().await?;
+    credentials_from_token(token)
+}
+
+fn credentials_from_token(token: TokenResponse) -> Result<OAuthCredentials> {
     let account_id = extract_account_id(&token.access_token)?;
 
     Ok(OAuthCredentials {

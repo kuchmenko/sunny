@@ -29,7 +29,9 @@ async fn main() -> Result<()> {
     state.client = Arc::new(client);
 
     let creds_manager = CredentialsManager::new()?;
-    let mut agent = creds_manager.get_openai()?.map(create_openai_agent);
+    let mut agent = creds_manager
+        .get_openai()?
+        .map(|credentials| create_openai_agent(credentials, creds_manager.clone()));
     state.is_authenticated = agent.is_some();
 
     if state.is_authenticated {
@@ -58,9 +60,12 @@ async fn main() -> Result<()> {
     }
 }
 
-fn create_openai_agent(credentials: openai::OAuthCredentials) -> Agent {
+fn create_openai_agent(
+    credentials: openai::OAuthCredentials,
+    creds_manager: CredentialsManager,
+) -> Agent {
     Agent::builder()
-        .provider(OpenAICodex::new(credentials))
+        .provider(OpenAICodex::new(credentials, creds_manager))
         .model("gpt-5.5")
         .system("You are a concise assistant.")
         .tools(tools::defaults())
@@ -88,47 +93,47 @@ async fn process_input(agent: &Agent, messages: &[Message]) -> Result<String> {
     let mut content = String::new();
 
     while let Some(event) = stream.next().await {
-        match event {
-            Ok(s_event) => match s_event {
-                tkach::StreamEvent::ContentDelta(cd) => {
-                    content.push_str(&cd);
-                }
-                tkach::StreamEvent::ToolUse { id, name, input } => {
-                    println!("tool_use: {}, {}, {}", id, name, input);
-                }
-                tkach::StreamEvent::ToolCallPending {
-                    id,
-                    name,
-                    input,
-                    class,
-                } => {
-                    println!(
-                        "tool_call_pending: {}, {}, {}, {:?}",
-                        id, name, input, class
-                    );
+        match event? {
+            tkach::StreamEvent::ContentDelta(cd) => {
+                content.push_str(&cd);
+            }
+            tkach::StreamEvent::ToolUse { id, name, input } => {
+                println!("tool_use: {}, {}, {}", id, name, input);
+            }
+            tkach::StreamEvent::ToolCallPending {
+                id,
+                name,
+                input,
+                class,
+            } => {
+                println!(
+                    "tool_call_pending: {}, {}, {}, {:?}",
+                    id, name, input, class
+                );
 
-                    match class {
-                        tkach::ToolClass::ReadOnly => todo!(),
-                        tkach::ToolClass::Mutating => todo!(),
-                    }
+                match class {
+                    tkach::ToolClass::ReadOnly => todo!(),
+                    tkach::ToolClass::Mutating => todo!(),
                 }
-                tkach::StreamEvent::MessageDelta { stop_reason } => {
-                    println!("message_delta: {:?}", stop_reason);
-                }
-                tkach::StreamEvent::Usage(usage) => {
-                    println!("usage: {:?}", usage);
-                }
-                tkach::StreamEvent::Done => {
-                    println!("done");
-                }
-            },
-            Err(err) => {
-                println!("err: {}", err);
+            }
+            tkach::StreamEvent::MessageDelta { stop_reason } => {
+                println!("message_delta: {:?}", stop_reason);
+            }
+            tkach::StreamEvent::Usage(usage) => {
+                println!("usage: {:?}", usage);
+            }
+            tkach::StreamEvent::Done => {
+                println!("done");
             }
         }
     }
 
-    Ok(content)
+    let result = stream.into_result().await?;
+    if content.is_empty() {
+        Ok(result.text)
+    } else {
+        Ok(content)
+    }
 }
 
 async fn detect_command(
@@ -142,7 +147,7 @@ async fn detect_command(
             println!("start openai oauth");
             let credentials = openai::run_oauth_flow(&state.client).await?;
             creds_manager.set_openai(credentials.clone())?;
-            *agent = Some(create_openai_agent(credentials));
+            *agent = Some(create_openai_agent(credentials, creds_manager.clone()));
             state.is_authenticating = false;
             state.is_authenticated = true;
 

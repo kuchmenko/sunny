@@ -5,23 +5,105 @@ use tkach::{
     Content, LlmProvider, ProviderError, ProviderEventStream, Request, Response, Role, StopReason,
     StreamEvent, Usage,
 };
+use tokio::sync::Mutex;
+
+use crate::credentials::CredentialsManager;
 
 use super::OAuthCredentials;
 
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const REFRESH_WINDOW_MS: u64 = 5 * 60 * 1000;
+const UNAUTHORIZED: u16 = 401;
 
 pub struct OpenAICodex {
-    credentials: OAuthCredentials,
+    credentials: Mutex<OAuthCredentials>,
+    credentials_manager: CredentialsManager,
     client: reqwest::Client,
 }
 
 impl OpenAICodex {
-    pub fn new(credentials: OAuthCredentials) -> Self {
+    pub fn new(credentials: OAuthCredentials, credentials_manager: CredentialsManager) -> Self {
         Self {
-            credentials,
+            credentials: Mutex::new(credentials),
+            credentials_manager,
             client: reqwest::Client::new(),
         }
     }
+
+    async fn fresh_credentials(&self) -> Result<OAuthCredentials, ProviderError> {
+        let mut credentials = self.credentials.lock().await;
+        if !should_refresh(&credentials) {
+            return Ok(credentials.clone());
+        }
+
+        self.refresh_locked(&mut credentials).await
+    }
+
+    async fn refresh_after_unauthorized(
+        &self,
+        rejected_access: &str,
+    ) -> Result<OAuthCredentials, ProviderError> {
+        let mut credentials = self.credentials.lock().await;
+        if credentials.access != rejected_access {
+            return Ok(credentials.clone());
+        }
+
+        self.refresh_locked(&mut credentials).await
+    }
+
+    async fn refresh_locked(
+        &self,
+        credentials: &mut OAuthCredentials,
+    ) -> Result<OAuthCredentials, ProviderError> {
+        let refreshed = super::refresh_oauth_credentials(&self.client, &credentials.refresh)
+            .await
+            .map_err(|err| {
+                ProviderError::Other(format!(
+                    "OpenAI OAuth token refresh failed: {err}. Run .login to re-authenticate."
+                ))
+            })?;
+
+        *credentials = refreshed.clone();
+        self.credentials_manager
+            .set_openai(refreshed.clone())
+            .map_err(|err| {
+                ProviderError::Other(format!(
+                    "failed to save refreshed OpenAI OAuth credentials: {err}"
+                ))
+            })?;
+
+        Ok(refreshed)
+    }
+
+    async fn send_codex_request(
+        &self,
+        body: &Value,
+        credentials: &OAuthCredentials,
+    ) -> Result<reqwest::Response, ProviderError> {
+        Ok(self
+            .client
+            .post(format!("{CODEX_BASE_URL}/codex/responses"))
+            .bearer_auth(&credentials.access)
+            .header("chatgpt-account-id", &credentials.account_id)
+            .header("originator", "sunny")
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .json(body)
+            .send()
+            .await?)
+    }
+}
+
+fn should_refresh(credentials: &OAuthCredentials) -> bool {
+    now_ms().saturating_add(REFRESH_WINDOW_MS) >= credentials.expires
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[async_trait]
@@ -50,18 +132,13 @@ impl LlmProvider for OpenAICodex {
 
     async fn stream(&self, request: Request) -> Result<ProviderEventStream, ProviderError> {
         let body = build_codex_body(&request);
-        let response = self
-            .client
-            .post(format!("{CODEX_BASE_URL}/codex/responses"))
-            .bearer_auth(&self.credentials.access)
-            .header("chatgpt-account-id", &self.credentials.account_id)
-            .header("originator", "sunny")
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("accept", "text/event-stream")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        let credentials = self.fresh_credentials().await?;
+        let mut response = self.send_codex_request(&body, &credentials).await?;
+
+        if response.status().as_u16() == UNAUTHORIZED {
+            let credentials = self.refresh_after_unauthorized(&credentials.access).await?;
+            response = self.send_codex_request(&body, &credentials).await?;
+        }
 
         let status = response.status().as_u16();
         if status >= 400 {

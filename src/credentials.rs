@@ -14,6 +14,7 @@ pub struct CredentialsStore {
     pub openai_codex: Option<openai::oauth::OAuthCredentials>,
 }
 
+#[derive(Clone)]
 pub struct CredentialsManager {
     path: PathBuf,
 }
@@ -33,7 +34,9 @@ impl CredentialsManager {
         match File::open(&self.path) {
             Ok(f) => serde_json::from_reader::<File, CredentialsStore>(f)
                 .map_err(|err| anyhow!("failed to deserialize credentials file: {err}")),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(CredentialsStore::default()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(CredentialsStore::default())
+            }
             Err(err) => Err(anyhow!("unable to open credentials file: {err}")),
         }
     }
