@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 use tkach::{
-    tools, Agent, CancellationToken, Content, Message, Tool, ToolClass, ToolContext, ToolError,
-    ToolOutput,
+    tools, Agent, AgentResult, CancellationToken, Content, Message, Tool, ToolClass, ToolContext,
+    ToolError, ToolOutput,
 };
 use tokio::io::{self as tokio_io, AsyncBufReadExt, BufReader};
 
@@ -32,7 +32,9 @@ const SYSTEM_PROMPT: &str = r#"You are Sunny, a concise terminal assistant. Be d
 Command-following contract:
 - Treat imperative user messages as tasks to execute, not topics to discuss.
 - If the user asks to use tools, use tools unless impossible.
+- For tasks about the environment, files, repo, codebase, shell state, or tool availability, verify with tools before answering.
 - Never claim tools or filesystem access are unavailable when tools are available.
+- Refer to tools by their Sunny names: bash, read, write, edit, grep, glob.
 - If required details are missing, choose the safest useful default instead of asking.
 - Ask only when ambiguity changes risk, writes data, touches secrets/auth, or blocks all progress.
 - If a target is broad, inspect shallowly first, then narrow.
@@ -233,10 +235,8 @@ async fn handle_agent_message(
     messages.push(Message::user(vec![Content::text(line)]));
 
     match process_input(agent, messages, ui).await {
-        Ok(resp) => {
-            if !resp.is_empty() {
-                messages.push(Message::assistant(vec![Content::text(resp)]));
-            }
+        Ok(result) => {
+            messages.extend(result.new_messages);
             Ok(())
         }
         Err(err) => {
@@ -246,7 +246,7 @@ async fn handle_agent_message(
     }
 }
 
-async fn process_input(agent: &Agent, messages: &[Message], ui: &Ui) -> Result<String> {
+async fn process_input(agent: &Agent, messages: &[Message], ui: &Ui) -> Result<AgentResult> {
     let token = CancellationToken::new();
     let mut stream = agent.stream(messages.to_vec(), token);
     let mut content = String::new();
@@ -277,6 +277,12 @@ async fn process_input(agent: &Agent, messages: &[Message], ui: &Ui) -> Result<S
                 input,
                 class,
             } => {
+                if assistant_started {
+                    println!();
+                    assistant_started = false;
+                }
+                print_tool_call(ui, &name, &input)?;
+
                 if debug {
                     print_debug(ui, format!("tool_pending {id} {name} {input} {class:?}"));
                 }
@@ -307,12 +313,11 @@ async fn process_input(agent: &Agent, messages: &[Message], ui: &Ui) -> Result<S
         std::io::stdout().flush()?;
     }
 
-    let text = if streamed { content } else { result.text };
-    if !text.is_empty() {
+    if streamed || !result.text.is_empty() {
         println!();
     }
 
-    Ok(text)
+    Ok(result)
 }
 
 async fn detect_command(
@@ -473,6 +478,29 @@ fn print_error(ui: &Ui, message: impl AsRef<str>) {
 
 fn print_note(ui: &Ui, message: impl AsRef<str>) {
     println!("{} {}", ui.paint(ORANGE, "›"), message.as_ref());
+}
+
+fn print_tool_call(ui: &Ui, name: &str, input: &Value) -> Result<()> {
+    println!(
+        "{} {} {}",
+        ui.paint(DIM, "↳"),
+        ui.paint(CREAM, name),
+        ui.paint(DIM, compact_json(input, 180))
+    );
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+fn compact_json(value: &Value, max_chars: usize) -> String {
+    let text = value.to_string();
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text;
+    }
+
+    let mut compact: String = text.chars().take(max_chars).collect();
+    compact.push('…');
+    compact
 }
 
 fn print_debug(ui: &Ui, message: impl AsRef<str>) {
