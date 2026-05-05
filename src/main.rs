@@ -7,8 +7,13 @@ use std::{
 };
 
 use anyhow::Result;
+use async_trait::async_trait;
 use futures::StreamExt;
-use tkach::{tools, Agent, CancellationToken, Content, Message};
+use serde_json::Value;
+use tkach::{
+    tools, Agent, CancellationToken, Content, Message, Tool, ToolClass, ToolContext, ToolError,
+    ToolOutput,
+};
 use tokio::io::{self as tokio_io, AsyncBufReadExt, BufReader};
 
 use crate::{credentials::CredentialsManager, openai::OpenAICodex};
@@ -21,6 +26,20 @@ const RED: &str = "1;38;5;196";
 const GREEN: &str = "38;5;150";
 const DIM: &str = "2;38;5;244";
 const FRAME: &str = "38;5;240";
+const MAX_TOOL_OUTPUT_CHARS: usize = 16_000;
+const SYSTEM_PROMPT: &str = r#"You are Sunny, a concise terminal assistant. Be direct and useful.
+
+Command-following contract:
+- Treat imperative user messages as tasks to execute, not topics to discuss.
+- If the user asks to use tools, use tools unless impossible.
+- Never claim tools or filesystem access are unavailable when tools are available.
+- If required details are missing, choose the safest useful default instead of asking.
+- Ask only when ambiguity changes risk, writes data, touches secrets/auth, or blocks all progress.
+- If a target is broad, inspect shallowly first, then narrow.
+- If a target is a directory but the requested tool reads files, list the directory first.
+- If a tool fails because scope or output is too large, retry once with a smaller bounded scope.
+- Prefer bounded commands and reads: shallow listings, targeted files, explicit limits.
+- Summarize findings; do not dump large raw outputs unless asked."#;
 
 #[derive(Default, Debug)]
 struct State {
@@ -132,9 +151,77 @@ fn create_openai_agent(
     Agent::builder()
         .provider(OpenAICodex::new(credentials, creds_manager))
         .model("gpt-5.5")
-        .system("You are Sunny, a concise terminal assistant. Be direct and useful.")
-        .tools(tools::defaults())
+        .system(SYSTEM_PROMPT)
+        .tools(bounded_default_tools())
         .build()
+}
+
+struct BoundedTool {
+    inner: Arc<dyn Tool>,
+    description: String,
+}
+
+impl BoundedTool {
+    fn new(inner: Arc<dyn Tool>) -> Self {
+        Self {
+            description: format!(
+                "{} Return bounded output; large results are truncated by Sunny.",
+                inner.description()
+            ),
+            inner,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for BoundedTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> Value {
+        self.inner.input_schema()
+    }
+
+    fn class(&self) -> ToolClass {
+        self.inner.class()
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let output = self.inner.execute(input, ctx).await?;
+        Ok(truncate_tool_output(output))
+    }
+}
+
+fn bounded_default_tools() -> Vec<Arc<dyn Tool>> {
+    tools::defaults()
+        .into_iter()
+        .map(|tool| Arc::new(BoundedTool::new(tool)) as Arc<dyn Tool>)
+        .collect()
+}
+
+fn truncate_tool_output(output: ToolOutput) -> ToolOutput {
+    match output {
+        ToolOutput::Text(text) => ToolOutput::text(truncate_text(text)),
+        ToolOutput::Error(text) => ToolOutput::error(truncate_text(text)),
+    }
+}
+
+fn truncate_text(text: String) -> String {
+    let total_chars = text.chars().count();
+    if total_chars <= MAX_TOOL_OUTPUT_CHARS {
+        return text;
+    }
+
+    let mut truncated: String = text.chars().take(MAX_TOOL_OUTPUT_CHARS).collect();
+    truncated.push_str(&format!(
+        "\n\n[Sunny truncated tool output: showed {MAX_TOOL_OUTPUT_CHARS} of {total_chars} chars. Retry with a narrower command/read if needed.]"
+    ));
+    truncated
 }
 
 async fn handle_agent_message(
