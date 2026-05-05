@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use tkach::{
-    Content, LlmProvider, ProviderError, ProviderEventStream, Request, Response, Role, StopReason,
-    StreamEvent, Usage,
+    Content, LlmProvider, Message, ProviderError, ProviderEventStream, Request, Response, Role,
+    StopReason, StreamEvent, ToolDefinition, Usage,
 };
 use tokio::sync::Mutex;
 
@@ -175,42 +175,152 @@ fn build_codex_body(request: &Request) -> Value {
         })
         .unwrap_or_default();
 
-    let input: Vec<Value> = request
-        .messages
-        .iter()
-        .map(|message| {
-            let role = match message.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            };
-            let content = message
-                .content
-                .iter()
-                .filter_map(|content| match content {
-                    Content::Text { text, .. } => Some(text.as_str()),
-                    Content::ToolResult { content, .. } => Some(content.as_str()),
-                    Content::ToolUse { .. } => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            json!({ "role": role, "content": content })
-        })
-        .collect();
-
-    json!({
+    let mut body = json!({
         "model": request.model,
         "store": false,
         "stream": true,
         "instructions": instructions,
-        "input": input,
+        "input": build_codex_input(&request.messages),
         "text": { "verbosity": "low" },
         "include": ["reasoning.encrypted_content"],
+    });
+
+    let tools = build_codex_tools(&request.tools);
+    if !tools.is_empty() {
+        let body = body.as_object_mut().expect("body is an object");
+        body.insert("tools".to_owned(), Value::Array(tools));
+        body.insert("tool_choice".to_owned(), json!("auto"));
+        body.insert("parallel_tool_calls".to_owned(), json!(true));
+    }
+
+    body
+}
+
+fn build_codex_input(messages: &[Message]) -> Vec<Value> {
+    let mut input = Vec::new();
+
+    for message in messages {
+        match message.role {
+            Role::User => push_user_message(&mut input, message),
+            Role::Assistant => push_assistant_message(&mut input, message),
+        }
+    }
+
+    input
+}
+
+fn push_user_message(input: &mut Vec<Value>, message: &Message) {
+    let mut text = Vec::new();
+
+    for content in &message.content {
+        match content {
+            Content::Text { text: chunk, .. } => text.push(chunk.as_str()),
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => {
+                push_text_message(input, "user", &text.join("\n"));
+                text.clear();
+
+                let output = if *is_error {
+                    format!("Error: {content}")
+                } else {
+                    content.clone()
+                };
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": tool_call_id_for_output(tool_use_id),
+                    "output": output,
+                }));
+            }
+            Content::ToolUse { .. } => {}
+        }
+    }
+
+    push_text_message(input, "user", &text.join("\n"));
+}
+
+fn push_assistant_message(input: &mut Vec<Value>, message: &Message) {
+    let mut text = Vec::new();
+
+    for content in &message.content {
+        match content {
+            Content::Text { text: chunk, .. } => text.push(chunk.as_str()),
+            Content::ToolUse {
+                id,
+                name,
+                input: args,
+            } => {
+                push_text_message(input, "assistant", &text.join("\n"));
+                text.clear();
+
+                let (call_id, item_id) = split_tool_use_id(id);
+                let mut item = json!({
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": args.to_string(),
+                });
+                if let Some(item_id) = item_id {
+                    item.as_object_mut()
+                        .expect("function call item is an object")
+                        .insert("id".to_owned(), json!(item_id));
+                }
+                input.push(item);
+            }
+            Content::ToolResult { .. } => {}
+        }
+    }
+
+    push_text_message(input, "assistant", &text.join("\n"));
+}
+
+fn push_text_message(input: &mut Vec<Value>, role: &str, content: &str) {
+    if !content.is_empty() {
+        input.push(json!({ "role": role, "content": content }));
+    }
+}
+
+fn build_codex_tools(tools: &[ToolDefinition]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+                "strict": null,
+            })
+        })
+        .collect()
+}
+
+fn split_tool_use_id(id: &str) -> (&str, Option<&str>) {
+    id.split_once('|').map_or((id, None), |(call_id, item_id)| {
+        (call_id, (!item_id.is_empty()).then_some(item_id))
     })
+}
+
+fn tool_call_id_for_output(id: &str) -> &str {
+    split_tool_use_id(id).0
+}
+
+#[derive(Default)]
+struct PendingToolCall {
+    call_id: String,
+    item_id: String,
+    name: String,
+    arguments: String,
 }
 
 fn parse_sse_events(raw: &str) -> Vec<StreamEvent> {
     let mut out = Vec::new();
     let mut usage = Usage::default();
+    let mut pending_tools = std::collections::HashMap::<String, PendingToolCall>::new();
+    let mut saw_tool_use = false;
 
     for chunk in raw.split("\n\n") {
         let data = chunk
@@ -234,16 +344,71 @@ fn parse_sse_events(raw: &str) -> Vec<StreamEvent> {
                     out.push(StreamEvent::ContentDelta(delta.to_owned()));
                 }
             }
+            Some("response.output_item.added") => {
+                if let Some(tool) = pending_tool_from_item(value.get("item")) {
+                    pending_tools.insert(tool.item_id.clone(), tool);
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                if let (Some(item_id), Some(delta)) = (
+                    value.get("item_id").and_then(Value::as_str),
+                    value.get("delta").and_then(Value::as_str),
+                ) {
+                    pending_tools
+                        .entry(item_id.to_owned())
+                        .or_insert_with(|| PendingToolCall {
+                            item_id: item_id.to_owned(),
+                            ..PendingToolCall::default()
+                        })
+                        .arguments
+                        .push_str(delta);
+                }
+            }
+            Some("response.function_call_arguments.done") => {
+                if let (Some(item_id), Some(arguments)) = (
+                    value.get("item_id").and_then(Value::as_str),
+                    value.get("arguments").and_then(Value::as_str),
+                ) {
+                    let tool = pending_tools.entry(item_id.to_owned()).or_insert_with(|| {
+                        PendingToolCall {
+                            item_id: item_id.to_owned(),
+                            ..PendingToolCall::default()
+                        }
+                    });
+                    tool.arguments = arguments.to_owned();
+                    if let Some(name) = value.get("name").and_then(Value::as_str) {
+                        tool.name = name.to_owned();
+                    }
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(tool) = completed_tool_call(&value, &mut pending_tools) {
+                    saw_tool_use = true;
+                    out.push(StreamEvent::ToolUse {
+                        id: combined_tool_use_id(&tool.call_id, &tool.item_id),
+                        name: tool.name,
+                        input: parse_tool_arguments(&tool.arguments),
+                    });
+                }
+            }
             Some("response.completed") | Some("response.done") | Some("response.incomplete") => {
                 if let Some(u) = value.get("response").and_then(|r| r.get("usage")) {
                     usage.input_tokens =
                         u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
                     usage.output_tokens =
                         u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
+                    usage.cache_read_input_tokens = u
+                        .pointer("/input_tokens_details/cached_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as u32;
                 }
+
                 out.push(StreamEvent::Usage(usage.clone()));
                 out.push(StreamEvent::MessageDelta {
-                    stop_reason: StopReason::EndTurn,
+                    stop_reason: codex_stop_reason(
+                        value.pointer("/response/status").and_then(Value::as_str),
+                        saw_tool_use,
+                    ),
                 });
                 out.push(StreamEvent::Done);
             }
@@ -261,4 +426,99 @@ fn parse_sse_events(raw: &str) -> Vec<StreamEvent> {
     }
 
     out
+}
+
+fn pending_tool_from_item(item: Option<&Value>) -> Option<PendingToolCall> {
+    let item = item?;
+    (item.get("type").and_then(Value::as_str) == Some("function_call")).then(|| PendingToolCall {
+        call_id: item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        item_id: item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        name: item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        arguments: item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    })
+}
+
+fn completed_tool_call(
+    value: &Value,
+    pending_tools: &mut std::collections::HashMap<String, PendingToolCall>,
+) -> Option<PendingToolCall> {
+    let item = value.get("item")?;
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+
+    let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+    let mut tool = pending_tools
+        .remove(item_id)
+        .or_else(|| pending_tool_from_item(Some(item)))?;
+
+    if tool.call_id.is_empty() {
+        tool.call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+    }
+    if tool.item_id.is_empty() {
+        tool.item_id = item_id.to_owned();
+    }
+    if tool.name.is_empty() {
+        tool.name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+    }
+    if tool.arguments.is_empty() {
+        tool.arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+    }
+
+    Some(tool)
+}
+
+fn combined_tool_use_id(call_id: &str, item_id: &str) -> String {
+    if item_id.is_empty() {
+        call_id.to_owned()
+    } else {
+        format!("{call_id}|{item_id}")
+    }
+}
+
+fn parse_tool_arguments(arguments: &str) -> Value {
+    if arguments.trim().is_empty() {
+        return Value::Object(Default::default());
+    }
+
+    serde_json::from_str(arguments).unwrap_or_else(|_| Value::Object(Default::default()))
+}
+
+fn codex_stop_reason(status: Option<&str>, saw_tool_use: bool) -> StopReason {
+    if saw_tool_use {
+        return StopReason::ToolUse;
+    }
+
+    match status {
+        Some("incomplete") => StopReason::MaxTokens,
+        _ => StopReason::EndTurn,
+    }
 }

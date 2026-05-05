@@ -111,10 +111,7 @@ async fn process_input(agent: &Agent, messages: &[Message]) -> Result<String> {
                     id, name, input, class
                 );
 
-                match class {
-                    tkach::ToolClass::ReadOnly => todo!(),
-                    tkach::ToolClass::Mutating => todo!(),
-                }
+                let _ = class;
             }
             tkach::StreamEvent::MessageDelta { stop_reason } => {
                 println!("message_delta: {:?}", stop_reason);
