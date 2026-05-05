@@ -1,7 +1,7 @@
 mod credentials;
 mod openai;
 
-use std::sync::Arc;
+use std::{io::Write, sync::Arc};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -80,9 +80,7 @@ async fn handle_agent_message(
     messages.push(Message::user(vec![Content::text(line)]));
     let resp = process_input(agent, messages).await?;
 
-    messages.push(Message::assistant(vec![Content::text(resp.clone())]));
-
-    println!("{}", resp);
+    messages.push(Message::assistant(vec![Content::text(resp)]));
 
     Ok(())
 }
@@ -95,6 +93,8 @@ async fn process_input(agent: &Agent, messages: &[Message]) -> Result<String> {
     while let Some(event) = stream.next().await {
         match event? {
             tkach::StreamEvent::ContentDelta(cd) => {
+                print!("{}", cd);
+                std::io::stdout().flush()?;
                 content.push_str(&cd);
             }
             tkach::StreamEvent::ToolUse { id, name, input } => {
@@ -126,11 +126,17 @@ async fn process_input(agent: &Agent, messages: &[Message]) -> Result<String> {
     }
 
     let result = stream.into_result().await?;
-    if content.is_empty() {
-        Ok(result.text)
+    let text = if content.is_empty() {
+        result.text
     } else {
-        Ok(content)
+        content
+    };
+
+    if !text.is_empty() {
+        println!();
     }
+
+    Ok(text)
 }
 
 async fn detect_command(

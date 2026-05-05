@@ -1,5 +1,7 @@
+use std::collections::{HashMap, VecDeque};
+
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tkach::{
     Content, LlmProvider, Message, ProviderError, ProviderEventStream, Request, Response, Role,
@@ -150,15 +152,7 @@ impl LlmProvider for OpenAICodex {
             });
         }
 
-        let mut byte_stream = response.bytes_stream();
-        let mut raw = String::new();
-        while let Some(chunk) = byte_stream.next().await {
-            let bytes = chunk.map_err(ProviderError::Http)?;
-            raw.push_str(&String::from_utf8_lossy(&bytes));
-        }
-
-        let events = parse_sse_events(&raw);
-        Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        Ok(codex_event_stream(response.bytes_stream()))
     }
 }
 
@@ -308,6 +302,22 @@ fn tool_call_id_for_output(id: &str) -> &str {
     split_tool_use_id(id).0
 }
 
+struct CodexStreamState<S> {
+    byte_stream: S,
+    buffer: Vec<u8>,
+    parser: CodexSseParser,
+    outbox: VecDeque<Result<StreamEvent, ProviderError>>,
+    done: bool,
+}
+
+#[derive(Default)]
+struct CodexSseParser {
+    usage: Usage,
+    pending_tools: HashMap<String, PendingToolCall>,
+    saw_tool_use: bool,
+    emitted_terminal: bool,
+}
+
 #[derive(Default)]
 struct PendingToolCall {
     call_id: String,
@@ -316,37 +326,97 @@ struct PendingToolCall {
     arguments: String,
 }
 
-fn parse_sse_events(raw: &str) -> Vec<StreamEvent> {
-    let mut out = Vec::new();
-    let mut usage = Usage::default();
-    let mut pending_tools = std::collections::HashMap::<String, PendingToolCall>::new();
-    let mut saw_tool_use = false;
+fn codex_event_stream<S, B>(byte_stream: S) -> ProviderEventStream
+where
+    S: Stream<Item = Result<B, reqwest::Error>> + Send + Unpin + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+{
+    Box::pin(futures::stream::unfold(
+        CodexStreamState {
+            byte_stream,
+            buffer: Vec::new(),
+            parser: CodexSseParser::default(),
+            outbox: VecDeque::new(),
+            done: false,
+        },
+        |mut state| async move {
+            loop {
+                if let Some(event) = state.outbox.pop_front() {
+                    return Some((event, state));
+                }
 
-    for chunk in raw.split("\n\n") {
-        let data = chunk
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .join("\n");
+                if state.done {
+                    return None;
+                }
 
-        if data.is_empty() || data == "[DONE]" {
-            continue;
+                if let Some(frame) = next_sse_frame(&mut state.buffer) {
+                    match state.parser.process_frame(&frame, &mut state.outbox) {
+                        Ok(terminal) => state.done = terminal,
+                        Err(err) => return Some((Err(err), state)),
+                    }
+                    continue;
+                }
+
+                match state.byte_stream.next().await {
+                    Some(Ok(bytes)) => state.buffer.extend_from_slice(bytes.as_ref()),
+                    Some(Err(err)) => return Some((Err(ProviderError::Http(err)), state)),
+                    None => {
+                        if !state.buffer.is_empty() {
+                            let frame = std::mem::take(&mut state.buffer);
+                            if let Err(err) = state.parser.process_frame(&frame, &mut state.outbox)
+                            {
+                                return Some((Err(err), state));
+                            }
+                        }
+                        state.parser.finish(&mut state.outbox);
+                        state.done = true;
+                    }
+                }
+            }
+        },
+    ))
+}
+
+impl CodexSseParser {
+    fn process_frame(
+        &mut self,
+        frame: &[u8],
+        out: &mut VecDeque<Result<StreamEvent, ProviderError>>,
+    ) -> Result<bool, ProviderError> {
+        let frame = String::from_utf8(frame.to_vec())
+            .map_err(|err| ProviderError::Other(format!("invalid SSE UTF-8: {err}")))?;
+        let data = sse_data(&frame);
+
+        if data.is_empty() {
+            return Ok(false);
+        }
+
+        if data == "[DONE]" {
+            self.finish(out);
+            return Ok(true);
         }
 
         let Ok(value) = serde_json::from_str::<Value>(&data) else {
-            continue;
+            return Ok(false);
         };
 
+        Ok(self.process_value(value, out))
+    }
+
+    fn process_value(
+        &mut self,
+        value: Value,
+        out: &mut VecDeque<Result<StreamEvent, ProviderError>>,
+    ) -> bool {
         match value.get("type").and_then(Value::as_str) {
             Some("response.output_text.delta") => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                    out.push(StreamEvent::ContentDelta(delta.to_owned()));
+                    out.push_back(Ok(StreamEvent::ContentDelta(delta.to_owned())));
                 }
             }
             Some("response.output_item.added") => {
                 if let Some(tool) = pending_tool_from_item(value.get("item")) {
-                    pending_tools.insert(tool.item_id.clone(), tool);
+                    self.pending_tools.insert(tool.item_id.clone(), tool);
                 }
             }
             Some("response.function_call_arguments.delta") => {
@@ -354,7 +424,7 @@ fn parse_sse_events(raw: &str) -> Vec<StreamEvent> {
                     value.get("item_id").and_then(Value::as_str),
                     value.get("delta").and_then(Value::as_str),
                 ) {
-                    pending_tools
+                    self.pending_tools
                         .entry(item_id.to_owned())
                         .or_insert_with(|| PendingToolCall {
                             item_id: item_id.to_owned(),
@@ -369,12 +439,13 @@ fn parse_sse_events(raw: &str) -> Vec<StreamEvent> {
                     value.get("item_id").and_then(Value::as_str),
                     value.get("arguments").and_then(Value::as_str),
                 ) {
-                    let tool = pending_tools.entry(item_id.to_owned()).or_insert_with(|| {
-                        PendingToolCall {
+                    let tool = self
+                        .pending_tools
+                        .entry(item_id.to_owned())
+                        .or_insert_with(|| PendingToolCall {
                             item_id: item_id.to_owned(),
                             ..PendingToolCall::default()
-                        }
-                    });
+                        });
                     tool.arguments = arguments.to_owned();
                     if let Some(name) = value.get("name").and_then(Value::as_str) {
                         tool.name = name.to_owned();
@@ -382,50 +453,119 @@ fn parse_sse_events(raw: &str) -> Vec<StreamEvent> {
                 }
             }
             Some("response.output_item.done") => {
-                if let Some(tool) = completed_tool_call(&value, &mut pending_tools) {
-                    saw_tool_use = true;
-                    out.push(StreamEvent::ToolUse {
-                        id: combined_tool_use_id(&tool.call_id, &tool.item_id),
-                        name: tool.name,
-                        input: parse_tool_arguments(&tool.arguments),
-                    });
+                if let Some(tool) = completed_tool_call(&value, &mut self.pending_tools) {
+                    self.emit_tool_use(tool, out);
                 }
             }
             Some("response.completed") | Some("response.done") | Some("response.incomplete") => {
-                if let Some(u) = value.get("response").and_then(|r| r.get("usage")) {
-                    usage.input_tokens =
-                        u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
-                    usage.output_tokens =
-                        u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
-                    usage.cache_read_input_tokens = u
-                        .pointer("/input_tokens_details/cached_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as u32;
-                }
-
-                out.push(StreamEvent::Usage(usage.clone()));
-                out.push(StreamEvent::MessageDelta {
-                    stop_reason: codex_stop_reason(
-                        value.pointer("/response/status").and_then(Value::as_str),
-                        saw_tool_use,
-                    ),
-                });
-                out.push(StreamEvent::Done);
+                self.update_usage(&value);
+                self.emit_terminal(
+                    value.pointer("/response/status").and_then(Value::as_str),
+                    out,
+                );
+                return true;
             }
             Some("response.failed") => {
                 let msg = value
                     .pointer("/response/error/message")
                     .and_then(Value::as_str)
                     .unwrap_or("Codex response failed");
-                out.push(StreamEvent::ContentDelta(format!(
+                out.push_back(Ok(StreamEvent::ContentDelta(format!(
                     "\n[OpenAI error: {msg}]"
-                )));
+                ))));
             }
             _ => {}
         }
+
+        false
     }
 
-    out
+    fn update_usage(&mut self, value: &Value) {
+        if let Some(u) = value.get("response").and_then(|r| r.get("usage")) {
+            self.usage.input_tokens =
+                u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
+            self.usage.output_tokens =
+                u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
+            self.usage.cache_read_input_tokens = u
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+        }
+    }
+
+    fn emit_tool_use(
+        &mut self,
+        tool: PendingToolCall,
+        out: &mut VecDeque<Result<StreamEvent, ProviderError>>,
+    ) {
+        self.saw_tool_use = true;
+        out.push_back(Ok(StreamEvent::ToolUse {
+            id: combined_tool_use_id(&tool.call_id, &tool.item_id),
+            name: tool.name,
+            input: parse_tool_arguments(&tool.arguments),
+        }));
+    }
+
+    fn emit_terminal(
+        &mut self,
+        status: Option<&str>,
+        out: &mut VecDeque<Result<StreamEvent, ProviderError>>,
+    ) {
+        if self.emitted_terminal {
+            return;
+        }
+
+        out.push_back(Ok(StreamEvent::Usage(self.usage.clone())));
+        out.push_back(Ok(StreamEvent::MessageDelta {
+            stop_reason: codex_stop_reason(status, self.saw_tool_use),
+        }));
+        out.push_back(Ok(StreamEvent::Done));
+        self.emitted_terminal = true;
+    }
+
+    fn finish(&mut self, out: &mut VecDeque<Result<StreamEvent, ProviderError>>) {
+        if self.emitted_terminal {
+            return;
+        }
+
+        for (_, tool) in std::mem::take(&mut self.pending_tools) {
+            self.emit_tool_use(tool, out);
+        }
+        self.emit_terminal(None, out);
+    }
+}
+
+fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let (index, separator_len) = find_sse_separator(buffer)?;
+    let frame = buffer[..index].to_vec();
+    buffer.drain(..index + separator_len);
+    Some(frame)
+}
+
+fn find_sse_separator(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = find_subslice(buffer, b"\n\n").map(|index| (index, 2));
+    let crlf = find_subslice(buffer, b"\r\n\r\n").map(|index| (index, 4));
+
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(found), None) | (None, Some(found)) => Some(found),
+        (None, None) => None,
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn sse_data(frame: &str) -> String {
+    frame
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn pending_tool_from_item(item: Option<&Value>) -> Option<PendingToolCall> {
