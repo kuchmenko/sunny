@@ -5,7 +5,7 @@ use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tkach::{
     Content, LlmProvider, Message, ProviderError, ProviderEventStream, Request, Response, Role,
-    StopReason, StreamEvent, ToolDefinition, Usage,
+    StopReason, StreamEvent, ThinkingMetadata, ThinkingProvider, ToolDefinition, Usage,
 };
 use tokio::sync::Mutex;
 
@@ -112,21 +112,42 @@ fn now_ms() -> u64 {
 impl LlmProvider for OpenAICodex {
     async fn complete(&self, request: Request) -> Result<Response, ProviderError> {
         let mut stream = self.stream(request).await?;
-        let mut text = String::new();
+        let mut current_text = String::new();
+        let mut content: Vec<Content> = Vec::new();
         let mut usage = Usage::default();
         let mut stop_reason = StopReason::EndTurn;
 
         while let Some(event) = stream.next().await {
             match event? {
-                StreamEvent::ContentDelta(delta) => text.push_str(&delta),
+                StreamEvent::ContentDelta(delta) => {
+                    current_text.push_str(&delta);
+                }
+                StreamEvent::ThinkingDelta { .. } => {}
+                StreamEvent::ThinkingBlock {
+                    text,
+                    provider,
+                    metadata,
+                } => {
+                    push_pending_text(&mut content, &mut current_text);
+                    content.push(Content::Thinking {
+                        text,
+                        provider,
+                        metadata,
+                    });
+                }
+                StreamEvent::ToolUse { id, name, input } => {
+                    push_pending_text(&mut content, &mut current_text);
+                    content.push(Content::ToolUse { id, name, input });
+                }
                 StreamEvent::Usage(u) => usage.merge_max(&u),
                 StreamEvent::MessageDelta { stop_reason: sr } => stop_reason = sr,
-                _ => {}
+                StreamEvent::ToolCallPending { .. } | StreamEvent::Done => {}
             }
         }
+        push_pending_text(&mut content, &mut current_text);
 
         Ok(Response {
-            content: vec![Content::text(text)],
+            content,
             stop_reason,
             usage,
         })
@@ -153,6 +174,12 @@ impl LlmProvider for OpenAICodex {
         }
 
         Ok(codex_event_stream(response.bytes_stream()))
+    }
+}
+
+fn push_pending_text(content: &mut Vec<Content>, text: &mut String) {
+    if !text.is_empty() {
+        content.push(Content::text(std::mem::take(text)));
     }
 }
 
@@ -229,7 +256,7 @@ fn push_user_message(input: &mut Vec<Value>, message: &Message) {
                     "output": output,
                 }));
             }
-            Content::ToolUse { .. } => {}
+            Content::ToolUse { .. } | Content::Thinking { .. } => {}
         }
     }
 
@@ -264,7 +291,25 @@ fn push_assistant_message(input: &mut Vec<Value>, message: &Message) {
                 }
                 input.push(item);
             }
-            Content::ToolResult { .. } => {}
+            Content::Thinking {
+                text: summary,
+                provider: ThinkingProvider::OpenAIResponses,
+                metadata:
+                    ThinkingMetadata::OpenAIResponses {
+                        item_id,
+                        encrypted_content,
+                        ..
+                    },
+            } => {
+                push_text_message(input, "assistant", &text.join("\n"));
+                text.clear();
+                input.push(openai_reasoning_item(
+                    item_id.as_deref(),
+                    summary,
+                    encrypted_content.as_deref(),
+                ));
+            }
+            Content::Thinking { .. } | Content::ToolResult { .. } => {}
         }
     }
 
@@ -275,6 +320,25 @@ fn push_text_message(input: &mut Vec<Value>, role: &str, content: &str) {
     if !content.is_empty() {
         input.push(json!({ "role": role, "content": content }));
     }
+}
+
+fn openai_reasoning_item(
+    item_id: Option<&str>,
+    summary: &str,
+    encrypted_content: Option<&str>,
+) -> Value {
+    let mut item = json!({
+        "type": "reasoning",
+        "summary": [{ "type": "summary_text", "text": summary }],
+    });
+    let obj = item.as_object_mut().expect("reasoning item is an object");
+    if let Some(item_id) = item_id.filter(|id| !id.is_empty()) {
+        obj.insert("id".to_owned(), json!(item_id));
+    }
+    if let Some(encrypted_content) = encrypted_content.filter(|value| !value.is_empty()) {
+        obj.insert("encrypted_content".to_owned(), json!(encrypted_content));
+    }
+    item
 }
 
 fn build_codex_tools(tools: &[ToolDefinition]) -> Vec<Value> {
@@ -324,6 +388,12 @@ struct PendingToolCall {
     item_id: String,
     name: String,
     arguments: String,
+}
+
+struct ReasoningItem {
+    item_id: Option<String>,
+    summaries: Vec<String>,
+    encrypted_content: Option<String>,
 }
 
 fn codex_event_stream<S, B>(byte_stream: S) -> ProviderEventStream
@@ -419,6 +489,19 @@ impl CodexSseParser {
                     self.pending_tools.insert(tool.item_id.clone(), tool);
                 }
             }
+            Some("response.reasoning_summary_text.delta") => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    out.push_back(Ok(StreamEvent::ThinkingDelta {
+                        text: delta.to_owned(),
+                    }));
+                }
+            }
+            Some("response.reasoning_summary_part.added")
+            | Some("response.reasoning_text.delta") => {
+                // Summary-part added carries indexes but no text. Raw reasoning_text
+                // is deliberately ignored: Sunny displays provider summaries only,
+                // never raw reasoning traces.
+            }
             Some("response.function_call_arguments.delta") => {
                 if let (Some(item_id), Some(delta)) = (
                     value.get("item_id").and_then(Value::as_str),
@@ -455,6 +538,8 @@ impl CodexSseParser {
             Some("response.output_item.done") => {
                 if let Some(tool) = completed_tool_call(&value, &mut self.pending_tools) {
                     self.emit_tool_use(tool, out);
+                } else if let Some(reasoning) = reasoning_item(value.get("item")) {
+                    self.emit_reasoning(reasoning, out);
                 }
             }
             Some("response.completed") | Some("response.done") | Some("response.incomplete") => {
@@ -504,6 +589,31 @@ impl CodexSseParser {
             name: tool.name,
             input: parse_tool_arguments(&tool.arguments),
         }));
+    }
+
+    fn emit_reasoning(
+        &mut self,
+        reasoning: ReasoningItem,
+        out: &mut VecDeque<Result<StreamEvent, ProviderError>>,
+    ) {
+        let summaries = if reasoning.summaries.is_empty() {
+            vec![String::new()]
+        } else {
+            reasoning.summaries
+        };
+
+        for (summary_index, text) in summaries.into_iter().enumerate() {
+            out.push_back(Ok(StreamEvent::ThinkingBlock {
+                text,
+                provider: ThinkingProvider::OpenAIResponses,
+                metadata: ThinkingMetadata::openai_responses(
+                    reasoning.item_id.clone(),
+                    None,
+                    summary_index,
+                    reasoning.encrypted_content.clone(),
+                ),
+            }));
+        }
     }
 
     fn emit_terminal(
@@ -594,6 +704,33 @@ fn pending_tool_from_item(item: Option<&Value>) -> Option<PendingToolCall> {
     })
 }
 
+fn reasoning_item(item: Option<&Value>) -> Option<ReasoningItem> {
+    let item = item?;
+    (item.get("type").and_then(Value::as_str) == Some("reasoning")).then(|| {
+        let summaries = item
+            .get("summary")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                (entry.get("type").and_then(Value::as_str) == Some("summary_text"))
+                    .then(|| entry.get("text").and_then(Value::as_str))
+                    .flatten()
+                    .map(str::to_owned)
+            })
+            .collect();
+
+        ReasoningItem {
+            item_id: item.get("id").and_then(Value::as_str).map(str::to_owned),
+            summaries,
+            encrypted_content: item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        }
+    })
+}
+
 fn completed_tool_call(
     value: &Value,
     pending_tools: &mut std::collections::HashMap<String, PendingToolCall>,
@@ -660,5 +797,102 @@ fn codex_stop_reason(status: Option<&str>, saw_tool_use: bool) -> StopReason {
     match status {
         Some("incomplete") => StopReason::MaxTokens,
         _ => StopReason::EndTurn,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    fn sse(events: Vec<Value>) -> Vec<u8> {
+        events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    async fn collect_events(events: Vec<Value>) -> Vec<StreamEvent> {
+        let bytes = sse(events);
+        let stream = futures::stream::iter(vec![Ok::<Vec<u8>, reqwest::Error>(bytes)]);
+        let mut stream = codex_event_stream(stream);
+        let mut out = Vec::new();
+        while let Some(event) = stream.next().await {
+            out.push(event.unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn reasoning_summary_delta_and_done_emit_thinking_events() {
+        let events = collect_events(vec![
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "Inspecting files",
+                "summary_index": 0
+            }),
+            json!({
+                "type": "response.reasoning_text.delta",
+                "delta": "raw hidden trace",
+                "content_index": 0
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "Inspecting files"}],
+                    "content": [{"type": "reasoning_text", "text": "raw hidden trace"}],
+                    "encrypted_content": "enc_1"
+                }
+            }),
+            json!({"type": "response.output_text.delta", "delta": "Done"}),
+            json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+        ]).await;
+
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ThinkingDelta { text } if text == "Inspecting files"
+        ));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::ThinkingBlock {
+                text,
+                provider: ThinkingProvider::OpenAIResponses,
+                metadata: ThinkingMetadata::OpenAIResponses {
+                    item_id: Some(item_id),
+                    output_index: None,
+                    summary_index: 0,
+                    encrypted_content: Some(encrypted),
+                },
+            } if text == "Inspecting files" && item_id == "rs_1" && encrypted == "enc_1"
+        ));
+        assert!(matches!(&events[2], StreamEvent::ContentDelta(text) if text == "Done"));
+        assert!(matches!(&events[3], StreamEvent::Usage(_)));
+        assert!(matches!(&events[4], StreamEvent::MessageDelta { .. }));
+        assert!(matches!(&events[5], StreamEvent::Done));
+    }
+
+    #[test]
+    fn assistant_thinking_replays_as_reasoning_item() {
+        let message = Message::assistant(vec![Content::Thinking {
+            text: "Checked project structure".into(),
+            provider: ThinkingProvider::OpenAIResponses,
+            metadata: ThinkingMetadata::openai_responses(
+                Some("rs_1".into()),
+                None,
+                0,
+                Some("enc_1".into()),
+            ),
+        }]);
+
+        let input = build_codex_input(&[message]);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["id"], "rs_1");
+        assert_eq!(input[0]["summary"][0]["type"], "summary_text");
+        assert_eq!(input[0]["summary"][0]["text"], "Checked project structure");
+        assert_eq!(input[0]["encrypted_content"], "enc_1");
     }
 }

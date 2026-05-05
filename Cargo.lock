@@ -2260,8 +2260,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 [[package]]
 name = "tkach"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f566e5062eabbbd2107bff6b9d90a6b6bb24fde8b199927ecae663bf1ac7f29"
+source = "git+https://github.com/kuchmenko/tkach?branch=wt%2Flinux%2Fissue-30-thinking-events#5db0a6e500ce59268655f773ea9350aebcd235c9"
 dependencies = [
  "async-trait",
  "bytes",

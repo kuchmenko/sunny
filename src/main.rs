@@ -400,6 +400,7 @@ async fn process_input(
     let run_started = Instant::now();
     let mut content = String::new();
     let mut assistant_started = false;
+    let mut thinking_started = false;
     let debug = stream_debug_enabled();
 
     let mut stream_open = true;
@@ -411,7 +412,14 @@ async fn process_input(
                     continue;
                 };
 
-                print_stream_event(ui, event?, &mut content, &mut assistant_started, debug)?;
+                print_stream_event(
+                    ui,
+                    event?,
+                    &mut content,
+                    &mut assistant_started,
+                    &mut thinking_started,
+                    debug,
+                )?;
             }
             event = tool_events.recv() => {
                 match event {
@@ -431,6 +439,10 @@ async fn process_input(
         &mut tool_stats,
         &mut assistant_started,
     )?;
+
+    if thinking_started {
+        println!();
+    }
 
     let streamed = !content.is_empty();
     let result = stream.into_result().await?;
@@ -454,10 +466,15 @@ fn print_stream_event(
     event: StreamEvent,
     content: &mut String,
     assistant_started: &mut bool,
+    thinking_started: &mut bool,
     debug: bool,
 ) -> Result<()> {
     match event {
         StreamEvent::ContentDelta(delta) => {
+            if *thinking_started {
+                println!();
+                *thinking_started = false;
+            }
             if !*assistant_started {
                 print!("{}", ui.assistant_prefix());
                 std::io::stdout().flush()?;
@@ -467,6 +484,27 @@ fn print_stream_event(
             print!("{delta}");
             std::io::stdout().flush()?;
             content.push_str(&delta);
+        }
+        StreamEvent::ThinkingDelta { text } => {
+            if *assistant_started {
+                println!();
+                *assistant_started = false;
+            }
+            if !*thinking_started {
+                print!("{} ", ui.paint(DIM, "☼ thinking"));
+                *thinking_started = true;
+            }
+            print!("{}", ui.paint(DIM, text));
+            std::io::stdout().flush()?;
+        }
+        StreamEvent::ThinkingBlock { .. } => {
+            if *thinking_started {
+                println!();
+                *thinking_started = false;
+            }
+            if debug {
+                print_debug(ui, "thinking_block");
+            }
         }
         StreamEvent::ToolUse { id, name, input } => {
             if debug {
